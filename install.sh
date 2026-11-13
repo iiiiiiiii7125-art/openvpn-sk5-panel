@@ -627,6 +627,14 @@ if [ -n "$_PUBLIC_IP" ]; then
 else
     log "no IPv4 public address detectable at install time; OPENVPN_SERVER_IP left unset (panel detects it at runtime)"
 fi
+# R35: remember a previously configured panel domain BEFORE panel.env
+# is rewritten fresh below -- the domain section re-applies it on a
+# re-run with no new domain ("no change"), so a re-run never
+# silently drops the reverse proxy.
+_PREV_PANEL_DOMAIN=""
+if [ -f "$CONFIG_DIR/panel.env" ]; then
+    _PREV_PANEL_DOMAIN="$(grep -E '^OVPN_PANEL_DOMAIN=' "$CONFIG_DIR/panel.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)"
+fi
 # NOTE: the admin password is NOT generated here. panel/app.py generates
 # it on first start and writes /etc/openvpn-sk5-panel/admin.pass (0600);
 # install.sh reads that file back after the panel is up (see the health
@@ -649,6 +657,350 @@ EOF
 # health gate below reads the same hardcoded path, so the two can no
 # longer drift apart.
 chmod 600 "$CONFIG_DIR/panel.env"
+
+# R35-HELPERS-BEGIN -- panel-domain helpers (R35). Sourced by
+# tests/r35_domain_reverse_proxy.sh: keep this block free of side
+# effects -- function definitions only, no commands run at source time.
+# Globals used (set by the caller / install.sh main body):
+#   CONFIG_DIR -- /etc/openvpn-sk5-panel (panel.env, panel-cert.pem)
+#   SERVER_IP, PANEL_PORT -- used by _resolve_panel_domain for the prompt
+#   _PREV_PANEL_DOMAIN -- domain from the previous install, if any
+#   OVPN_PANEL_DOMAIN -- env override for non-interactive installs
+
+_trim() { # _trim <s> -- strip leading/trailing whitespace
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+_normalize_panel_domain() { # _normalize_panel_domain <input> -- print normalized domain or fail
+    # Bare domain only: no scheme, port or path. One trailing dot is
+    # stripped (FQDN root dot); anything else invalid fails.
+    local d=""
+    d="$(_trim "$1")"
+    d="${d%.}"
+    [ -n "$d" ] || return 1
+    printf '%s' "$d" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' || return 1
+    printf '%s' "$d"
+}
+
+_resolve_panel_domain() { # _resolve_panel_domain -- print the domain to use (raw) or nothing
+    # Precedence: OVPN_PANEL_DOMAIN env > interactive prompt > previous
+    # install's domain (a re-run keeps it). Non-TTY stdin or a 60s
+    # timeout returns empty -- never hangs a non-interactive run.
+    local raw=""
+    if [ -n "${OVPN_PANEL_DOMAIN:-}" ]; then
+        _trim "${OVPN_PANEL_DOMAIN}"
+        return 0
+    fi
+    if [ -t 0 ]; then
+        # R20-BUG-1: the prompt MUST go to stderr. The call site
+        # captures stdout via $(...) -- a prompt on stdout is captured
+        # together with the answer and _normalize_panel_domain then
+        # rejects the polluted value, so interactive domain entry could
+        # never succeed.
+        printf '面板域名（留空则不设反代，直接用 https://%s:%s）: ' "${SERVER_IP:-127.0.0.1}" "${PANEL_PORT:-8443}" >&2
+        if read -r -t 60 raw; then
+            _trim "$raw"
+        fi
+        return 0
+    fi
+    if [ -n "${_PREV_PANEL_DOMAIN:-}" ]; then
+        printf '%s' "$_PREV_PANEL_DOMAIN"
+    fi
+    return 0
+}
+
+_resolve_domain_ip() { # _resolve_domain_ip <domain> -- print first resolved IPv4 or nothing
+    getent hosts "$1" 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1; exit}'
+}
+
+_caddy_block() { # _caddy_block <domain> -- print the managed Caddyfile block
+    # R20-BUG-2: reference the caddy-readable COPY of the panel cert
+    # (${_CADDY_PANEL_CERT:-/etc/caddy/panel-cert.pem}), never
+    # $CONFIG_DIR/panel-cert.pem -- $CONFIG_DIR is 0700 root-only and
+    # the caddy unit runs as User=caddy. The installer re-copies the
+    # public cert to that path on every run (see the domain section);
+    # panel-key.pem is never copied.
+    printf '%s {\n    reverse_proxy https://localhost:8443 {\n        transport http {\n            tls_trusted_ca_certs %s\n        }\n    }\n}\n' "$1" "${_CADDY_PANEL_CERT:-/etc/caddy/panel-cert.pem}"
+}
+
+_build_caddyfile() { # _build_caddyfile <domain> <existing-file-or--> <outfile>
+    # New Caddyfile content = existing content minus any previous
+    # managed block, plus the new managed block. Never touches the
+    # live Caddyfile: the caller validates the built file first.
+    local domain="$1" existing="${2:-}" out="$3"
+    if [ -n "$existing" ] && [ -f "$existing" ]; then
+        awk '/^# BEGIN openvpn-sk5-panel/{skip=1} /^# END openvpn-sk5-panel/{skip=0; next} !skip' "$existing" > "$out" || return 1
+    else
+        : > "$out" || return 1
+    fi
+    {
+        printf '# BEGIN openvpn-sk5-panel (managed by install.sh -- change the domain with OVPN_PANEL_DOMAIN, do not hand-edit this block)\n'
+        _caddy_block "$domain"
+        printf '# END openvpn-sk5-panel\n'
+    } >> "$out" || return 1
+}
+
+_validate_caddy_config() { # _validate_caddy_config <caddyfile> -- validate the built Caddyfile
+    # R20-BUG-2: `caddy validate` as root always passes even when the
+    # caddy unit (User=caddy) cannot read a referenced file -- the
+    # failure only surfaces at service start. Validate as the caddy
+    # user so a readability failure fails validation instead. The
+    # temp file must be world-readable for the caddy user, and HOME
+    # must be the caddy user's own home (never /root): validate
+    # provisions storage under $HOME, and as User=caddy it cannot
+    # write into /root.
+    local _cfg="$1" _caddy_home=""
+    chmod 644 "$_cfg" 2>/dev/null || true
+    if command -v runuser >/dev/null 2>&1 && id caddy >/dev/null 2>&1; then
+        _caddy_home="$(getent passwd caddy 2>/dev/null | cut -d: -f6 || true)"
+        [ -n "$_caddy_home" ] || _caddy_home="/var/lib/caddy"
+        runuser -u caddy -- env "HOME=$_caddy_home" caddy validate --config "$_cfg" --adapter caddyfile >/dev/null 2>&1
+    else
+        warn "cannot validate the Caddy config as the caddy user (no runuser or no caddy user) -- validating as root, which cannot catch cert readability problems"
+        caddy validate --config "$_cfg" --adapter caddyfile >/dev/null 2>&1
+    fi
+}
+
+_append_panel_env_domain() { # _append_panel_env_domain <domain>
+    # panel.env is rewritten fresh every run, so appending here is
+    # safe (no duplicates). OVPN_PANEL_HTTPS=1 sets the Secure cookie
+    # flag (required behind a TLS proxy); OVPN_TRUSTED_PROXY=1 makes
+    # Flask trust X-Forwarded-For from Caddy (required: without it
+    # every client looks like 127.0.0.1 and one attacker's 5 failed
+    # logins lock out everyone).
+    {
+        printf 'OVPN_PANEL_DOMAIN=%s\n' "$1"
+        printf 'OVPN_PANEL_HTTPS=1\n'
+        printf 'OVPN_TRUSTED_PROXY=1\n'
+    } >> "$CONFIG_DIR/panel.env"
+}
+
+_restore_prev_panel_domain() { # R35-P2-1: on a failure branch, keep
+    # trusting what the still-running Caddy serves: re-append the
+    # previous domain's trust vars instead of dropping them. A fresh
+    # install (no _PREV_PANEL_DOMAIN) ends up with no vars, as before.
+    if [ -n "${_PREV_PANEL_DOMAIN:-}" ]; then
+        _append_panel_env_domain "$_PREV_PANEL_DOMAIN"
+        log "keeping previously configured panel domain $_PREV_PANEL_DOMAIN in panel.env (panel keeps trusting the previous proxy config)"
+    fi
+}
+# R35-HELPERS-END
+
+# ------------------------------------------------------------------ panel domain + reverse proxy (Caddy)
+# R35: interactive domain + automatic reverse proxy. The operator is
+# asked for a domain at install time; Caddy (official apt repo)
+# terminates TLS for it (Let's Encrypt, HTTP-01 on :80) and proxies
+# to the panel's own TLS wrapper at https://localhost:8443 -- NOT
+# 127.0.0.1 (the panel cert carries DNS:localhost as a SAN, so
+# hostname verification succeeds against `localhost`; 127.0.0.1 is
+# NOT in the SANs). The panel stays reachable via https://IP:8443.
+# Env plumbing (panel/app.py): OVPN_PANEL_HTTPS=1 sets the Secure
+# cookie flag, OVPN_TRUSTED_PROXY=1 makes Flask trust
+# X-Forwarded-For from Caddy. Both are appended to panel.env below
+# ONLY once Caddy is actually installed and its config validates --
+# trusting X-Forwarded-For with no proxy in front would let anyone
+# forge the header and bypass the login rate limit.
+# Re-run semantics: an empty answer keeps a previously configured
+# domain ("no change"); only a fresh install with no previous domain
+# skips the proxy. Change the domain later with
+# OVPN_PANEL_DOMAIN=<new> bash install.sh. Removal is manual (see
+# README.md / DELIVERY.md §1.2).
+_PANEL_DOMAIN="$(_resolve_panel_domain || true)"
+if [ -n "$_PANEL_DOMAIN" ]; then
+    _PANEL_DOMAIN_NORM=""
+    if _PANEL_DOMAIN_NORM="$(_normalize_panel_domain "$_PANEL_DOMAIN" 2>/dev/null)"; then
+        _PANEL_DOMAIN="$_PANEL_DOMAIN_NORM"
+    else
+        warn "invalid panel domain '$_PANEL_DOMAIN' -- must be a bare domain (no scheme, port or path); this domain is not applied"
+        _PANEL_DOMAIN=""
+    fi
+fi
+if [ -z "$_PANEL_DOMAIN" ] && [ -n "${_PREV_PANEL_DOMAIN:-}" ]; then
+    _PANEL_DOMAIN="$_PREV_PANEL_DOMAIN"
+    log "re-run: keeping previously configured panel domain $_PANEL_DOMAIN (set OVPN_PANEL_DOMAIN to change it)"
+fi
+# R20-BUG-3: the reverse proxy listens on *:443, which collides with
+# an OpenVPN server in TCP 443 mode. Do not set up a NEW proxy this
+# run (loud warn) and keep the panel on https://IP:8443. The guard
+# declines to configure a new proxy, but it never touches Caddy --
+# an already-running proxy keeps serving the previous domain, so the
+# previous domain's trust vars are preserved (R37-P2-1: dropping them
+# would turn ProxyFix off at the next panel restart while Caddy still
+# forwards, making every domain client look like 127.0.0.1 to the rate
+# limiter). Switch the server back to UDP 1194 (or another port) and
+# re-run to re-configure the proxy.
+if [ -n "$_PANEL_DOMAIN" ] && [ "$OVPN_PROTO" = "tcp" ] && [ "$OVPN_PORT" = "443" ]; then
+    warn "域名反代需占用 443 端口，服务端当前为 TCP 443，两者冲突，本次不设反代；改用 UDP 1194 或换端口后再配域名"
+    _restore_prev_panel_domain
+    _PANEL_DOMAIN=""
+fi
+if [ -n "$_PANEL_DOMAIN" ]; then
+    # Best-effort DNS check: warn only, never die. Caddy retries
+    # issuance automatically once DNS propagates.
+    _EXPECTED_IP="${_PUBLIC_IP:-$SERVER_IP}"
+    _RESOLVED_IP="$(_resolve_domain_ip "$_PANEL_DOMAIN" || true)"
+    if [ -z "$_RESOLVED_IP" ]; then
+        warn "domain $_PANEL_DOMAIN does not resolve yet -- no certificate can be issued until DNS points at this server ($_EXPECTED_IP); Caddy will keep retrying automatically"
+    elif [ "$_RESOLVED_IP" != "$_EXPECTED_IP" ]; then
+        warn "domain $_PANEL_DOMAIN resolves to $_RESOLVED_IP, not this server ($_EXPECTED_IP) -- no certificate can be issued until DNS points here; Caddy will keep retrying automatically"
+    else
+        log "domain $_PANEL_DOMAIN resolves to this server ($_RESOLVED_IP)"
+    fi
+    # Install Caddy from its official apt repo
+    # (https://caddyserver.com/docs/install#debian-ubuntu-raspbian).
+    # Any failure here warns and skips the proxy -- never dies.
+    _CADDY_INSTALL_OK=1
+    if ! command -v caddy >/dev/null 2>&1; then
+        log "installing Caddy (official apt repo) for the reverse proxy..."
+        if ! command -v gpg >/dev/null 2>&1; then
+            apt-get install -y -qq --no-install-recommends gnupg 2>/dev/null || _CADDY_INSTALL_OK=0
+        fi
+        if [ "$_CADDY_INSTALL_OK" -eq 1 ]; then
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' 2>/dev/null \
+                | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null \
+                || _CADDY_INSTALL_OK=0
+        fi
+        if [ "$_CADDY_INSTALL_OK" -eq 1 ]; then
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' 2>/dev/null \
+                | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null 2>&1 \
+                || _CADDY_INSTALL_OK=0
+        fi
+        if [ "$_CADDY_INSTALL_OK" -eq 1 ]; then
+            apt-get update -qq 2>/dev/null || _CADDY_INSTALL_OK=0
+        fi
+        if [ "$_CADDY_INSTALL_OK" -eq 1 ]; then
+            apt-get install -y -qq --no-install-recommends caddy 2>/dev/null || _CADDY_INSTALL_OK=0
+        fi
+        if [ "$_CADDY_INSTALL_OK" -eq 1 ] && ! command -v caddy >/dev/null 2>&1; then
+            _CADDY_INSTALL_OK=0
+        fi
+    fi
+    if [ "$_CADDY_INSTALL_OK" -eq 0 ]; then
+        warn "Caddy install failed -- skipping the reverse proxy; the panel stays reachable at https://$SERVER_IP:$PANEL_PORT (re-run with OVPN_PANEL_DOMAIN set to retry)"
+        _restore_prev_panel_domain
+        _PANEL_DOMAIN=""
+    else
+        # R20-BUG-2(a): copy the PUBLIC panel cert to a caddy-readable
+        # path on every run, so cert rotation is followed. $CONFIG_DIR
+        # is 0700 root-only (it holds admin.pass / secret.key /
+        # panel-key.pem) and the caddy unit runs as User=caddy, so a
+        # Caddyfile pointing into $CONFIG_DIR can never load. Only the
+        # public cert is copied -- panel-key.pem never leaves
+        # $CONFIG_DIR.
+        _CADDY_PANEL_CERT="/etc/caddy/panel-cert.pem"
+        mkdir -p /etc/caddy 2>/dev/null || true
+        # R38-P2-1: pin the directory mode too. mkdir -p takes the
+        # caller's umask for a new dir and never touches an existing
+        # one, so under umask 027/077 a freshly created (or sticky
+        # 0700) /etc/caddy trapped the 0644 cert copy inside and
+        # User=caddy could not traverse it (R37-P2-2 pinned only the
+        # files). Best-effort here like the cert copy below: if the
+        # chmod fails, validate-as-caddy still catches it loudly.
+        chmod 755 /etc/caddy 2>/dev/null || true
+        if [ -f "$PANEL_CERT" ]; then
+            if install -m 0644 "$PANEL_CERT" "$_CADDY_PANEL_CERT" 2>/dev/null; then
+                log "copied panel cert for Caddy: $_CADDY_PANEL_CERT"
+            else
+                warn "failed to copy $PANEL_CERT to $_CADDY_PANEL_CERT -- Caddy may fail to start (cannot read the panel CA cert)"
+            fi
+        else
+            warn "panel cert $PANEL_CERT not found -- cannot copy it for Caddy; the reverse proxy will likely fail to start"
+        fi
+        # Build the new Caddyfile to a temp file and validate it
+        # BEFORE touching the live config, so a bad config can never
+        # strand a previously working proxy.
+        _CADDYFILE="/etc/caddy/Caddyfile"
+        _CADDY_TMP="$(mktemp)"
+        if ! _build_caddyfile "$_PANEL_DOMAIN" "$_CADDYFILE" "$_CADDY_TMP"; then
+            warn "failed to build the Caddyfile -- skipping the reverse proxy; the panel stays reachable at https://$SERVER_IP:$PANEL_PORT"
+            rm -f "$_CADDY_TMP"
+            _restore_prev_panel_domain
+            _PANEL_DOMAIN=""
+        elif ! _validate_caddy_config "$_CADDY_TMP"; then
+            warn "caddy validate failed for the new config -- the live Caddyfile is untouched and Caddy keeps running the old config; panel.env keeps the previous domain vars; the panel stays reachable at https://$SERVER_IP:$PANEL_PORT"
+            rm -f "$_CADDY_TMP"
+            _restore_prev_panel_domain
+            _PANEL_DOMAIN=""
+        else
+            mkdir -p /etc/caddy
+            # R38-P2-1: pin the directory mode (see above). Bare chmod
+            # like the R37-P2-2 chmod 644 below: validate has already
+            # proved the directory traversable by caddy, so a failure
+            # here is a should-never-happen and dies loud.
+            chmod 755 /etc/caddy
+            if ! cat "$_CADDY_TMP" > "$_CADDYFILE"; then
+                warn "failed to write $_CADDYFILE -- skipping the reverse proxy; the panel stays reachable at https://$SERVER_IP:$PANEL_PORT"
+                rm -f "$_CADDY_TMP"
+                _restore_prev_panel_domain
+                _PANEL_DOMAIN=""
+            else
+                # R37-P2-2: pin the live file's mode. `cat >` keeps an
+                # existing file's mode and takes the caller's umask for
+                # a new one, while `caddy validate` only ever saw the
+                # 644 temp file -- under umask 027/077 the live file
+                # landed 0640/0600 and User=caddy could not read it,
+                # and re-runs preserved the mode (sticky failure).
+                chmod 644 "$_CADDYFILE"
+            fi
+            rm -f "$_CADDY_TMP"
+        fi
+    fi
+fi
+if [ -n "$_PANEL_DOMAIN" ]; then
+    # Open 80/443: ufw when active (same pattern as the panel/VPN
+    # ports below); otherwise live iptables rules with the same
+    # no-survives-reboot caveat.
+    _DOM_UFW_STATUS=""
+    if command -v ufw >/dev/null 2>&1; then
+        _DOM_UFW_STATUS="$(ufw status 2>/dev/null || true)"
+    fi
+    if [[ $_DOM_UFW_STATUS == *"Status: active"* ]]; then
+        ufw allow 80/tcp >/dev/null 2>&1 || warn "ufw allow 80/tcp failed"
+        ufw allow 443/tcp >/dev/null 2>&1 || warn "ufw allow 443/tcp failed"
+        log "ufw: allowed 80/tcp and 443/tcp for the reverse proxy"
+    else
+        for _DOM_PORT in 80 443; do
+            if ! iptables -C INPUT -p tcp --dport "$_DOM_PORT" -j ACCEPT 2>/dev/null; then
+                iptables -I INPUT -p tcp --dport "$_DOM_PORT" -j ACCEPT 2>/dev/null \
+                    || warn "iptables allow $_DOM_PORT/tcp failed"
+            fi
+        done
+        warn "ports 80/443 opened via live iptables rules only -- they will NOT survive a reboot (no persistence backend); re-run install.sh after a reboot to re-apply them"
+    fi
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+        systemctl reload caddy 2>/dev/null || systemctl restart caddy 2>/dev/null \
+            || warn "caddy reload/restart failed -- run 'systemctl restart caddy' by hand"
+    else
+        # O-R20-1: a masked unit makes `enable --now` fail into the
+        # warn branch; unmask best-effort first, never die on it.
+        systemctl unmask caddy 2>/dev/null || true
+        systemctl enable --now caddy 2>/dev/null \
+            || warn "failed to start caddy -- the panel stays reachable at https://$SERVER_IP:$PANEL_PORT; see: journalctl -u caddy"
+    fi
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+        _append_panel_env_domain "$_PANEL_DOMAIN"
+        # The panel reads panel.env at start. On a re-run it is already
+        # running with the old environment, so restart it when the
+        # proxy env vars changed (fresh installs start it below,
+        # already with the new vars). NRestarts counts automatic
+        # restarts only -- a manual restart resets it -- so the health
+        # gate's zero-restart check below still holds.
+        if [ "$_PANEL_DOMAIN" != "${_PREV_PANEL_DOMAIN:-}" ] \
+            && systemctl is-active --quiet openvpn-sk5-panel 2>/dev/null; then
+            log "restarting openvpn-sk5-panel to apply the proxy env vars..."
+            systemctl restart openvpn-sk5-panel 2>/dev/null \
+                || warn "panel restart failed -- run 'systemctl restart openvpn-sk5-panel' by hand"
+        fi
+        log "reverse proxy configured: https://$_PANEL_DOMAIN -> https://localhost:8443"
+    else
+        warn "caddy is not running after start -- skipping the reverse proxy; the panel stays reachable at https://$SERVER_IP:$PANEL_PORT (see: journalctl -u caddy)"
+        _restore_prev_panel_domain
+        _PANEL_DOMAIN=""
+    fi
+fi
 
 # ------------------------------------------------------------------ sing-box config
 # Direct-mode starter config: tun1 exists and sing-box runs, but no
@@ -995,6 +1347,18 @@ STATUS_CODE="$(curl -ks --max-time 10 -b "$COOKIE_JAR" -o /dev/null -w '%{http_c
     || die "panel /api/status returned HTTP $STATUS_CODE after login"
 log "panel health gate passed (login + /api/status 200)"
 
+# R35: domain health check (best effort). The panel answers /api/me
+# directly already (gate above); this checks the public path through
+# Caddy -- DNS propagation / certificate issuance may lag, so a
+# failure warns only and never dies.
+if [ -n "${_PANEL_DOMAIN:-}" ]; then
+    if curl -fsS --max-time 10 -o /dev/null "https://$_PANEL_DOMAIN/api/me" 2>/dev/null; then
+        log "panel answers via domain: https://$_PANEL_DOMAIN/api/me"
+    else
+        warn "panel does not answer yet at https://$_PANEL_DOMAIN/api/me (usually DNS not pointing here yet, or the certificate is still being issued) -- Caddy retries automatically; the panel remains reachable at https://$SERVER_IP:$PANEL_PORT"
+    fi
+fi
+
 # BUG-8: prove the direct-mode forwarding path, not just that services
 # are up. A host with FORWARD policy DROP and no accept rules passes
 # every service check while dropping all VPN user traffic (live-verify
@@ -1053,12 +1417,15 @@ fi
 # ------------------------------------------------------------------ summary
 _INHERIT_NOTE=""
 [ -n "${INHERITED_PORT:-}" ] && _INHERIT_NOTE=" (entry port inherited from existing server.conf)"
+_DOMAIN_LINE=""
+[ -n "${_PANEL_DOMAIN:-}" ] && _DOMAIN_LINE="
+ 域名:    https://$_PANEL_DOMAIN (Caddy 自动 HTTPS；IP 直连仍可用)"
 cat <<EOF
 
 ============================================================
  openvpn-sk5-panel 安装完成
 ============================================================
- 面板:    https://$SERVER_IP:$PANEL_PORT
+ 面板:    https://$SERVER_IP:$PANEL_PORT$_DOMAIN_LINE
  管理员:  admin
  初始密码: $ADMIN_PASS
    (仅显示一次；已保存于 $ADMIN_PASS_FILE，权限 0600。

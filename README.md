@@ -75,10 +75,12 @@ cd /root/openvpn-sk5-panel && bash install.sh
 
 ```bash
 # 或在目标机上直接下载发布包安装：
-cd /root && curl -L -o ovpn-release-1.0.1.tar.gz https://raw.githubusercontent.com/iiiiiiiii7125-art/openvpn-sk5-panel/1.0.1/releases/ovpn-release-1.0.1.tar.gz && tar xzf ovpn-release-1.0.1.tar.gz && cd openvpn-sk5-panel && bash install.sh
+cd /root && curl -L -o ovpn-release-1.0.2.tar.gz https://raw.githubusercontent.com/iiiiiiiii7125-art/openvpn-sk5-panel/1.0.2/releases/ovpn-release-1.0.2.tar.gz && tar xzf ovpn-release-1.0.2.tar.gz && cd openvpn-sk5-panel && bash install.sh
 ```
 
 安装完打印面板地址 `https://<服务器 IP>:8443` + 初始管理员密码（仅显示一次，也写在 `/etc/openvpn-sk5-panel/admin.pass`，0600）。重装不会轮换密码、CA 与服务端证书。装完自检：`bash /opt/openvpn-sk5-panel/verify.sh`（24 项检查，逐项 PASS/FAIL/SKIP）。
+
+域名反代（安装时交互填写）：装到面板 TLS 与 `panel.env` 之后会问一次 `面板域名（留空则不设反代，直接用 https://IP:8443）`，填域名后自动装 Caddy 并反代到面板，自动办 Let's Encrypt 证书（HTTP-01，需 80 端口可达且域名已解析到本机），面板之后用 `https://<域名>` 访问，`https://IP:8443` 仍可用。留空 = 不设反代；重装时留空表示“不改动”，保留已配的域名。非交互安装用环境变量预设：`OVPN_PANEL_DOMAIN=panel.example.com bash install.sh`。域名须是裸域名（无 scheme/端口/路径，形如 `panel.example.com`）；解析未生效时只警告、不中断安装，Caddy 会在 DNS 生效后自动重试。换域名：`OVPN_PANEL_DOMAIN=<新域名> bash install.sh` 重装。去掉反代需手动操作：停并禁用 Caddy（`systemctl disable --now caddy`）、删 `/etc/caddy/Caddyfile` 里的 `# BEGIN openvpn-sk5-panel` … `# END openvpn-sk5-panel` 段、删 `/etc/openvpn-sk5-panel/panel.env` 里的 `OVPN_PANEL_DOMAIN`、`OVPN_PANEL_HTTPS`、`OVPN_TRUSTED_PROXY` 三行并重启面板（`systemctl restart openvpn-sk5-panel`）。三行必须一起删：只删域名行、留下 `OVPN_TRUSTED_PROXY=1` 时，面板在直连 8443 上仍信任伪造的 `X-Forwarded-For`。反代与 OpenVPN TCP 443 模式互斥：Caddy 占 TCP 80（HTTP-01 办证）与 TCP 443（HTTPS），同一台机器上域名反代与 TCP 443 模式不能共存。安装时服务端已是 TCP 443（`OVPN_PROTO=tcp OVPN_PORT=443`）时，填域名也会被跳过并大声警告、反代不设，面板仍用 `https://IP:8443`；要用域名先把服务端改回 UDP 1194（默认）或改出 TCP 443，再重装填域名。反代在跑时，面板里把服务端切到 TCP 443 会被拒绝（500，点名 caddy 占着 `*:443`），服务端保持原协议/端口；要切 TCP 443 先按上面「去掉反代」步骤拆掉反代再切。
 
 可选环境变量：`OVPN_PROTO`（udp|tcp）、`OVPN_PORT`、`OVPN_SUBNET`（固定 `10.8.0.0/24`，core 模板写死该子网；设为其他值安装器直接拒绝，否则 NAT 规则与已服务子网错位、出口断流）、`OVPN_DNS`（默认 `1.1.1.1`，写入 `server.conf` 的 `push "dhcp-option DNS …"`）；`SINGBOX_SHA256` / `TUN2SOCKS_SHA256`（见下「二进制校验」）。
 
@@ -293,6 +295,8 @@ read -r -p "确认卸载 OpenVPN + SK5 面板并删除 CA 与全部用户证书�
 [ "$ans" = y ] || [ "$ans" = Y ] || exit 1
 systemctl disable --now openvpn-sk5-panel openvpn-sk5-singbox openvpn-server@server
 systemctl disable --now openvpn-sk5-policy.service openvpn-sk5-healthcheck.timer
+systemctl disable --now caddy
+# Caddy 反代配置：删 /etc/caddy/Caddyfile 里的 # BEGIN openvpn-sk5-panel … # END openvpn-sk5-panel 段；若 Caddyfile 只有这一段，直接删文件：rm -f /etc/caddy/Caddyfile
 rm -rf /opt/openvpn-sk5-panel /etc/openvpn-sk5-panel
 rm -rf /etc/openvpn/server          # 含 CA 与全部用户证书，删前确认
 rm -f /etc/systemd/system/openvpn-sk5-panel.service /etc/systemd/system/openvpn-sk5-singbox.service
@@ -305,5 +309,10 @@ iptables -D FORWARD -i <网卡> -d 10.8.0.0/24 -o tun0 -m conntrack --ctstate RE
 # ufw 放行（仅 ufw 机上有；端口按实际 OVPN_PORT/PANEL_PORT，默认 1194/udp 与 8443/tcp）：
 ufw delete allow 1194/udp
 ufw delete allow 8443/tcp
+# 反代放行（仅配过域名反代的 ufw 机上有）：
+ufw delete allow 80/tcp
+ufw delete allow 443/tcp
 # 然后 netfilter-persistent save（无 ufw 机）或确认 ufw 规则已删
 ```
+
+注：`panel.env` 随 `rm -rf /etc/openvpn-sk5-panel` 一并删除，`OVPN_PANEL_DOMAIN` / `OVPN_PANEL_HTTPS` / `OVPN_TRUSTED_PROXY` 三行无需单独清理——卸载已覆盖「域名反代」一节的去掉反代步骤。
