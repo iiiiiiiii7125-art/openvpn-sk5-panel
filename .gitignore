@@ -1,0 +1,6 @@
+# runtime data (never commit: R8-BUG-1)
+panel/data/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store

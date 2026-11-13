@@ -1,0 +1,54 @@
+# OpenVPN 2.6 server config -- rendered by core/openvpn_manager.py
+# render_server_conf(). Placeholders (string.Template): PROTO, PORT,
+# SERVER_DIR, DNS. Defaults: proto udp / port 1194; TCP mode: proto tcp /
+# port 443; DNS from the OVPN_DNS env var (default 1.1.1.1).
+# NOTE: explicit-exit-notify is UDP-only; OpenVPN ignores it (with a
+# warning) when proto is tcp.
+
+port $PORT
+proto $PROTO
+dev tun
+
+ca $SERVER_DIR/ca.crt
+cert $SERVER_DIR/server.crt
+key $SERVER_DIR/server.key
+dh $SERVER_DIR/dh.pem
+tls-auth $SERVER_DIR/ta.key 0
+crl-verify $SERVER_DIR/crl.pem
+
+server 10.8.0.0 255.255.255.0
+topology subnet
+
+# Route all client traffic through the VPN (the SK5 egress layer then
+# decides whether it leaves via the SOCKS5 proxy or direct).
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS $DNS"
+
+keepalive 10 120
+tun-mtu 1400
+mssfix 1360
+
+data-ciphers AES-256-GCM
+cipher AES-256-GCM
+auth SHA256
+
+persist-key
+persist-tun
+user nobody
+group nogroup
+
+status /var/log/openvpn/openvpn-status.log
+# NOTE (R2-BUG-13): this line sets the status *path* only. The Debian
+# openvpn-server@.service unit additionally passes --status-version 2,
+# so the file actually written here is comma-separated v2 (HEADER /
+# CLIENT_LIST / ROUTING_TABLE rows), NOT v1 -- the unit's --status
+# /run/openvpn-server/status-server.log path was empty on the test
+# machine, the config path above is the effective file the panel
+# reads (see STATUS_LOG_CANDIDATES in openvpn_manager.py). Status
+# files are ALWAYS comma-separated (TAB exists only in
+# management-interface output); the parser in
+# openvpn_manager.py._parse_status_log accepts comma v2, bare v1,
+# TAB v2 and the 7-field prefixed form.
+log-append /var/log/openvpn/openvpn.log
+verb 3
+explicit-exit-notify 1

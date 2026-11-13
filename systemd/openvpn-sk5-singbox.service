@@ -1,0 +1,26 @@
+[Unit]
+Description=sing-box SK5 egress for OpenVPN users (openvpn-sk5-panel)
+After=network-online.target
+Wants=network-online.target
+# BUG-3: without a start limit, Restart=on-failure spins a crashing
+# sing-box forever (3s cycle) while the installer/panel still reports
+# the service as "starting". 5 starts in 120s then the unit goes
+# failed loudly instead of silently burning CPU.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+# Config is rendered by egress/sk5_manager.py on SK5 save; install.sh
+# writes a direct-mode starter config so the unit can start before
+# any SK5 is configured.
+ExecStart=/usr/local/bin/sing-box run -c /etc/openvpn-sk5-panel/sing-box.json
+Restart=on-failure
+RestartSec=3
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

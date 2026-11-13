@@ -1,0 +1,15 @@
+[Unit]
+Description=SK5 egress health check for openvpn-sk5-panel (fail-open fail-over)
+After=network-online.target openvpn-sk5-singbox.service
+Wants=network-online.target
+
+# P1-8: check_health() is the only thing that executes a fail-open
+# fail-over (fail_open=true -> disable(), restoring direct egress).
+# Without this timer the fail-open switch promises a behaviour nothing
+# ever performs. Runs via the timer unit, every 60s.
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/openvpn-sk5-panel/egress/sk5_manager.py health
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run SK5 health check every 60s (openvpn-sk5-panel)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60s
+Unit=openvpn-sk5-healthcheck.service
+
+[Install]
+WantedBy=timers.target

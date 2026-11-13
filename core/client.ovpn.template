@@ -1,0 +1,31 @@
+# OpenVPN client config -- rendered by core/openvpn_manager.py
+# build_client_config()/create_user(). Placeholders (string.Template):
+# PROTO, SERVER_IP, PORT, CA, CERT, KEY, TA (PEM blocks inlined).
+# NOTE: keep dollar-sign placeholders out of these comment lines --
+# Template.substitute would expand them here too.
+client
+dev tun
+proto $PROTO
+remote $SERVER_IP $PORT
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+data-ciphers AES-256-GCM
+cipher AES-256-GCM
+auth SHA256
+verb 3
+<ca>
+$CA
+</ca>
+<cert>
+$CERT
+</cert>
+<key>
+$KEY
+</key>
+<tls-auth>
+$TA
+</tls-auth>
+key-direction 1

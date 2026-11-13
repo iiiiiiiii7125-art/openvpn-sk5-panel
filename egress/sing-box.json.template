@@ -1,0 +1,97 @@
+# sing-box config template for the SK5 egress chain (sing-box 1.11+).
+# Placeholders (replaced by egress/sk5_manager.py, never hand-edited):
+#   __SK5_HOST__  bought SOCKS5 hostname or IP
+#   __SK5_PORT__  bought SOCKS5 port (number, no quotes)
+#   __SK5_USER__  SOCKS5 username (key dropped if empty)
+#   __SK5_PASS__  SOCKS5 password (key dropped if empty)
+#   "udp_over_tcp": false  -> set true by the manager when UoT is on.
+#
+# UDP MODE (default, merchant supports UDP ASSOCIATE):
+#   OpenVPN runs UDP 1194, sing-box forwards UDP natively:
+#     "udp_over_tcp": false
+# TCP MODE (merchant is TCP-only, or native UDP probe fails):
+#   OpenVPN must switch to TCP 443 (TCP-over-TCP warning, see README),
+#   and this outbound becomes:
+#     "udp_over_tcp": true
+#   With udp_over_tcp=true sing-box wraps every UDP packet in a TCP
+#   stream to the merchant, so DNS / game UDP still works -- slower,
+#   but it works. The manager's test_sk5() proves the UoT path with a
+#   throwaway sing-box before reporting udp_ok=true.
+#
+# CHECK (strip the '#' comment lines above, substitute, then check):
+#   grep -v '^[[:space:]]*#' sing-box.json.template \
+#     | sed -e 's/__SK5_HOST__/proxy.example.net/' \
+#           -e 's/__SK5_PORT__/1080/' \
+#           -e 's/__SK5_USER__/u1/' -e 's/__SK5_PASS__/p1/' \
+#     > /tmp/sing-box-test.json
+#   sing-box check -c /tmp/sing-box-test.json
+# Expected: no output / exit 0. Any error names the bad field.
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-direct",
+        "address": "1.1.1.1",
+        "detour": "direct"
+      }
+    ],
+    "rules": [
+      {
+        "outbound": "any",
+        "server": "dns-direct"
+      }
+    ],
+    "final": "dns-direct",
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun1",
+      "address": "10.9.0.1/30",
+      "mtu": 1400,
+      "auto_route": false,
+      "strict_route": false,
+      "stack": "system"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "bought-sk5",
+      "server": "__SK5_HOST__",
+      "server_port": __SK5_PORT__,
+      "version": "5",
+      "username": "__SK5_USER__",
+      "password": "__SK5_PASS__",
+      "udp_over_tcp": false
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "outbound": "direct"
+      },
+      {
+        "port": 53,
+        "outbound": "direct"
+      }
+    ],
+    "final": "bought-sk5",
+    "auto_detect_interface": true
+  }
+}

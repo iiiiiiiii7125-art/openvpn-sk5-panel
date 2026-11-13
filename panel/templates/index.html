@@ -1,0 +1,1259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenVPN + SK5 面板</title>
+<!--
+  FLMX 风格重做（对照 ~/workspace/flvx-max/vite-frontend/src/layouts/admin.tsx，
+  只读参考，未改 FLMX 一行）：
+  - 外层 flex + p-6 gap-6 + mesh 渐变底（globals.css .bg-mesh-gradient，#f6f7fb）
+  - 左侧栏 w-260px rounded-3xl bg-white/70 backdrop-blur-3xl
+    shadow-[0_10px_30px_rgba(0,0,0,0.1)]，激活项 bg-white/60 + 大阴影
+  - 主色 #2563eb（--primary），卡片圆角 + shadow-md/lg 保留
+  - 按 2026-11-01/11-04 定稿：侧栏无分组小标题（FLMX 的 section 标题不抄）、
+    玻璃透明度适中（70% 不是 20%）、文字对比度目标 7 / 底线 4.5
+  - 单文件、无外部 CDN；全部接口与 panel/app.py 实物一致。
+-->
+<style>
+  :root {
+    --primary: #2563eb;
+    --primary-dark: #1d4ed8;
+    --primary-soft: #dbeafe;
+    --primary-text: #1e40af;
+    --bg: #f6f7fb;
+    --ink: #1f2937;          /* 正文，对比度见 static/contrast-check.py */
+    --ink-2: #4b5563;        /* 次要文字 */
+    --ink-3: #6b7280;        /* 仅用于大号/辅助，不作正文 */
+    --ok: #15803d;
+    --ok-bg: #dcfce7;
+    --ok-ink: #166534;
+    --bad: #b91c1c;
+    --bad-bg: #fee2e2;
+    --bad-ink: #991b1b;
+    --line: rgba(255, 255, 255, .8);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--ink);
+    background-color: var(--bg);
+    background-image:
+      radial-gradient(600px 400px at 15% 0%, rgba(37, 99, 235, .10), transparent 60%),
+      radial-gradient(500px 380px at 90% 10%, rgba(16, 185, 129, .08), transparent 60%),
+      radial-gradient(700px 500px at 50% 100%, rgba(37, 99, 235, .06), transparent 60%);
+    background-attachment: fixed;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+  a { color: var(--primary-dark); }
+  button { font-family: inherit; }
+
+  /* ---- 整体布局：FLMX admin.tsx 外层 flex + p-6 gap-6 ---- */
+  .shell { display: flex; min-height: 100vh; padding: 24px; gap: 24px; }
+  .overlay { display: none; }
+
+  /* ---- 左侧栏：FLMX aside（bg-white/70 + blur-3xl + 大圆角 + 阴影）---- */
+  .sidebar {
+    width: 260px; flex-shrink: 0;
+    background: rgba(255, 255, 255, .70);
+    -webkit-backdrop-filter: blur(24px); backdrop-filter: blur(24px);
+    border: 1px solid var(--line);
+    border-radius: 24px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, .10);
+    display: flex; flex-direction: column;
+    position: sticky; top: 24px; height: calc(100vh - 48px);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; padding: 28px 24px 20px; }
+  .brand-mark {
+    width: 40px; height: 40px; flex-shrink: 0; border-radius: 12px;
+    background: var(--primary); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; font-weight: 700;
+    box-shadow: 0 4px 12px rgba(37, 99, 235, .35);
+  }
+  .brand-name { font-size: 19px; font-weight: 700; color: var(--ink); line-height: 1.25; }
+  .brand-sub { font-size: 12px; color: var(--ink-2); }
+  .nav { flex: 1; overflow-y: auto; padding: 4px 16px; }
+  .nav ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .nav button {
+    width: 100%; display: flex; align-items: center; gap: 12px;
+    min-height: 44px; padding: 10px 12px; border: 0; border-radius: 16px;
+    background: transparent; color: var(--ink-2); font-size: 14px; font-weight: 500;
+    cursor: pointer; text-align: left; position: relative;
+  }
+  .nav button:hover { background: rgba(255, 255, 255, .45); color: var(--ink); }
+  .nav button.active {
+    color: var(--primary-text); font-weight: 600;
+    background: rgba(255, 255, 255, .60);
+    -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+    border: 1px solid #fff;
+    box-shadow: 0 12px 36px rgba(0, 0, 0, .18);
+  }
+  .nav .ico { font-size: 18px; line-height: 1; flex-shrink: 0; }
+  .sidebar-foot { padding: 20px 24px; color: var(--ink-2); font-size: 12px; border-top: 1px solid rgba(31, 41, 55, .08); }
+
+  /* ---- 主区 ---- */
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+  .menu-btn { display: none; }
+
+  /* 顶栏：FLMX h5 header 的玻璃条做法，但用 70% 白保证对比度 */
+  .topbar {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 14px 20px; border-radius: 20px;
+    background: rgba(255, 255, 255, .70);
+    -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px);
+    border: 1px solid var(--line);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, .08);
+  }
+  .topbar h1 { font-size: 18px; margin: 0; color: var(--ink); }
+  .topbar .spacer { flex: 1; }
+  .top-meta { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+  .top-meta .item { font-size: 13px; color: var(--ink-2); }
+  .top-meta .item b { color: var(--ink); font-weight: 600; }
+
+  /* 徽标：深色字 + 浅底，保证对比度 */
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  }
+  .badge .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .badge.ok { background: var(--ok-bg); color: var(--ok-ink); }
+  .badge.bad { background: var(--bad-bg); color: var(--bad-ink); }
+  .badge.idle { background: #e5e7eb; color: #374151; }
+  .badge.info { background: var(--primary-soft); color: var(--primary-text); }
+  .badge.warn { background: #fef3c7; color: #92400e; }
+
+  /* 概览小卡 */
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .card {
+    background: rgba(255, 255, 255, .72);
+    -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, .10), 0 2px 4px -2px rgba(0, 0, 0, .10);
+    padding: 18px 20px;
+  }
+  .card .label { color: var(--ink-2); font-size: 13px; }
+  .card .value { font-size: 24px; font-weight: 700; margin-top: 6px; color: var(--ink); word-break: break-all; }
+  .card .sub { color: var(--ink-2); font-size: 13px; margin-top: 6px; word-break: break-all; }
+
+  /* 内容大卡：入站卡 / 出站卡 */
+  section.panel-card {
+    background: rgba(255, 255, 255, .72);
+    -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, .10), 0 4px 6px -4px rgba(0, 0, 0, .10);
+    padding: 20px 22px;
+  }
+  section.panel-card > h2 { font-size: 17px; margin: 0 0 4px; color: var(--ink); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  section.panel-card > .desc { color: var(--ink-2); font-size: 13px; margin: 0 0 16px; }
+  .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px 20px; margin: 12px 0; }
+  .field .k { color: var(--ink-2); font-size: 12px; }
+  .field .v { font-size: 15px; font-weight: 600; color: var(--ink); margin-top: 2px; word-break: break-all; }
+  .field .v.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 14px; }
+
+  label { display: block; margin: 10px 0 4px; font-size: 14px; color: var(--ink); font-weight: 500; }
+  input, select {
+    padding: 9px 12px; border: 1px solid #d1d5db; border-radius: 10px;
+    font-size: 14px; width: 260px; max-width: 100%; box-sizing: border-box;
+    background: rgba(255, 255, 255, .9); color: var(--ink);
+  }
+  input:disabled { background: #f3f4f6; color: var(--ink-2); }
+  input[type="checkbox"] { width: auto; accent-color: var(--primary); }
+  .check-row { display: flex; align-items: flex-start; gap: 8px; margin: 10px 0 0; font-size: 14px; color: var(--ink); }
+  .check-row input { margin-top: 3px; }
+  .check-row small { display: block; color: var(--ink-2); font-size: 12px; }
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0 20px; }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  button.btn {
+    padding: 9px 18px; border: none; border-radius: 10px; background: var(--primary);
+    color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+    box-shadow: 0 2px 6px rgba(37, 99, 235, .30);
+  }
+  button.btn:hover { background: var(--primary-dark); }
+  button.btn.secondary { background: #4b5563; box-shadow: 0 2px 6px rgba(75, 85, 99, .30); }
+  button.btn.secondary:hover { background: #374151; }
+  button.btn.danger { background: var(--bad); box-shadow: 0 2px 6px rgba(185, 28, 28, .30); }
+  button.btn.danger:hover { background: #991b1b; }
+  button.btn.ghost { background: rgba(255, 255, 255, .85); color: var(--primary-dark); border: 1px solid #bfdbfe; box-shadow: none; }
+  button.btn:disabled { opacity: .55; cursor: not-allowed; }
+  button.btn.small { padding: 6px 12px; font-size: 13px; border-radius: 8px; }
+
+  table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+  th, td { border-bottom: 1px solid rgba(31, 41, 55, .10); text-align: left; padding: 10px 8px; font-size: 14px; vertical-align: middle; }
+  th { color: var(--ink-2); font-size: 12px; font-weight: 600; }
+  td .ops { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .muted { color: var(--ink-2); }
+  .ok-text { color: var(--ok); font-weight: 600; }
+  .bad-text { color: var(--bad); font-weight: 600; }
+  pre {
+    background: rgba(17, 24, 39, .92); color: #e5e7eb; padding: 14px; border-radius: 12px;
+    overflow: auto; font-size: 13px; white-space: pre-wrap; margin: 12px 0 0;
+  }
+  .test-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+  .test-box { border: 1px solid rgba(31, 41, 55, .12); border-radius: 14px; padding: 12px 14px; background: rgba(255, 255, 255, .55); }
+  .test-box h3 { margin: 0 0 6px; font-size: 14px; color: var(--ink); }
+  .test-box p { margin: 2px 0; font-size: 13px; color: var(--ink-2); }
+  .test-box p b { color: var(--ink); }
+  .log-list { list-style: none; margin: 8px 0 0; padding: 0; font-size: 13px; max-height: 180px; overflow-y: auto; }
+  .log-list li { padding: 6px 0; border-bottom: 1px solid rgba(31, 41, 55, .08); color: var(--ink-2); word-break: break-word; }
+  .log-list li b { color: var(--ink); }
+  .msg { margin-top: 10px; font-size: 14px; }
+
+  /* 登录页：居中玻璃卡 */
+  #loginBox { max-width: 380px; margin: 90px auto; padding: 28px; }
+  #loginBox h2 { margin: 0 0 8px; font-size: 19px; color: var(--ink); }
+  #loginBox p { color: var(--ink-2); font-size: 13px; }
+  #app { display: none; }
+
+  @media (max-width: 900px) {
+    .shell { padding: 12px; gap: 0; }
+    .sidebar {
+      position: fixed; top: 0; left: 0; z-index: 50; height: 100vh;
+      border-radius: 0 24px 24px 0; width: 264px;
+      transform: translateX(-105%); transition: transform .25s ease;
+    }
+    .sidebar.open { transform: translateX(0); }
+    .overlay.show {
+      display: block; position: fixed; inset: 0; z-index: 40;
+      background: rgba(0, 0, 0, .30);
+      -webkit-backdrop-filter: blur(2px); backdrop-filter: blur(2px);
+    }
+    .menu-btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 40px; height: 40px; border-radius: 12px; border: 1px solid var(--line);
+      background: rgba(255, 255, 255, .70); font-size: 19px; cursor: pointer; color: var(--ink);
+    }
+    .cards { grid-template-columns: 1fr; }
+    .test-grid { grid-template-columns: 1fr; }
+    .topbar h1 { font-size: 16px; }
+  }
+</style>
+</head>
+<body>
+<div id="loginBox" class="card">
+  <h2>OpenVPN + SK5 面板登录</h2>
+  <p>首次启动的随机管理员密码打印在服务端 stdout，并写入 /etc/openvpn-sk5-panel/admin.pass（600）。</p>
+  <label for="password">管理员密码</label>
+  <input id="password" type="password" autocomplete="current-password" style="width:100%">
+  <div class="btn-row"><button id="loginBtn" type="button" class="btn">登录</button></div>
+  <p id="loginMsg" class="msg"></p>
+</div>
+
+<div id="app">
+  <div class="shell">
+    <div id="overlay" class="overlay"></div>
+    <!-- 左侧栏：FLMX admin.tsx 的 aside 结构；按定稿删掉分组小标题，导航扁平一列 -->
+    <aside id="sidebar" class="sidebar" aria-label="主导航">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">◈</div>
+        <div>
+          <div class="brand-name">OpenVPN · SK5</div>
+          <div class="brand-sub">中转面板</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <ul>
+          <li><button type="button" data-nav="overview" class="active"><span class="ico">▦</span><span>概览</span></button></li>
+          <li><button type="button" data-nav="nodes"><span class="ico">🖥</span><span>节点</span></button></li>
+          <li><button type="button" data-nav="ovpn"><span class="ico">🔒</span><span>OpenVPN 服务</span></button></li>
+          <li><button type="button" data-nav="users"><span class="ico">👥</span><span>用户</span></button></li>
+          <li><button type="button" data-nav="sk5"><span class="ico">↗</span><span>SK5 出口</span></button></li>
+          <li><button type="button" data-nav="logs"><span class="ico">≡</span><span>日志</span></button></li>
+        </ul>
+      </nav>
+      <div class="sidebar-foot">OpenVPN + SK5 中转面板<br>玻璃适中 · 对比度 ≥ 4.5</div>
+    </aside>
+
+    <div class="main">
+      <!-- 顶栏 -->
+      <div class="topbar">
+        <button id="menuBtn" type="button" class="menu-btn" aria-label="打开菜单">☰</button>
+        <h1 id="pageTitle">概览</h1>
+        <div class="spacer"></div>
+        <div class="top-meta">
+          <span class="item">节点 <b id="topNode">—</b></span>
+          <span class="item">出口 IP <b id="topEgress">—</b></span>
+          <span id="topBadge" class="badge idle"><span class="dot"></span>未知</span>
+        </div>
+        <button id="refreshBtn" type="button" class="btn ghost small">刷新</button>
+        <button id="changePwBtn" type="button" class="btn ghost small">修改密码</button>
+        <button id="logoutBtn" type="button" class="btn secondary small">退出登录</button>
+      </div>
+
+      <!-- 概览三卡 -->
+      <div class="cards" id="overview">
+        <div class="card">
+          <div class="label">OpenVPN 状态</div>
+          <div class="value" id="ovpnState">—</div>
+          <div class="sub" id="ovpnSub">—</div>
+        </div>
+        <div class="card">
+          <div class="label">当前出口 IP</div>
+          <div class="value" id="egressIp">—</div>
+          <div class="sub" id="egressSub">—</div>
+        </div>
+        <div class="card">
+          <div class="label">SK5 状态</div>
+          <div class="value" id="sk5State">—</div>
+          <div class="sub" id="sk5Sub">—</div>
+        </div>
+      </div>
+
+      <!-- 修改密码：调 POST /api/change-password；成功后全部旧会话作废，须重新登录 -->
+      <section class="panel-card" id="changePwCard" style="display:none">
+        <h2>修改管理员密码</h2>
+        <p class="desc">新密码至少 12 个字符，含字母和数字，且与旧密码不同。修改成功后全部旧会话立即作废，当前页面将回到登录页，请用新密码重新登录。</p>
+        <form id="changePwForm">
+          <div class="form-grid">
+            <div>
+              <label for="oldPw">当前密码</label>
+              <input id="oldPw" type="password" autocomplete="current-password">
+            </div>
+            <div>
+              <label for="newPw">新密码</label>
+              <input id="newPw" type="password" autocomplete="new-password">
+            </div>
+            <div>
+              <label for="confirmPw">确认新密码</label>
+              <input id="confirmPw" type="password" autocomplete="new-password">
+            </div>
+          </div>
+          <div class="btn-row"><button type="submit" class="btn">确认修改</button></div>
+        </form>
+        <p id="changePwMsg" class="msg"></p>
+      </section>
+
+      <!-- 节点 / agent -->
+      <section class="panel-card" id="nodes">
+        <h2>🖥 节点 <span id="nodeBadge" class="badge idle"><span class="dot"></span>未注册</span></h2>
+        <p class="desc">远程中转机（agent）在这里注册与管理：注册时 token 与安装命令只返回一次，当场记下；节点离线只影响该节点。单节点自动用唯一节点，多节点时先在下面选当前节点，再操作 OpenVPN / SK5。</p>
+        <div class="form-grid">
+          <div>
+            <label for="nodeSelect">当前节点（OpenVPN / SK5 操作发往该节点）</label>
+            <select id="nodeSelect"><option value="">— 未注册节点 —</option></select>
+          </div>
+          <div>
+            <label for="newNodeName">注册新节点：节点名</label>
+            <input id="newNodeName" type="text" placeholder="例如 hk-transit">
+          </div>
+          <div>
+            <label for="newNodeUrl">面板地址（可空，默认当前面板地址）</label>
+            <input id="newNodeUrl" type="text" placeholder="例如 https://ovpn-sk5-panel.example.workers.dev">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="registerNodeBtn" type="button" class="btn">注册节点</button>
+          <button id="refreshNodesBtn" type="button" class="btn secondary">刷新节点</button>
+          <button id="refreshCmdsBtn" type="button" class="btn secondary">刷新命令状态</button>
+        </div>
+        <p id="nodeMsg" class="msg"></p>
+        <pre id="nodeTokenBox" style="display:none"></pre>
+        <table>
+          <thead>
+            <tr><th>节点</th><th>地址</th><th>在线</th><th>出口 IP</th><th>SK5</th><th>操作</th></tr>
+          </thead>
+          <tbody id="nodeTable">
+            <tr><td colspan="6" class="muted">暂无节点</td></tr>
+          </tbody>
+        </table>
+        <h3 style="font-size:14px;margin:18px 0 4px">命令记录（只存本浏览器，刷新页面仍在）</h3>
+        <p class="muted" style="margin:0 0 6px;font-size:13px">写操作下发后只表示“已排队”，这里按命令查到 done/failed 才算完；超时未回执的幂等命令会自动重发，非幂等命令标失败须手动重发。</p>
+        <table>
+          <thead>
+            <tr><th>时间</th><th>节点</th><th>动作</th><th>状态</th><th>结果 / 错误</th></tr>
+          </thead>
+          <tbody id="cmdTable">
+            <tr><td colspan="5" class="muted">暂无命令</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- 入站卡：OpenVPN 服务 -->
+      <section class="panel-card" id="ovpn">
+        <h2>🔒 OpenVPN 服务 <span id="ovpnBadge" class="badge idle"><span class="dot"></span>未知</span></h2>
+        <p class="desc">一张入站卡：协议、端口、子网、密码学、在线用户。改配置后需重启服务才生效。</p>
+        <div class="fields">
+          <div class="field"><div class="k">协议 / 端口</div><div class="v" id="ovpnProtoPort">—</div></div>
+          <div class="field"><div class="k">隧道子网</div><div class="v mono" id="ovpnSubnet">10.8.0.0/24</div></div>
+          <div class="field"><div class="k">推送 DNS</div><div class="v mono" id="ovpnDns">1.1.1.1</div></div>
+          <div class="field"><div class="k">密码学</div><div class="v">AES-256-GCM / SHA256</div></div>
+          <div class="field"><div class="k">在线用户</div><div class="v" id="ovpnOnline">—</div></div>
+          <div class="field"><div class="k">进程 PID</div><div class="v mono" id="ovpnPid">—</div></div>
+        </div>
+        <div class="form-grid">
+          <div>
+            <label for="port">端口</label>
+            <input id="port" type="number" value="1194" min="1" max="65535">
+          </div>
+          <div>
+            <label for="proto">协议</label>
+            <select id="proto">
+              <option value="udp" selected>UDP（优先，TCP 套 TCP 会重传放大）</option>
+              <option value="tcp">TCP（SK5 只支持 TCP 时用）</option>
+            </select>
+          </div>
+          <div>
+            <label for="subnet">隧道子网（core 固定，不可改）</label>
+            <input id="subnet" type="text" value="10.8.0.0/24" disabled>
+          </div>
+          <div>
+            <label for="dns">推送 DNS（core 固定，不可改）</label>
+            <input id="dns" type="text" value="1.1.1.1" disabled>
+          </div>
+          <div>
+            <label for="serverIp">对外地址（.ovpn 的 remote，留空=自动探测公网 IP）</label>
+            <input id="serverIp" type="text" placeholder="例如 1.2.3.4 或 vpn.example.com">
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <button id="detectIpBtn" type="button" class="btn secondary">自动探测公网 IP</button>
+          </div>
+        </div>
+        <p id="remoteWarning" class="msg"></p>
+        <div class="btn-row">
+          <button id="saveServerBtn" type="button" class="btn">保存服务配置</button>
+          <button id="startBtn" type="button" class="btn">启动</button>
+          <button id="restartBtn" type="button" class="btn secondary">重启</button>
+          <button id="stopBtn" type="button" class="btn danger">停止</button>
+          <button id="rebuildCaBtn" type="button" class="btn danger">重建 CA</button>
+        </div>
+        <p class="msg muted">重建 CA（R7-P2-9）：销毁现有 CA，全部已签发用户证书立即失效，旧 .ovpn 全部作废；重建后须逐个重建用户并重新下载 .ovpn，再重启 OpenVPN 服务。点按钮后有两次确认。</p>
+        <p id="serverMsg" class="msg"></p>
+      </section>
+
+      <!-- 用户表 -->
+      <section class="panel-card" id="users">
+        <h2>👥 用户</h2>
+        <p class="desc">新建用户即签发证书，下载 .ovpn 导入客户端即可连接。吊销后须重启 OpenVPN 服务才对新连接生效。</p>
+        <div class="form-grid">
+          <div>
+            <label for="newUser">新建用户名</label>
+            <input id="newUser" type="text" placeholder="例如 alice">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="createUserBtn" type="button" class="btn">新建用户</button>
+          <button id="refreshUsersBtn" type="button" class="btn secondary">刷新列表</button>
+        </div>
+        <table>
+          <thead>
+            <tr><th>用户名</th><th>证书状态</th><th>在线</th><th>操作</th></tr>
+          </thead>
+          <tbody id="userTable">
+            <tr><td colspan="4" class="muted">暂无用户</td></tr>
+          </tbody>
+        </table>
+        <p id="userMsg" class="msg"></p>
+      </section>
+
+      <!-- 链式出站卡：SK5 出口 -->
+      <section class="panel-card" id="sk5">
+        <h2>↗ SK5 出口链 <span id="sk5Badge" class="badge idle"><span class="dot"></span>未启用</span></h2>
+        <p class="desc">一张链式出站卡：OpenVPN 用户流量经策略路由进 sing-box，再由购买的 SK5 出去。TCP 与 UDP 测试结果分开显示。注意：DNS 查询（53 端口）默认直出、不经过 SK5（sing-box 模板的既定设计），只有 TCP/UDP 业务流量走 SK5。</p>
+        <div class="fields">
+          <div class="field"><div class="k">SK5 地址</div><div class="v mono" id="sk5Addr">未配置</div></div>
+          <div class="field"><div class="k">当前出口 IP</div><div class="v mono" id="sk5EgressIp">—</div></div>
+          <div class="field"><div class="k">sing-box</div><div class="v" id="sk5Singbox">—</div></div>
+          <div class="field"><div class="k">策略路由</div><div class="v" id="sk5Policy">—</div></div>
+        </div>
+        <div class="form-grid">
+          <div>
+            <label for="sk5Host">SK5 地址（host）</label>
+            <input id="sk5Host" type="text" placeholder="例如 proxy.iproyal.net">
+          </div>
+          <div>
+            <label for="sk5Port">SK5 端口</label>
+            <input id="sk5Port" type="number" value="1001" min="1" max="65535">
+            <small class="muted">端口待确认：默认 1001；若商家给的是 9000 请填 9000 并回报</small>
+          </div>
+          <div>
+            <label for="sk5User">用户名</label>
+            <input id="sk5User" type="text" autocomplete="username">
+          </div>
+          <div>
+            <label for="sk5Pass">密码</label>
+            <input id="sk5Pass" type="password" autocomplete="current-password">
+          </div>
+        </div>
+        <label class="check-row"><input id="sk5Enabled" type="checkbox"><span>启用 SK5 作为出口</span></label>
+        <label class="check-row"><input id="sk5FailOpen" type="checkbox"><span>故障回直连<small>不勾 = 默认断网保护：SK5 断链时 VPN 流量黑洞，不静默回直连</small></span></label>
+        <label class="check-row"><input id="sk5Uot" type="checkbox"><span>UDP over TCP<small>商家不支持原生 UDP ASSOCIATE 时勾，sing-box 把 UDP 包进 TCP</small></span></label>
+        <div class="btn-row">
+          <button id="saveSk5Btn" type="button" class="btn">保存 SK5 配置</button>
+          <button id="testSk5Btn" type="button" class="btn secondary">测试 SK5</button>
+          <button id="enableSk5Btn" type="button" class="btn">一键启用</button>
+          <button id="disableSk5Btn" type="button" class="btn danger">停用（回直连）</button>
+        </div>
+        <p id="sk5Msg" class="msg"></p>
+        <div class="test-grid">
+          <div class="test-box">
+            <h3>TCP 测试</h3>
+            <p>结果：<b id="tcpResult">未测试</b></p>
+            <p>延迟：<b id="tcpLatency">—</b></p>
+            <p>出口 IP：<b id="tcpEgress">—</b></p>
+          </div>
+          <div class="test-box">
+            <h3>UDP 测试</h3>
+            <p>结果：<b id="udpResult">未测试</b></p>
+            <p>模式：<b id="udpMode">—</b></p>
+            <p>说明：<b id="udpNote">若 UDP 不支持，OpenVPN 须切 TCP 模式</b></p>
+          </div>
+        </div>
+        <pre id="testResult">未测试。TCP 与 UDP 分开显示。</pre>
+      </section>
+
+      <!-- 日志 -->
+      <section class="panel-card" id="logs">
+        <h2>≡ 日志</h2>
+        <p class="desc">本页操作记录（仅当前浏览器会话，不存服务端）。</p>
+        <ul id="logList" class="log-list"><li class="muted">暂无记录</li></ul>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script>
+/* 接口与 panel/app.py 实物一一对应（不自造接口）：
+   GET /api/me, POST /api/login, POST /api/logout, GET /api/status,
+   POST /api/openvpn/server, GET /api/openvpn/public-ip,
+   POST /api/openvpn/start|stop|restart, POST /api/openvpn/init-pki,
+   GET/POST /api/openvpn/users, DELETE /api/openvpn/users/<name>,
+   GET /api/openvpn/users/<name>/ovpn,
+   GET/POST /api/sk5, POST /api/sk5/test|enable|disable,
+   POST /api/sk5/fail-open, POST /api/sk5/udp-over-tcp,
+   GET/POST /api/nodes, DELETE /api/nodes/<name>,
+   POST /api/nodes/<name>/rotate, POST /api/nodes/<name>/install,
+   POST /api/cmd, GET /api/cmd/<id>
+   写操作语义（P0-1）：Cloudflare 模式返回 202 + cmd_id 只表示“已排队”，
+   必须用 apiWait() 按 cmd_id 轮询 /api/cmd/:id 等到 done/failed 才报
+   成功/失败，绝不凭 202 报成功；Flask 直连模式直接返回结果，同样走 apiWait。
+*/
+function showMsg(id, text, ok) {
+  var el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = "msg " + (ok === true ? "ok-text" : ok === false ? "bad-text" : "muted");
+}
+function addLog(text, ok) {
+  var ul = document.getElementById("logList");
+  var first = ul.querySelector("li.muted");
+  if (first) first.remove();
+  var li = document.createElement("li");
+  var t = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  var b = document.createElement("b");
+  b.textContent = "[" + t + "] ";
+  li.appendChild(b);
+  li.appendChild(document.createTextNode(text));
+  if (ok === true) li.style.color = "#15803d";
+  if (ok === false) li.style.color = "#b91c1c";
+  ul.prepend(li);
+  while (ul.children.length > 50) ul.removeChild(ul.lastChild);
+}
+/* 当前节点：多节点时 OpenVPN / SK5 兼容接口带 ?node= 发往该节点；
+   单节点留空，由面板自动用唯一节点。存 localStorage，刷新页面仍在。 */
+var currentNode = localStorage.getItem("ovpn-current-node") || "";
+function withNode(path) {
+  if (!currentNode) return path;
+  if (path.indexOf("/api/status") !== 0 && path.indexOf("/api/openvpn/") !== 0 && path.indexOf("/api/sk5") !== 0) return path;
+  return path + (path.indexOf("?") === -1 ? "?" : "&") + "node=" + encodeURIComponent(currentNode);
+}
+async function api(path, method, body) {
+  var opts = { method: method || "GET", headers: {} };
+  if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  var res = await fetch(withNode(path), opts);
+  var data = await res.json().catch(function () { return { ok: false, error: "响应不是 JSON" }; });
+  if (res.status === 401) { showLogin(); throw new Error("未登录"); }
+  if (res.status === 429) { throw new Error(data.error || "请求过快，请稍后再试"); }
+  if (!res.ok || data.ok === false) { throw new Error(data.error || ("HTTP " + res.status)); }
+  return data;
+}
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+/* 按 cmd_id 等真实结果：每 2 秒查一次 /api/cmd/:id，最多 120 秒；
+   done 返回命令记录，failed 抛错，超时抛错（绝不报“已成功”）。 */
+async function waitCmd(cmdId, msgId, pendingText) {
+  for (var i = 0; i < 60; i++) {
+    await sleep(2000);
+    var cmd;
+    try { cmd = await api("/api/cmd/" + encodeURIComponent(cmdId)); }
+    catch (e) { throw new Error("查询命令结果失败：" + e.message); }
+    if (msgId) showMsg(msgId, pendingText + "（已等 " + ((i + 1) * 2) + " 秒）");
+    if (cmd.status === "done") return cmd;
+    if (cmd.status === "failed") throw new Error(cmd.error || "命令执行失败");
+  }
+  throw new Error("命令已下发超过 120 秒未回执，agent 可能离线；请在“节点”页的命令记录里查看");
+}
+/* 写操作统一入口：直接结果（Flask 直连）原样返回；202 排队（Cloudflare）
+   则轮询等真实结果。返回的命令记录进“节点”页的命令记录。 */
+async function apiWait(path, method, body, msgId, pendingText) {
+  var d = await api(path, method, body);
+  if (d && d.queued && d.cmd_id) {
+    logCmd({ cmd_id: d.cmd_id, action: d.action || path, node: d.node || currentNode || "", status: "queued", at: new Date().toISOString() });
+    if (msgId) showMsg(msgId, pendingText || "已下发，等待 agent 执行…");
+    var cmd = await waitCmd(d.cmd_id, msgId, pendingText || "已下发，等待 agent 执行…");
+    updateCmdLog(cmd);
+    return cmd;
+  }
+  return d;
+}
+/* 测试结果归一化：Flask 直接返回 {test:{tcp,udp}}，Worker 命令回执是
+   agent 原始结果 {tcp_ok, udp_ok, egress_ip, latency_ms, udp_mode, udp_note}，
+   两种都收敛成 {tcp:{ok,latency_ms,egress_ip}, udp:{ok,mode,note}}。 */
+function normalizeTest(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  var t = raw.test || raw;
+  if (!t || typeof t !== "object") return null;
+  var tcp = t.tcp || {};
+  var udp = t.udp || {};
+  return {
+    tcp: {
+      ok: tcp.ok != null ? tcp.ok : (t.tcp_ok != null ? t.tcp_ok : null),
+      latency_ms: tcp.latency_ms != null ? tcp.latency_ms : (t.latency_ms != null ? t.latency_ms : null),
+      egress_ip: tcp.egress_ip || t.egress_ip || null
+    },
+    udp: {
+      ok: udp.ok != null ? udp.ok : (t.udp_ok != null ? t.udp_ok : null),
+      mode: udp.mode || t.udp_mode || null,
+      note: udp.note || t.udp_note || null
+    },
+    egress_ip: t.egress_ip || null
+  };
+}
+/* 最近一次测试结果与服务协议（1-25 前端守卫用：UDP 模式 + UDP 测试失败过，
+   保存 SK5 前先让用户确认；未测过的不拦，只提示先测）。 */
+var lastTest = null;
+var lastServerProto = null;
+var lastServerPort = null;
+function showLogin() {
+  document.getElementById("app").style.display = "none";
+  document.getElementById("loginBox").style.display = "block";
+}
+function showApp() {
+  document.getElementById("loginBox").style.display = "none";
+  document.getElementById("app").style.display = "block";
+}
+function setBadge(id, text, kind) {
+  var el = document.getElementById(id);
+  el.className = "badge " + (kind || "idle");
+  el.innerHTML = "";
+  var dot = document.createElement("span");
+  dot.className = "dot";
+  el.appendChild(dot);
+  el.appendChild(document.createTextNode(text));
+}
+async function loadStatus() {
+  var d = await api("/api/status");
+  var ovpn = d.openvpn || {};
+  var eg = d.egress || {};
+  var sk5 = d.sk5 || {};
+  lastServerProto = ovpn.proto || null;
+  lastServerPort = ovpn.port || null;
+  var st = document.getElementById("ovpnState");
+  st.textContent = ovpn.running ? "运行中" : "已停止";
+  st.className = "value " + (ovpn.running ? "ok-text" : "bad-text");
+  document.getElementById("ovpnSub").textContent =
+    "在线用户 " + (ovpn.online_users || 0) + " 人" +
+    (ovpn.port ? " · " + ovpn.proto + "/" + ovpn.port : "") +
+    (ovpn.subnet ? " · " + ovpn.subnet : "") + (ovpn.error ? " · " + ovpn.error : "");
+  document.getElementById("egressIp").textContent = eg.ip || "—";
+  document.getElementById("egressSub").textContent =
+    (eg.via_sk5 ? "经 SK5 出口" : eg.via_sk5 === false ? "直连出口" : "") +
+    (eg.latency_ms != null ? " · 延迟 " + eg.latency_ms + " ms" : "") +
+    (eg.error ? " · " + eg.error : "") +
+    (d.stale ? " · 状态为缓存快照（" + (d.age_s != null ? d.age_s + " 秒前" : "未上报") + "），agent 未上报" : "");
+  var ss = document.getElementById("sk5State");
+  ss.textContent = sk5.enabled ? "已启用" : "未启用";
+  ss.className = "value " + (sk5.enabled ? "ok-text" : "");
+  document.getElementById("sk5Sub").textContent =
+    (sk5.host ? sk5.host + ":" + sk5.port : "未配置") + (sk5.error ? " · " + sk5.error : "");
+  setBadge("ovpnBadge", ovpn.running ? "运行中" : "已停止", ovpn.running ? "ok" : "bad");
+  setBadge("sk5Badge", sk5.enabled ? "已启用" : "未启用", sk5.enabled ? "ok" : "idle");
+  setBadge("topBadge", ovpn.running ? "运行中" : "已停止", ovpn.running ? "ok" : "bad");
+  document.getElementById("topEgress").textContent = eg.ip || "—";
+  document.getElementById("topNode").textContent = currentNode || (d.node || "本机");
+  document.getElementById("ovpnProtoPort").textContent =
+    (ovpn.proto && ovpn.port) ? ovpn.proto.toUpperCase() + " / " + ovpn.port : "—";
+  if (ovpn.subnet) { document.getElementById("ovpnSubnet").textContent = ovpn.subnet; }
+  if (ovpn.dns) { document.getElementById("ovpnDns").textContent = ovpn.dns; }
+  document.getElementById("ovpnOnline").textContent = (ovpn.online_users || 0) + " 人";
+  document.getElementById("ovpnPid").textContent = ovpn.pid ? String(ovpn.pid) : "—";
+  document.getElementById("sk5Addr").textContent = sk5.host ? sk5.host + ":" + sk5.port : "未配置";
+  document.getElementById("sk5EgressIp").textContent = eg.ip || "—";
+  document.getElementById("sk5Singbox").textContent =
+    sk5.singbox_running === true ? "运行中" : sk5.singbox_running === false ? "未运行" : "—";
+  document.getElementById("sk5Policy").textContent =
+    sk5.policy_routing_active === true ? "已生效" : sk5.policy_routing_active === false ? "未生效" : "—";
+  if (ovpn.port) { document.getElementById("port").value = ovpn.port; }
+  if (ovpn.proto) { document.getElementById("proto").value = ovpn.proto; }
+  if (ovpn.subnet) { document.getElementById("subnet").value = ovpn.subnet; }
+  if (ovpn.dns) { document.getElementById("dns").value = ovpn.dns; }
+  /* 对外地址：只在用户没在编辑时回填，不抢正在输入的内容 */
+  var ipInput = document.getElementById("serverIp");
+  if (ovpn.remote_ip && document.activeElement !== ipInput) {
+    if (!ipInput.value || ipInput.dataset.auto === "1") {
+      ipInput.value = ovpn.remote_ip;
+      ipInput.dataset.auto = "1";
+    }
+  }
+  var rw = document.getElementById("remoteWarning");
+  if (ovpn.remote_warning) {
+    rw.textContent = "⚠ " + ovpn.remote_warning;
+    rw.className = "msg bad-text";
+  } else if (ovpn.remote_ip) {
+    rw.textContent = "当前 .ovpn 的 remote 为公网地址 " + ovpn.remote_ip + "，站外客户端可直连。";
+    rw.className = "msg ok-text";
+  } else {
+    rw.textContent = "";
+    rw.className = "msg";
+  }
+  if (d.modules_missing && d.modules_missing.length) {
+    showMsg("serverMsg", "缺失模块（对接路未落盘）：" + d.modules_missing.join(", "), false);
+  }
+}
+async function loadUsers() {
+  try {
+    var d = await api("/api/openvpn/users");
+    var tb = document.getElementById("userTable");
+    var users = d.users || [];
+    if (!users.length) { tb.innerHTML = '<tr><td colspan="4" class="muted">暂无用户</td></tr>'; return; }
+    tb.innerHTML = "";
+    users.forEach(function (u) {
+      var tr = document.createElement("tr");
+      var name = u.name || u.username || "";
+      var state = u.status === "revoked" ? "已吊销" : u.status === "expired" ? "已过期" : "有效";
+      var tdName = document.createElement("td"); tdName.textContent = name;
+      if (u.legacy) {
+        var lg = document.createElement("span");
+        lg.className = "badge warn"; lg.textContent = "旧证书";
+        lg.title = "该证书签发时 CN 异常（旧版 bug），仍可正常使用；重建同名用户可换发 CN 正确的证书";
+        tdName.appendChild(document.createTextNode(" "));
+        tdName.appendChild(lg);
+      }
+      var tdState = document.createElement("td");
+      var badge = document.createElement("span");
+      badge.className = "badge " + (u.status === "revoked" || u.status === "expired" ? "bad" : "ok");
+      badge.textContent = state;
+      tdState.appendChild(badge);
+      var tdOnline = document.createElement("td");
+      var ob = document.createElement("span");
+      ob.className = "badge " + (u.online ? "ok" : "idle");
+      ob.textContent = u.online ? "在线" : "离线";
+      tdOnline.appendChild(ob);
+      var tdOps = document.createElement("td");
+      var ops = document.createElement("span"); ops.className = "ops";
+      var dl = document.createElement("a");
+      dl.href = withNode("/api/openvpn/users/" + encodeURIComponent(name) + "/ovpn"); /* R11-P1-1 残留：纯浏览器 href 不走 api()，须显式带 ?node=，否则多节点下下载仍取本机文件 */
+      dl.textContent = "下载 .ovpn";
+      var revoke = document.createElement("button");
+      revoke.type = "button"; revoke.className = "btn danger small"; revoke.textContent = "吊销";
+      revoke.onclick = async function () {
+        if (!confirm("确定吊销用户 " + name + " 吗？")) { return; }
+        try {
+          var r = await apiWait("/api/openvpn/users/" + encodeURIComponent(name), "DELETE", undefined, "userMsg", "已下发吊销，等待 agent 执行…");
+          showMsg("userMsg", "已吊销 " + name + (r.note ? "。" + r.note : "（吊销后须重启 OpenVPN 服务才对新连接生效）"), true);
+          addLog("吊销用户 " + name, true);
+          loadUsers(); loadStatus();
+        } catch (e) { showMsg("userMsg", e.message, false); addLog("吊销用户 " + name + " 失败：" + e.message, false); }
+      };
+      ops.appendChild(dl); ops.appendChild(revoke);
+      tdOps.appendChild(ops);
+      tr.appendChild(tdName); tr.appendChild(tdState); tr.appendChild(tdOnline); tr.appendChild(tdOps);
+      tb.appendChild(tr);
+    });
+  } catch (e) { showMsg("userMsg", e.message, false); }
+}
+async function loadSk5() {
+  try {
+    var d = await api("/api/sk5");
+    var c = d.sk5 || {};
+    if (c.host) { document.getElementById("sk5Host").value = c.host; }
+    if (c.port) { document.getElementById("sk5Port").value = c.port; }
+    if (c.username) { document.getElementById("sk5User").value = c.username; }
+    document.getElementById("sk5Enabled").checked = !!c.enabled;
+    document.getElementById("sk5FailOpen").checked = !!c.fail_open;
+    document.getElementById("sk5Uot").checked = !!c.udp_over_tcp;
+  } catch (e) { showMsg("sk5Msg", e.message, false); }
+}
+async function refreshAll() {
+  try { await loadStatus(); } catch (e) {}
+  await loadUsers(); await loadSk5(); await loadNodes();
+}
+/* ---- 节点 / 命令记录（P1-2）---- */
+function nodeAgeS(lastSeen) {
+  if (lastSeen == null) return null;
+  var t = (typeof lastSeen === "number") ? lastSeen : Date.parse(lastSeen);
+  if (isNaN(t)) return null;
+  return Math.floor((Date.now() - t) / 1000);
+}
+/* 节点归一化：Worker 形 {last_seen: ms, egress_ip, sk5_enabled, openvpn} 与
+   Flask 形 {last_seen: ISO, last_status:{openvpn, egress, sk5}} 都收敛。 */
+function normalizeNode(n) {
+  var ls = n.last_status || {};
+  var ovpn = n.openvpn || ls.openvpn || {};
+  var eg = ls.egress || {};
+  return {
+    name: n.name,
+    panel_url: n.panel_url || null,
+    last_seen: n.last_seen || null,
+    age_s: nodeAgeS(n.last_seen),
+    online: (function () { var a = nodeAgeS(n.last_seen); return a != null && a < 30; })(),
+    egress_ip: (n.egress_ip != null ? n.egress_ip : (eg.ip || null)),
+    sk5_enabled: (n.sk5_enabled != null ? n.sk5_enabled : (ls.sk5 ? !!ls.sk5.enabled : null)),
+    online_users: ovpn.online_users || 0,
+    proto: ovpn.proto || null,
+    port: ovpn.port || null
+  };
+}
+function setCurrentNode(name) {
+  currentNode = name || "";
+  if (currentNode) localStorage.setItem("ovpn-current-node", currentNode);
+  else localStorage.removeItem("ovpn-current-node");
+  document.getElementById("topNode").textContent = currentNode || "本机";
+  var sel = document.getElementById("nodeSelect");
+  if (sel) sel.value = currentNode;
+}
+function shellQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+/* R2-BUG-11/12: 默认安装命令必须是两步走 -- 自签面板上 plain curl
+   连脚本都下不下来 (-k 下脚本 + sha256 校验后执行，校验失败即停，
+   不许 warn 后继续跑未验脚本)；且必须带 --node-name <注册名>，
+   否则 agent 默认用 hostname 注册，poll 恒 401。 */
+/* R3-P2-13: token 与 panelUrl 同样须 shellQuote——token 目前由服务端
+   生成（字母表安全），一旦生成字母表或 panelUrl 来源放宽，裸插值
+   即成命令注入面；三处统一加引号，纵深防御。 */
+function buildInstallCommand(panelUrl, token, nodeName) {
+  var base = String(panelUrl || location.origin).replace(/\/$/, "");
+  var cmd = "curl -ksSL " + shellQuote(base + "/install-agent.sh") + " -o /tmp/install-agent.sh && "
+    + "curl -ksSL " + shellQuote(base + "/install-agent.sh.sha256") + " -o /tmp/install-agent.sh.sha256 && "
+    + "cd /tmp && sha256sum -c install-agent.sh.sha256 && "
+    + "bash /tmp/install-agent.sh --panel-url " + shellQuote(base) + " --token " + shellQuote(token);
+  if (nodeName) cmd += " --node-name " + shellQuote(nodeName);
+  return cmd;
+}
+function copyText(text, okMsg) {
+  function done() { if (okMsg) showMsg("nodeMsg", okMsg, true); }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text); done(); });
+  } else { fallbackCopy(text); done(); }
+}
+function fallbackCopy(text) {
+  var ta = document.createElement("textarea");
+  ta.value = text; document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); } catch (e) {}
+  ta.remove();
+}
+function showTokenBox(token, panelUrl, nodeName) {
+  var box = document.getElementById("nodeTokenBox");
+  box.style.display = "block";
+  box.textContent = "节点 token（只显示这一次，请当场记下；丢失只能轮换）：\n" + token
+    + "\n\n安装命令（-k 下脚本 + sha256 校验后执行，校验失败即停；--node-name 须与注册名一致，否则 agent 的 poll 会 401）：\n"
+    + buildInstallCommand(panelUrl, token, nodeName);
+  box.dataset.token = token;
+  box.dataset.panelUrl = panelUrl || location.origin;
+}
+async function loadNodes() {
+  var tb = document.getElementById("nodeTable");
+  var sel = document.getElementById("nodeSelect");
+  try {
+    var d = await api("/api/nodes");
+    var nodes = (d.nodes || []).map(normalizeNode);
+    setBadge("nodeBadge", nodes.length ? nodes.length + " 个节点" : "未注册", nodes.length ? "ok" : "idle");
+    var prev = sel.value;
+    sel.innerHTML = "";
+    var opt0 = document.createElement("option");
+    opt0.value = ""; opt0.textContent = nodes.length === 1 ? "— 单节点自动 —" : "— 请选择节点 —";
+    sel.appendChild(opt0);
+    nodes.forEach(function (n) {
+      var o = document.createElement("option");
+      o.value = n.name; o.textContent = n.name + (n.online ? "（在线）" : "（离线）");
+      sel.appendChild(o);
+    });
+    if (currentNode && nodes.some(function (n) { return n.name === currentNode; })) sel.value = currentNode;
+    else if (prev && nodes.some(function (n) { return n.name === prev; })) sel.value = prev;
+    else if (nodes.length === 1) sel.value = "";
+    if (!nodes.length) { tb.innerHTML = '<tr><td colspan="6" class="muted">暂无节点</td></tr>'; return; }
+    tb.innerHTML = "";
+    nodes.forEach(function (n) {
+      var tr = document.createElement("tr");
+      function td(text, cls) {
+        var c = document.createElement("td"); c.textContent = text;
+        if (cls) c.className = cls;
+        return c;
+      }
+      tr.appendChild(td(n.name));
+      tr.appendChild(td(n.panel_url || "—"));
+      var tdOn = document.createElement("td");
+      var ob = document.createElement("span");
+      ob.className = "badge " + (n.online ? "ok" : "idle");
+      ob.textContent = n.online ? "在线" : (n.age_s != null ? "离线 " + n.age_s + "s 前" : "从未上报");
+      tdOn.appendChild(ob); tr.appendChild(tdOn);
+      tr.appendChild(td(n.egress_ip || "—"));
+      tr.appendChild(td(n.sk5_enabled === true ? "已启用" : n.sk5_enabled === false ? "未启用" : "—"));
+      var tdOps = document.createElement("td");
+      var ops = document.createElement("span"); ops.className = "ops";
+      var useBtn = document.createElement("button");
+      useBtn.type = "button"; useBtn.className = "btn ghost small"; useBtn.textContent = "设为当前";
+      useBtn.onclick = function () { setCurrentNode(n.name); showMsg("nodeMsg", "当前节点已切到 " + n.name, true); addLog("当前节点切到 " + n.name, true); refreshAll(); };
+      var cmdBtn = document.createElement("button");
+      cmdBtn.type = "button"; cmdBtn.className = "btn secondary small"; cmdBtn.textContent = "复制安装命令";
+      cmdBtn.onclick = async function () {
+        try {
+          var r = await api("/api/nodes/" + encodeURIComponent(n.name) + "/install", "POST", {});
+          copyText(r.command_template || "", "安装命令模板已复制（把 <NODE_TOKEN> 换成注册时记下的 token）");
+        } catch (e) {
+          copyText(buildInstallCommand(n.panel_url || location.origin, "<NODE_TOKEN>", n.name), "安装命令模板已复制（把 <NODE_TOKEN> 换成注册时记下的 token）");
+        }
+      };
+      var rotBtn = document.createElement("button");
+      rotBtn.type = "button"; rotBtn.className = "btn secondary small"; rotBtn.textContent = "轮换 token";
+      rotBtn.onclick = async function () {
+        if (!confirm("轮换后旧 token 立即失效，旧 agent 须重跑安装命令。确定轮换 " + n.name + " 吗？")) return;
+        try {
+          var r = await api("/api/nodes/" + encodeURIComponent(n.name) + "/rotate", "POST", {});
+          showTokenBox(r.token, (r.node && r.node.panel_url) || n.panel_url, n.name);
+          showMsg("nodeMsg", "已轮换 " + n.name + "，新 token 只显示一次", true);
+          addLog("轮换节点 token " + n.name, true);
+        } catch (e) { showMsg("nodeMsg", e.message, false); }
+      };
+      var delBtn = document.createElement("button");
+      delBtn.type = "button"; delBtn.className = "btn danger small"; delBtn.textContent = "吊销";
+      delBtn.onclick = async function () {
+        if (!confirm("确定吊销节点 " + n.name + " 吗？旧 token 立即作废，排队/已下发的命令一律标失败。")) return;
+        try {
+          await api("/api/nodes/" + encodeURIComponent(n.name), "DELETE");
+          if (currentNode === n.name) setCurrentNode("");
+          showMsg("nodeMsg", "已吊销 " + n.name, true);
+          addLog("吊销节点 " + n.name, true);
+          loadNodes(); loadStatus();
+        } catch (e) { showMsg("nodeMsg", e.message, false); }
+      };
+      ops.appendChild(useBtn); ops.appendChild(cmdBtn); ops.appendChild(rotBtn); ops.appendChild(delBtn);
+      tdOps.appendChild(ops); tr.appendChild(tdOps);
+      tb.appendChild(tr);
+    });
+  } catch (e) { showMsg("nodeMsg", e.message, false); }
+}
+/* 命令记录：本浏览器 localStorage 存最近 30 条，写操作下发时记 queued，
+   回执到 done/failed 时更新；刷新按钮重查未终态的命令。 */
+function loadCmdLog() {
+  try { return JSON.parse(localStorage.getItem("ovpn-cmd-log") || "[]"); } catch (e) { return []; }
+}
+function saveCmdLog(list) {
+  try { localStorage.setItem("ovpn-cmd-log", JSON.stringify(list.slice(0, 30))); } catch (e) {}
+}
+function logCmd(entry) {
+  var list = loadCmdLog();
+  list.unshift(entry); saveCmdLog(list); renderCmdLog();
+}
+function updateCmdLog(cmd) {
+  var list = loadCmdLog();
+  var found = false;
+  list.forEach(function (e) {
+    if (e.cmd_id === cmd.id) {
+      e.status = cmd.status; e.error = cmd.error || null;
+      e.result = cmd.result ? JSON.stringify(cmd.result).slice(0, 200) : null;
+      found = true;
+    }
+  });
+  if (!found) list.unshift({ cmd_id: cmd.id, action: cmd.action || "", node: cmd.node || "", status: cmd.status, error: cmd.error || null, at: new Date().toISOString() });
+  saveCmdLog(list); renderCmdLog();
+}
+function renderCmdLog() {
+  var tb = document.getElementById("cmdTable");
+  var list = loadCmdLog();
+  if (!list.length) { tb.innerHTML = '<tr><td colspan="5" class="muted">暂无命令</td></tr>'; return; }
+  tb.innerHTML = "";
+  list.forEach(function (e) {
+    var tr = document.createElement("tr");
+    function td(text, cls) {
+      var c = document.createElement("td"); c.textContent = text == null ? "" : text;
+      if (cls) c.className = cls;
+      return c;
+    }
+    tr.appendChild(td(e.at ? new Date(e.at).toLocaleTimeString("zh-CN", { hour12: false }) : "—"));
+    tr.appendChild(td(e.node || "—"));
+    tr.appendChild(td(e.action || "—"));
+    var tdSt = document.createElement("td");
+    var b = document.createElement("span");
+    b.className = "badge " + (e.status === "done" ? "ok" : e.status === "failed" ? "bad" : e.status === "sent" ? "info" : "idle");
+    b.textContent = e.status === "done" ? "已完成" : e.status === "failed" ? "失败" : e.status === "sent" ? "已下发" : "排队中";
+    tdSt.appendChild(b); tr.appendChild(tdSt);
+    tr.appendChild(td(e.error || (e.result ? e.result : "") || "—"));
+    tb.appendChild(tr);
+  });
+}
+/* 侧栏导航：扁平滚动定位（无分组小标题），手机上点后收起侧栏 */
+var NAV_TITLES = { overview: "概览", nodes: "节点", ovpn: "OpenVPN 服务", users: "用户", sk5: "SK5 出口", logs: "日志" };
+document.querySelectorAll(".nav button").forEach(function (btn) {
+  btn.addEventListener("click", function () {
+    document.querySelectorAll(".nav button").forEach(function (b) { b.classList.remove("active"); });
+    btn.classList.add("active");
+    var target = document.getElementById(btn.dataset.nav);
+    document.getElementById("pageTitle").textContent = NAV_TITLES[btn.dataset.nav] || "概览";
+    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+    document.getElementById("sidebar").classList.remove("open");
+    document.getElementById("overlay").classList.remove("show");
+  });
+});
+document.getElementById("menuBtn").onclick = function () {
+  document.getElementById("sidebar").classList.add("open");
+  document.getElementById("overlay").classList.add("show");
+};
+document.getElementById("overlay").onclick = function () {
+  document.getElementById("sidebar").classList.remove("open");
+  document.getElementById("overlay").classList.remove("show");
+};
+document.getElementById("refreshBtn").onclick = function () { refreshAll(); addLog("手动刷新状态"); };
+document.getElementById("loginBtn").onclick = async function () {
+  try {
+    await api("/api/login", "POST", { password: document.getElementById("password").value });
+    showApp(); refreshAll(); addLog("登录成功", true);
+  } catch (e) { showMsg("loginMsg", e.message, false); }
+};
+document.getElementById("password").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") { document.getElementById("loginBtn").click(); }
+});
+document.getElementById("logoutBtn").onclick = async function () {
+  try { await api("/api/logout", "POST", {}); } catch (e) {}
+  showLogin();
+};
+/* 改密入口（R2-P1-2）：调已有 POST /api/change-password；前端先做
+   强度校验（≥12 字符、含字母和数字、与旧密码不同、两次一致），
+   成功后提示重登并回到登录页。 */
+document.getElementById("changePwBtn").onclick = function () {
+  var card = document.getElementById("changePwCard");
+  var show = card.style.display === "none";
+  card.style.display = show ? "block" : "none";
+  if (show) { card.scrollIntoView(); document.getElementById("oldPw").focus(); }
+};
+document.getElementById("changePwForm").onsubmit = async function (e) {
+  e.preventDefault();
+  var oldPw = document.getElementById("oldPw").value;
+  var newPw = document.getElementById("newPw").value;
+  var confirmPw = document.getElementById("confirmPw").value;
+  if (newPw !== confirmPw) { showMsg("changePwMsg", "两次输入的新密码不一致", false); return; }
+  if (newPw.length < 12) { showMsg("changePwMsg", "新密码至少 12 个字符", false); return; }
+  if (!/[A-Za-z]/.test(newPw) || !/[0-9]/.test(newPw)) { showMsg("changePwMsg", "新密码须同时含字母和数字", false); return; }
+  if (newPw === oldPw) { showMsg("changePwMsg", "新密码须与旧密码不同", false); return; }
+  try {
+    var d = await api("/api/change-password", "POST", { old_password: oldPw, new_password: newPw });
+    showMsg("changePwMsg", (d.note || "密码已修改") + "，全部旧会话已作废，正在回到登录页…", true);
+    addLog("管理员密码已修改", true);
+    setTimeout(function () { showLogin(); }, 1500);
+  } catch (err) { showMsg("changePwMsg", err.message, false); }
+};
+document.getElementById("nodeSelect").onchange = function () {
+  setCurrentNode(this.value);
+  showMsg("nodeMsg", this.value ? "当前节点已切到 " + this.value : "已切回单节点自动", true);
+  refreshAll();
+};
+document.getElementById("registerNodeBtn").onclick = async function () {
+  var name = document.getElementById("newNodeName").value.trim();
+  var panelUrl = document.getElementById("newNodeUrl").value.trim();
+  if (!name) { showMsg("nodeMsg", "请输入节点名", false); return; }
+  try {
+    var d = await api("/api/nodes", "POST", { name: name, panel_url: panelUrl });
+    showTokenBox(d.token, (d.node && d.node.panel_url) || panelUrl, name);
+    showMsg("nodeMsg", "已注册节点 " + name + "，token 与安装命令只显示一次，请当场复制保存", true);
+    addLog("注册节点 " + name, true);
+    document.getElementById("newNodeName").value = "";
+    loadNodes();
+  } catch (e) { showMsg("nodeMsg", e.message, false); addLog("注册节点失败：" + e.message, false); }
+};
+document.getElementById("refreshNodesBtn").onclick = loadNodes;
+document.getElementById("refreshCmdsBtn").onclick = async function () {
+  var list = loadCmdLog();
+  for (var i = 0; i < list.length; i++) {
+    var e = list[i];
+    if (e.status === "queued" || e.status === "sent") {
+      try { var cmd = await api("/api/cmd/" + encodeURIComponent(e.cmd_id)); updateCmdLog(cmd); }
+      catch (err) {}
+    }
+  }
+  renderCmdLog();
+  showMsg("nodeMsg", "命令状态已刷新", true);
+};
+/* 对外地址只有用户改过才随保存一起发（没改过不发，后端保持原值）；
+   手动清空 = 清除已保存的显式地址、恢复自动探测。 */
+var serverIpDirty = false;
+document.getElementById("serverIp").addEventListener("input", function () {
+  serverIpDirty = true;
+  this.dataset.auto = "";
+});
+document.getElementById("detectIpBtn").onclick = async function () {
+  try {
+    var d = await api("/api/openvpn/public-ip");
+    if (d && d.ip) {
+      var ipInput = document.getElementById("serverIp");
+      ipInput.value = d.ip;
+      ipInput.dataset.auto = "";
+      serverIpDirty = true;
+      showMsg("serverMsg", "已探测到公网 IP " + d.ip + "，点“保存服务配置”后生效", true);
+    } else {
+      showMsg("serverMsg", "探测不到公网 IP：" + (d && d.error ? d.error : "未知错误"), false);
+    }
+  } catch (e) { showMsg("serverMsg", "自动探测不可用：" + e.message + "（Cloudflare 模式无此端点，请手动填公网 IP/域名）", false); }
+};
+document.getElementById("saveServerBtn").onclick = async function () {
+  try {
+    var newPort = parseInt(document.getElementById("port").value, 10);
+    var newProto = document.getElementById("proto").value;
+    var body = {
+      port: newPort,
+      proto: newProto
+    };
+    /* R2-BUG-14: 改入口端口/协议会断开所有已连接客户端且须重启
+       服务生效 -- 显式确认后才带 allow_port_change 发下去；首次
+       建服务（无现存 proto/port）不弹确认、不带该字段。 */
+    var changingEntry = (lastServerProto && newProto !== lastServerProto)
+      || (lastServerPort && newPort !== lastServerPort);
+    if (changingEntry) {
+      if (!confirm("改入口端口/协议会断开所有已连接客户端，需重启 OpenVPN 服务才生效；确定要改成 " + newProto.toUpperCase() + "/" + newPort + " 吗？")) return;
+      body.allow_port_change = true;
+    }
+    if (serverIpDirty) {
+      body.server_ip = document.getElementById("serverIp").value.trim();
+      serverIpDirty = false;
+    }
+    var d = await apiWait("/api/openvpn/server", "POST", body,
+      "serverMsg", "已下发保存服务配置，等待 agent 执行…");
+    showMsg("serverMsg", "服务配置已保存" + (d.server && d.server.note ? "（" + d.server.note + "）" : ""), true);
+    addLog("保存 OpenVPN 服务配置", true); loadStatus();
+  } catch (e) { showMsg("serverMsg", e.message, false); addLog("保存服务配置失败：" + e.message, false); }
+};
+document.getElementById("startBtn").onclick = async function () {
+  try { await apiWait("/api/openvpn/start", "POST", {}, "serverMsg", "已下发启动，等待 agent 执行…"); showMsg("serverMsg", "OpenVPN 已启动", true); addLog("启动 OpenVPN", true); loadStatus(); }
+  catch (e) { showMsg("serverMsg", e.message, false); }
+};
+document.getElementById("restartBtn").onclick = async function () {
+  try { await apiWait("/api/openvpn/restart", "POST", {}, "serverMsg", "已下发重启，等待 agent 执行…"); showMsg("serverMsg", "OpenVPN 已重启", true); addLog("重启 OpenVPN", true); loadStatus(); }
+  catch (e) { showMsg("serverMsg", e.message, false); }
+};
+document.getElementById("stopBtn").onclick = async function () {
+  try { await apiWait("/api/openvpn/stop", "POST", {}, "serverMsg", "已下发停止，等待 agent 执行…"); showMsg("serverMsg", "OpenVPN 已停止", true); addLog("停止 OpenVPN", true); loadStatus(); }
+  catch (e) { showMsg("serverMsg", e.message, false); }
+};
+/* R7-P2-9 重建 CA：两次确认才发 force=true + confirm=true，
+   走 /api/openvpn/init-pki 入队 agent 执行（POST /api/cmd 同款
+   202 + cmd_id，apiWait 轮询等真实结果）。 */
+document.getElementById("rebuildCaBtn").onclick = async function () {
+  if (!confirm("重建 CA 将销毁现有 CA，全部已签发用户证书立即失效，旧 .ovpn 全部作废；确定继续吗？")) return;
+  if (!confirm("二次确认：重建后须逐个重建用户并重新下载 .ovpn，再重启 OpenVPN 服务；确定重建 CA 吗？")) return;
+  try {
+    await apiWait("/api/openvpn/init-pki", "POST", { force: true, confirm: true },
+      "serverMsg", "已下发重建 CA，等待 agent 执行…");
+    showMsg("serverMsg", "CA 已重建：全部旧用户证书已失效，请重建用户并重新下载 .ovpn，然后重启 OpenVPN 服务", true);
+    addLog("重建 CA（旧证书全部失效）", true); loadUsers(); loadStatus();
+  } catch (e) { showMsg("serverMsg", e.message, false); addLog("重建 CA 失败：" + e.message, false); }
+};
+document.getElementById("createUserBtn").onclick = async function () {
+  var name = document.getElementById("newUser").value.trim();
+  if (!name) { showMsg("userMsg", "请输入用户名", false); return; }
+  try {
+    var d = await apiWait("/api/openvpn/users", "POST", { name: name }, "userMsg", "已下发新建用户，等待 agent 签发证书…");
+    document.getElementById("newUser").value = "";
+    if (d.ovpn_url) {
+      /* Flask 直连模式：直接返回下载地址 */
+      showMsg("userMsg", "已新建用户 " + name + "，正在下载 .ovpn", true);
+      var a = document.createElement("a");
+      a.href = d.ovpn_url; a.download = name + ".ovpn";
+      document.body.appendChild(a); a.click(); a.remove();
+    } else if (d.result && d.result.ovpn) {
+      /* Cloudflare 模式：命令回执里带 .ovpn 文本，用 Blob 下载 */
+      showMsg("userMsg", "已新建用户 " + name + "，正在下载 .ovpn", true);
+      var blob = new Blob([d.result.ovpn], { type: "application/x-openvpn-profile" });
+      var url = URL.createObjectURL(blob);
+      var a2 = document.createElement("a");
+      a2.href = url; a2.download = name + ".ovpn";
+      document.body.appendChild(a2); a2.click(); a2.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+    } else {
+      showMsg("userMsg", "已新建用户 " + name + "，请在用户列表点“下载 .ovpn”", true);
+    }
+    addLog("新建用户 " + name, true);
+    loadUsers(); loadStatus();
+  } catch (e) { showMsg("userMsg", e.message, false); addLog("新建用户失败：" + e.message, false); }
+};
+document.getElementById("refreshUsersBtn").onclick = loadUsers;
+/* 密码框留空即不覆盖已存密码：两端后端收到空串都按“保留旧密码”处理
+   （Worker 读 sk5cfg 补、Flask sk5_save 同款），前端照常发空串即可。 */
+function sk5Body() {
+  return {
+    host: document.getElementById("sk5Host").value.trim(),
+    port: parseInt(document.getElementById("sk5Port").value, 10),
+    username: document.getElementById("sk5User").value,
+    password: document.getElementById("sk5Pass").value,
+    enabled: document.getElementById("sk5Enabled").checked,
+    fail_open: document.getElementById("sk5FailOpen").checked,
+    udp_over_tcp: document.getElementById("sk5Uot").checked
+  };
+}
+document.getElementById("saveSk5Btn").onclick = async function () {
+  /* 1-25 前端守卫：UDP 模式 + 最近一次 UDP 测试明确失败过，保存前先确认；
+     未测过的不拦，保存后提示先点测试。服务端另有硬拒（同地址 UDP 失败即 400）。 */
+  if (lastServerProto === "udp" && lastTest && lastTest.udp.ok === false) {
+    if (!confirm("该 SK5 最近一次 UDP 测试失败（UDP ASSOCIATE 不通），而服务是 UDP 模式。保存后 OpenVPN 用户的 UDP 流量仍走不通。确定保存吗？")) return;
+  }
+  try {
+    await apiWait("/api/sk5", "POST", sk5Body(), "sk5Msg", "已下发保存 SK5 配置，等待 agent 执行…");
+    var hint = (!lastTest && lastServerProto === "udp") ? "（建议点“测试 SK5”确认该商家支持 UDP，否则 UDP 1194 下 UDP 不通）" : "";
+    showMsg("sk5Msg", "SK5 配置已保存" + hint, true); addLog("保存 SK5 配置", true); loadStatus();
+  }
+  catch (e) { showMsg("sk5Msg", e.message, false); addLog("保存 SK5 失败：" + e.message, false); }
+};
+document.getElementById("testSk5Btn").onclick = async function () {
+  document.getElementById("testResult").textContent = "测试中…";
+  document.getElementById("tcpResult").textContent = "测试中…";
+  document.getElementById("udpResult").textContent = "测试中…";
+  try {
+    var d = await apiWait("/api/sk5/test", "POST", {}, "sk5Msg", "已下发 SK5 测试，等待 agent 执行…");
+    /* Flask 直接返回 {test}，Worker 命令回执是 agent 原始结果 {tcp_ok, udp_ok, ...}，
+       normalizeTest 两种都收敛；没有任何测试数据时绝不报“测试完成”。 */
+    var t = normalizeTest(d.test || d.result || d);
+    if (!t || (t.tcp.ok == null && t.udp.ok == null)) {
+      document.getElementById("testResult").textContent = "测试未返回结果：未确认 TCP/UDP 状态";
+      document.getElementById("tcpResult").textContent = "—";
+      document.getElementById("udpResult").textContent = "—";
+      throw new Error("测试未返回结果，未确认 TCP/UDP 状态");
+    }
+    lastTest = t;
+    document.getElementById("testResult").textContent = JSON.stringify(t, null, 2);
+    document.getElementById("tcpResult").textContent = t.tcp.ok === true ? "通过" : t.tcp.ok === false ? "失败" : "—";
+    document.getElementById("tcpResult").className = t.tcp.ok === true ? "ok-text" : t.tcp.ok === false ? "bad-text" : "";
+    document.getElementById("tcpLatency").textContent = t.tcp.latency_ms != null ? t.tcp.latency_ms + " ms" : "—";
+    document.getElementById("tcpEgress").textContent = t.tcp.egress_ip || t.egress_ip || "—";
+    document.getElementById("udpResult").textContent = t.udp.ok === true ? "通过" : t.udp.ok === false ? "失败" : "—";
+    document.getElementById("udpResult").className = t.udp.ok === true ? "ok-text" : t.udp.ok === false ? "bad-text" : "";
+    document.getElementById("udpMode").textContent = t.udp.mode || "—";
+    document.getElementById("udpNote").textContent = t.udp.note || (t.udp.ok === false ? "UDP 不支持时 OpenVPN 须切 TCP 模式" : "—");
+    showMsg("sk5Msg", "测试完成：TCP " + (t.tcp.ok === true ? "通过" : "失败") + "，UDP " + (t.udp.ok === true ? "通过" : "失败"), t.tcp.ok === true && t.udp.ok === true);
+    addLog("SK5 测试完成：TCP " + (t.tcp.ok === true ? "通过" : "失败") + " / UDP " + (t.udp.ok === true ? "通过" : "失败"), t.tcp.ok === true && t.udp.ok === true);
+    loadStatus();
+  } catch (e) {
+    if (document.getElementById("testResult").textContent === "测试中…") {
+      document.getElementById("testResult").textContent = "测试失败：" + e.message;
+    }
+    showMsg("sk5Msg", e.message, false); addLog("SK5 测试失败：" + e.message, false);
+  }
+};
+document.getElementById("enableSk5Btn").onclick = async function () {
+  try { await apiWait("/api/sk5/enable", "POST", {}, "sk5Msg", "已下发启用 SK5，等待 agent 执行…"); showMsg("sk5Msg", "SK5 出口已启用", true); addLog("一键启用 SK5 出口", true); loadStatus(); }
+  catch (e) { showMsg("sk5Msg", e.message, false); }
+};
+document.getElementById("disableSk5Btn").onclick = async function () {
+  try { await apiWait("/api/sk5/disable", "POST", {}, "sk5Msg", "已下发停用 SK5，等待 agent 执行…"); showMsg("sk5Msg", "SK5 已停用，出口回直连", true); addLog("停用 SK5 出口", true); loadStatus(); }
+  catch (e) { showMsg("sk5Msg", e.message, false); }
+};
+renderCmdLog();
+if (currentNode) { document.getElementById("topNode").textContent = currentNode; }
+fetch("/api/me").then(function (r) { return r.json(); }).then(function (d) {
+  if (d.admin) { showApp(); refreshAll(); }
+}).catch(function () {});
+setInterval(function () { if (document.getElementById("app").style.display !== "none") { loadStatus().catch(function () {}); } }, 15000);
+</script>
+</body>
+</html>

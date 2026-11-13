@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenVPN + SK5 egress agent (ovpn-agent, polls the panel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ovpn-agent
+ExecStart=/usr/bin/python3 /opt/ovpn-agent/agent/agent.py
+Restart=on-failure
+RestartSec=5
+# The agent runs openvpn/easy-rsa/iptables and writes /etc/openvpn/*,
+# so it needs root (no DynamicUser, no sandboxing that hides /etc).
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

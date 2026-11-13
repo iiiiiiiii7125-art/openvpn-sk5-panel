@@ -1,0 +1,26 @@
+[Unit]
+Description=Restore OpenVPN -> SK5 policy routing if SK5 is enabled (openvpn-sk5-panel)
+After=network-online.target openvpn-sk5-singbox.service
+Wants=network-online.target openvpn-sk5-singbox.service
+
+# Wants (not Requires) on sing-box (R23-P2-1): After= only orders,
+# Wants= pulls the daemon into the boot transaction best-effort.
+# Requires= would CANCEL this restore when sing-box fails to start
+# -- and then no blackhole would be installed at all, so VPN
+# traffic would silently egress direct, the exact outcome P1-9
+# exists to prevent. With Wants=, restore still runs (and secures
+# the blackhole) even if sing-box is down; the 60 s health check
+# completes the repair once sing-box recreates tun1.
+
+# P1-9: the `ip rule from 10.8.0.0/24 lookup 100` rule is runtime state
+# and dies with a reboot, while sk5.json still says enabled -- without
+# this unit a reboot silently turns "SK5 enabled" into direct egress.
+# policy-routing.sh restore only re-applies when the stored config says
+# enabled; in direct mode it deliberately does nothing.
+[Service]
+Type=oneshot
+ExecStart=/opt/openvpn-sk5-panel/egress/policy-routing.sh restore
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

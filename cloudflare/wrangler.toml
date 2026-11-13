@@ -1,0 +1,33 @@
+# OpenVPN + SK5 面板 — Cloudflare Workers 部署配置
+# 注意：本文件不含任何密码 / token。管理员密码用 wrangler secret 设置：
+#   wrangler secret put ADMIN_PASSWORD
+# KV 命名空间先创建再填 id：
+#   wrangler kv namespace create PANEL_KV
+#   wrangler kv namespace create PANEL_KV --preview
+# 把上面两条命令输出的 id / preview_id 填到下面对应位置；填之前 wrangler deploy 会报错。
+
+name = "ovpn-sk5-panel"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+workers_dev = true
+
+[vars]
+# 控制面模式：cloudflare（本 Worker）| server（同一套前端 + panel/app.py 跑在服务器上）
+PANEL_MODE = "cloudflare"
+
+# agent 安装包源站（P0-3）：服务器模式面板的地址，例如 https://panel.example.com:8443。
+# Worker 把 /install-agent.sh(.sha256) 与 /api/agent/bundle(.sha256) 代理到该地址，
+# bundle 下发前必验源站的 bundle.sha256。不配时安装接口返回 503。
+# 注意：这是 secret（wrangler secret put AGENT_BUNDLE_ORIGIN），不要写死在这里。
+# AGENT_BUNDLE_ORIGIN = ""
+
+# 前端：直接复用 panel/templates/index.html（Workers Static Assets，不复制文件）
+# GET / 由 Worker 转给 ASSETS；其它静态路径同样由 ASSETS 响应。
+[assets]
+directory = "../panel/templates"
+
+[[kv_namespaces]]
+binding = "PANEL_KV"
+# 下面的 id 是占位符，部署前必须替换为 wrangler kv namespace create 的真实输出。
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_KV_PREVIEW_NAMESPACE_ID"
