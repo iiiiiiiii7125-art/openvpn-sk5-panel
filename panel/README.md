@@ -28,7 +28,7 @@ python3 app.py
 |---|---|---|
 | GET `/` | — | `index.html` |
 | POST `/api/login` | `password: string` | `ok` |
-| POST `/api/change-password` | `old_password: string, new_password: string`（新密码 ≥12 字符、含字母和数字、与旧密码不同） | `ok, note`；成功后全部旧会话作废，须重新登录；仅服务器（Flask）模式，Cloudflare 模式回 501（R11-P2-1） |
+| POST `/api/change-password` | `old_password: string, new_password: string`（新密码 ≥12 字符、含字母和数字、UTF-8 不超过 72 字节、与旧密码不同） | `ok, note`；成功后全部旧会话作废，须重新登录；仅服务器（Flask）模式，Cloudflare 模式回 501（R11-P2-1） |
 | POST `/api/logout` | — | `ok` |
 | GET `/api/me` | — | `ok, admin: bool` |
 | GET `/api/status` | — | `openvpn{running, online_users, port, proto, subnet: "10.8.0.0/24", dns: "1.1.1.1", unit_active, pid, error?, detail}, sk5{enabled, host, port, error?}, egress{ip, latency_ms, via_sk5, error?}, modules_missing[]` |
@@ -99,7 +99,7 @@ SK5 启用时复用 `get_status()` 已探到的 `egress_ip`，直连探针与
   唯一的例外是 `.ovpn` 下载重建（见上节，纯属 core 缺口的适配）。
 - 生产部署建议在反代后加 HTTPS，面板本身只监听 8443 明文端口。
 - 改密入口：顶栏「修改密码」按钮（`POST /api/change-password`），
-  前端先校验新密码强度（≥12 字符、含字母和数字、与旧密码不同、
+  前端先校验新密码强度（≥12 字符、含字母和数字、UTF-8 不超过 72 字节、与旧密码不同、
   两次输入一致），改后全部旧会话作废、页面回到登录页。（仅服务器 Flask 模式；Cloudflare 模式下该按钮调接口回 501 并明示线下改密方法，见 README:260。）
 - 旧证书迁移（R2-P1-3）：修复前签发的用户证书 CN 都是 `OpenVPN-CA`
   （BUG-7），面板按序列号识别用户（见 core/README.md）：用户列表

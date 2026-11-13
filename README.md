@@ -52,13 +52,21 @@
 
 目标机：全新 Debian 12 / Ubuntu 22.04 / 24.04，root，amd64 或 arm64。
 
-本项目无公开 git 仓库，不走 `git clone`：把整个 `openvpn-sk5-panel/` 目录拷到目标机（`scp -r` / `rsync` 任选），再进目录安装。
+首选 `git clone`（公开仓库）：
+
+```bash
+ssh root@<目标机> 'git clone https://github.com/iiiiiiiii7125-art/openvpn-sk5-panel && cd openvpn-sk5-panel && bash install.sh'   # 默认 OpenVPN UDP 1194
+# 或 TCP 模式：
+ssh root@<目标机> 'cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443 bash install.sh'
+```
+
+安装器只按固定清单复制文件（`agent core egress panel systemd install.sh verify.sh verify-integration.sh README.md`），克隆来的 `.git/` 不会进 `/opt`。
+
+备选（目标机不能直连 GitHub 时）：把整个 `openvpn-sk5-panel/` 目录拷到目标机（`scp -r` / `rsync` 任选），或传发布包 `releases/ovpn-release-1.0.tar.gz` 后解包，再进目录安装：
 
 ```bash
 scp -r openvpn-sk5-panel root@<目标机>:/root/
-ssh root@<目标机> 'cd /root/openvpn-sk5-panel && bash install.sh'   # 默认 OpenVPN UDP 1194
-# 或 TCP 模式：
-ssh root@<目标机> 'cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443 bash install.sh'
+ssh root@<目标机> 'cd /root/openvpn-sk5-panel && bash install.sh'
 ```
 
 安装完打印面板地址 `https://<服务器 IP>:8443` + 初始管理员密码（仅显示一次，也写在 `/etc/openvpn-sk5-panel/admin.pass`，0600）。重装不会轮换密码、CA 与服务端证书。
@@ -76,7 +84,9 @@ ssh root@<目标机> 'cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443
 7. 生成面板自签 TLS 证书；装 systemd 单元并启动 `openvpn-server@server`、`openvpn-sk5-singbox`、`openvpn-sk5-panel`。
 8. 健康门禁：面板 `https://127.0.0.1:8443/api/me` 200，用 `admin.pass` 登录成功、`GET /api/status` 200 才算装完，否则报错退出。
 
-## 部署方式二：Cloudflare 面板 + agent（推荐，FLMX 同款）
+## 部署方式二：Cloudflare 面板 + agent（可选，FLMX 同款）
+
+> **未验（P0-1）：Cloudflare 模式从未在真实部署上验证。** `wrangler deploy --dry-run` 通过不等于部署可用；`wrangler.toml` 里的 KV id 仍为占位符，部署后须验活再投入使用。
 
 面板放 Cloudflare，中转机只装 agent。面板本体不直接碰 OpenVPN/sing-box，一切操作经命令队列下发给 agent 执行。
 
@@ -84,6 +94,9 @@ ssh root@<目标机> 'cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443
 # 1. 部署 Worker（cloudflare/ 目录）：
 cd cloudflare
 wrangler kv namespace create PANEL_KV
+wrangler kv namespace create PANEL_KV --preview
+# 把两条命令输出的 id / preview_id 填进 wrangler.toml 对应位置
+# （填之前 wrangler deploy 会报错，这是故意的：不许把假 id 提交上去）
 wrangler secret put ADMIN_PASSWORD
 wrangler deploy
 # 注意：Cloudflare Workers 版本按 POP 慢速传播，部署 API 显示 100%
@@ -168,7 +181,7 @@ bash /opt/openvpn-sk5-panel/verify.sh
 
 环境受限的项会如实记 `SKIP` 而不是假 PASS：沙箱无 `CAP_NET_ADMIN` 时路由项 SKIP；`ifconfig.me` 不可达时出口 IP 项 SKIP。注意本沙箱对 UDP sendto 一律 EPERM，UDP 数据面验证必须上真机。
 
-自检不会覆盖已有 SK5：若面板里已配好启用的商家 SK5，切换测试自动 SKIP（密码无法从面板 API 取回，覆盖后无法还原）；`VERIFY_ALLOW_OVERWRITE_SK5=1` 可强制，但事后须在面板重填 SK5 密码。
+自检不会覆盖已有 SK5：若面板里已配好启用的商家 SK5，切换测试（sk5-toggle / sk5-egress-ip / sk5-disable）自动 SKIP，什么都不改；`VERIFY_ALLOW_OVERWRITE_SK5=1` 可强制跑切换测试，跑之前脚本先备份 `sk5.json` 与 `sing-box.json`、退出时原样恢复，无须事后在面板重填 SK5 密码。失败路径例外：清理失败时文件故意不恢复（大声 FAIL，链路诚实保持禁用，备份留在工作目录供人工恢复）。
 
 ## 常见问题
 
@@ -257,7 +270,7 @@ report → 回执 done、下发 `create_user`（无 CA）→ 回执 failed 且 e
 - SK5 密码只存在 `/etc/openvpn-sk5-panel/sk5.json`（0600），`get_status()`、日志、报错里永不出现明文；不要把它贴进工单或日志。
 - 面板自签证书浏览器会报不安全，属预期（无域名）；有域名时可把证书换成合法证书并重启 `openvpn-sk5-panel`。
 - 面板以 root 运行（要操作路由/iptables/OpenVPN），只放内网或加访问控制，不要直接暴露到公网。
-- **改密（不强制）**：初始管理员密码随机生成、无默认值；登录即给完整 admin 会话，不设改密前置条件。改密接口 `POST /api/change-password` 存在（须旧密码，新密码 ≥12 位且含字母＋数字），改密后 `session_version` +1，全部旧会话立即失效。**仅服务器（Flask）模式可用；Cloudflare 模式下管理员密码是 Cloudflare secret，面板内改密回 501，须用 `wrangler secret put ADMIN_PASSWORD` 修改后重新部署（R11-P2-1）。**注：Flask 面板密码哈希已是 bcrypt（`panel/app.py` `_hash_password`，存量加盐 SHA-256 哈希在登录成功时透明迁移到 bcrypt）；bcrypt 未安装的极简环境才回落旧的加盐 SHA-256。
+- **改密（不强制）**：初始管理员密码随机生成、无默认值；登录即给完整 admin 会话，不设改密前置条件。改密接口 `POST /api/change-password` 存在（须旧密码，新密码 ≥12 位且含字母＋数字、UTF-8 不超过 72 字节（bcrypt 限制，按字节计）），改密后 `session_version` +1，全部旧会话立即失效。**仅服务器（Flask）模式可用；Cloudflare 模式下管理员密码是 Cloudflare secret，面板内改密回 501，须用 `wrangler secret put ADMIN_PASSWORD` 修改后重新部署（R11-P2-1）。**注：Flask 面板密码哈希已是 bcrypt（`panel/app.py` `_hash_password`，存量加盐 SHA-256 哈希在登录成功时透明迁移到 bcrypt）；bcrypt 未安装的极简环境才回落旧的加盐 SHA-256。
 - **登录限流（仅 IP 维）**：同一 IP 5 分钟内 5 次失败即锁 15 分钟，命中直接 429 + `Retry-After`。面板是单管理员密码登录，限流只看来源 IP。
 - **权限（单管理员）**：面板只有管理员一种角色；`.ovpn` 下载、节点监控、SK5 配置、服务启停全部须管理员登录后才能用。写接口全部校验管理员会话，未登录调即拒绝。
 - **已对齐（2026-11-12）**：面板密码哈希已换 bcrypt（存量加盐 SHA-256 哈希登录时透明迁移）；`/api/agent/bundle.sha256` 端点已于 2026-11-12 补上。两项均不再是待补项。

@@ -306,7 +306,7 @@
       <!-- 修改密码：调 POST /api/change-password；成功后全部旧会话作废，须重新登录 -->
       <section class="panel-card" id="changePwCard" style="display:none">
         <h2>修改管理员密码</h2>
-        <p class="desc">新密码至少 12 个字符，含字母和数字，且与旧密码不同。修改成功后全部旧会话立即作废，当前页面将回到登录页，请用新密码重新登录。</p>
+        <p class="desc">新密码至少 12 个字符，含字母和数字，UTF-8 不超过 72 字节，且与旧密码不同。修改成功后全部旧会话立即作废，当前页面将回到登录页，请用新密码重新登录。</p>
         <form id="changePwForm">
           <div class="form-grid">
             <div>
@@ -1022,7 +1022,7 @@ document.getElementById("logoutBtn").onclick = async function () {
   showLogin();
 };
 /* 改密入口（R2-P1-2）：调已有 POST /api/change-password；前端先做
-   强度校验（≥12 字符、含字母和数字、与旧密码不同、两次一致），
+   强度校验（≥12 字符、含字母和数字、UTF-8 不超过 72 字节、与旧密码不同、两次一致），
    成功后提示重登并回到登录页。 */
 document.getElementById("changePwBtn").onclick = function () {
   var card = document.getElementById("changePwCard");
@@ -1038,6 +1038,7 @@ document.getElementById("changePwForm").onsubmit = async function (e) {
   if (newPw !== confirmPw) { showMsg("changePwMsg", "两次输入的新密码不一致", false); return; }
   if (newPw.length < 12) { showMsg("changePwMsg", "新密码至少 12 个字符", false); return; }
   if (!/[A-Za-z]/.test(newPw) || !/[0-9]/.test(newPw)) { showMsg("changePwMsg", "新密码须同时含字母和数字", false); return; }
+  if (new TextEncoder().encode(newPw).length > 72) { showMsg("changePwMsg", "新密码超过 72 字节上限（按 UTF-8 字节计，bcrypt 限制）", false); return; }
   if (newPw === oldPw) { showMsg("changePwMsg", "新密码须与旧密码不同", false); return; }
   try {
     var d = await api("/api/change-password", "POST", { old_password: oldPw, new_password: newPw });

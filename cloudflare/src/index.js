@@ -121,12 +121,139 @@ function err(message, status = 400) {
 }
 
 async function readJson(request) {
+  // R31-P2-1: envelope guard (Flask _json_body parity). A body only
+  // counts as a JSON object when Content-Type is application/json
+  // (a `; charset=...` suffix is allowed; compared case-insensitively,
+  // like Flask's mimetype) AND the parsed value is a plain object.
+  // Anything else — wrong Content-Type, malformed JSON, scalar, null,
+  // array — returns null here, and every caller 400s with
+  // "请求体须为 JSON 对象". Never silently proceed with {}.
+  if (!isJsonContentType(request)) return null;
   try {
     const body = await request.json();
-    return body && typeof body === "object" ? body : null;
+    return body && typeof body === "object" && !Array.isArray(body) ? body : null;
   } catch {
     return null;
   }
+}
+
+// R31-P2-1: Content-Type must be application/json for a JSON body.
+// Flask _json_body requires request.is_json; Workers' request.json()
+// parses regardless of Content-Type, so the check lives here.
+function isJsonContentType(request) {
+  const ct = request.headers.get("content-type");
+  if (typeof ct !== "string") return false;
+  return ct.split(";")[0].trim().toLowerCase() === "application/json";
+}
+
+// R30-P2-1: plain-integer token scanner for one JSON object text.
+// JSON.parse erases the 1.0 vs 1 distinction (both become the number
+// 1), while Flask's `type(x) is int` / `isinstance(x, int)` rejects
+// 1.0. Integer client fields are therefore validated against the RAW
+// request text: the token for the field must be a plain integer
+// literal. Returns a Map of top-level key -> raw value token (last
+// occurrence wins, matching JSON.parse), or null if the text is not
+// a single well-formed JSON object. Nested values are skipped whole
+// (strings honor escapes, brackets nest), so a key spelled inside a
+// nested string or value can never be mistaken for a top-level member.
+function topLevelTokens(raw) {
+  let i = 0;
+  const n = raw.length;
+  const isWs = (c) => c === " " || c === "\t" || c === "\n" || c === "\r";
+  const skipWs = () => { while (i < n && isWs(raw[i])) i++; };
+  // Index just past the closing quote of the string starting at `s`,
+  // or -1 if unterminated.
+  const stringEnd = (s) => {
+    let j = s + 1;
+    while (j < n) {
+      if (raw[j] === "\\") { j += 2; continue; }
+      if (raw[j] === '"') return j + 1;
+      j++;
+    }
+    return -1;
+  };
+  // Index just past the JSON value starting at `s`, or -1.
+  const valueEnd = (s) => {
+    const ch = raw[s];
+    if (ch === '"') return stringEnd(s);
+    if (ch === "{" || ch === "[") {
+      const open = ch;
+      const close = ch === "{" ? "}" : "]";
+      let depth = 0;
+      let j = s;
+      while (j < n) {
+        const c = raw[j];
+        if (c === '"') { j = stringEnd(j); if (j < 0) return -1; continue; }
+        if (c === open) depth++;
+        else if (c === close) { depth--; if (depth === 0) return j + 1; }
+        j++;
+      }
+      return -1;
+    }
+    let j = s;
+    while (j < n && raw[j] !== "," && raw[j] !== "}") j++;
+    return j;
+  };
+  skipWs();
+  if (raw[i] !== "{") return null;
+  i++;
+  const out = new Map();
+  skipWs();
+  if (raw[i] === "}") return out;
+  for (;;) {
+    skipWs();
+    if (raw[i] !== '"') return null;
+    const keyEnd = stringEnd(i);
+    if (keyEnd < 0) return null;
+    let key;
+    try { key = JSON.parse(raw.slice(i, keyEnd)); } catch { return null; }
+    i = keyEnd;
+    skipWs();
+    if (raw[i] !== ":") return null;
+    i++;
+    skipWs();
+    const valueStart = i;
+    const end = valueEnd(i);
+    if (end < 0) return null;
+    out.set(key, raw.slice(valueStart, end).trim());
+    i = end;
+    skipWs();
+    if (raw[i] === ",") { i++; continue; }
+    if (raw[i] === "}") return out;
+    return null;
+  }
+}
+
+// The only JSON integer literals Python parses as int: an optional
+// minus followed by 0 or a non-zero digit run. No fraction, no
+// exponent, no leading zeros (those are invalid JSON anyway, so
+// JSON.parse already rejects them). `1.0`, `1.00`, `1e0`, `1.5` all
+// fail this test, exactly like Flask's `type(x) is int`.
+const INT_TOKEN_RE = /^-?(0|[1-9][0-9]*)$/;
+
+// R30-P2-1: read the raw request text together with the parsed body.
+// Integer fields are checked against the raw token (see
+// topLevelTokens). Malformed JSON keeps the old readJson behavior
+// (body null, and the callers 400 as before).
+// R31-P2-1: the same envelope guard as readJson applies — wrong
+// Content-Type, malformed JSON, scalar, null, or array body yields
+// { body: null, tokens: null }.
+async function readJsonRaw(request) {
+  if (!isJsonContentType(request)) return { body: null, tokens: null };
+  let raw = null;
+  try {
+    raw = await request.text();
+  } catch {
+    return { body: null, tokens: null };
+  }
+  let body = null;
+  try {
+    const v = JSON.parse(raw);
+    if (v && typeof v === "object" && !Array.isArray(v)) body = v;
+  } catch {
+    return { body: null, tokens: null };
+  }
+  return { body, tokens: body ? topLevelTokens(raw) : null };
 }
 
 function nowMs() {
@@ -314,7 +441,11 @@ async function enqueueCommand(env, nodeName, action, params) {
   await kvPutJson(env, `cmd:${id}`, cmd, { expirationTtl: CMD_TTL_S });
   const queue = kvArray(await kvGetJson(env, `queue:${nodeName}`), `queue:${nodeName}`);
   queue.push(id);
-  await kvPutJson(env, `queue:${nodeName}`, queue);
+  // R27-P2-2: queue: shares the cmd: TTL (7 days) so the list and its
+  // records live and die together -- a queue list that outlives its
+  // records is what leaves dangling ids. Every poll rewrites the
+  // list and refreshes the TTL, so live nodes are unaffected.
+  await kvPutJson(env, `queue:${nodeName}`, queue, { expirationTtl: CMD_TTL_S });
   return cmd;
 }
 
@@ -531,7 +662,7 @@ async function handleRegisterNode(request, env) {
     created_at: nowMs(),
     last_seen: null,
   });
-  await kvPutJson(env, `queue:${name}`, []);
+  await kvPutJson(env, `queue:${name}`, [], { expirationTtl: CMD_TTL_S });
   return json(
     {
       ok: true,
@@ -773,7 +904,7 @@ async function _sweepWorkerCmds(env, nodeName, queue, sent) {
     const fresh = kvArray(await kvGetJson(env, `queue:${nodeName}`), `queue:${nodeName}`);
     const merged = [...fresh];
     for (const id of queueArr) if (!merged.includes(id)) merged.push(id);
-    await kvPutJson(env, `queue:${nodeName}`, merged);
+    await kvPutJson(env, `queue:${nodeName}`, merged, { expirationTtl: CMD_TTL_S });
   }
   if (sentChanged) {
     const fresh = kvArray(await kvGetJson(env, `sent:${nodeName}`), `sent:${nodeName}`);
@@ -785,7 +916,7 @@ async function _sweepWorkerCmds(env, nodeName, queue, sent) {
         mergedIds.add(e.id);
       }
     }
-    await kvPutJson(env, `sent:${nodeName}`, merged);
+    await kvPutJson(env, `sent:${nodeName}`, merged, { expirationTtl: CMD_TTL_S });
   }
   return { queue: queueArr, sent: sentArr };
 }
@@ -822,7 +953,16 @@ async function handleAgentPoll(request, env) {
   const stillSent = [];
   for (const entry of sent) {
     const cmd = await kvGetJson(env, `cmd:${entry.id}`);
-    if (!cmd || typeof cmd !== "object" || cmd.status !== "sent") continue;
+    if (!cmd) {
+      // R27-P2-2: dangling sent id -- the cmd: record expired (7-day
+      // CMD_TTL_S) while the sent: list still holds it. The entry is
+      // dropped below (stillSent omits it); warn so the loss is
+      // visible in logs instead of evaporating silently. Worker has
+      // no audit store; console.warn is the only honest signal.
+      console.warn(`worker poll: dangling sent command id ${entry.id} (cmd record expired or deleted)`);
+      continue;
+    }
+    if (typeof cmd !== "object" || cmd.status !== "sent") continue;
     const outcome = await _handleSentTimeout(env, cmd, now, entry.sent_at);
     if (outcome === "requeued") {
       queue.push(cmd.id);
@@ -843,7 +983,14 @@ async function handleAgentPoll(request, env) {
   const takenIds = new Set(queue); // 本轮实际取走的 id（含超时回队重发的）
   for (const id of queue) {
     const cmd = await kvGetJson(env, `cmd:${id}`);
-    if (!cmd) continue;
+    if (!cmd) {
+      // R27-P2-2: dangling queued id -- the cmd: record expired (7-day
+      // CMD_TTL_S) while the queue: list still holds it. The conditional
+      // clear below drops the id; warn so the loss is visible in logs
+      // instead of evaporating silently.
+      console.warn(`worker poll: dangling queued command id ${id} (cmd record expired or deleted)`);
+      continue;
+    }
     if (cmd.status !== "queued") continue;
     cmd.status = "sent";
     cmd.sent_at = now;
@@ -862,6 +1009,7 @@ async function handleAgentPoll(request, env) {
     env,
     `queue:${node.name}`,
     currentQueue.filter((id) => !takenIds.has(id)),
+    { expirationTtl: CMD_TTL_S },
   );
   // sent 副本去重（并发 poll 可能重复记同一 id；超时循环按 id 去重处理，
   // 副本里不留重复条目）。
@@ -872,7 +1020,7 @@ async function handleAgentPoll(request, env) {
     seenSentIds.add(e.id);
     dedupedSent.push(e);
   }
-  await kvPutJson(env, `sent:${node.name}`, dedupedSent);
+  await kvPutJson(env, `sent:${node.name}`, dedupedSent, { expirationTtl: CMD_TTL_S });
   const rec = await kvGetJson(env, `node:${node.name}`);
   if (rec) {
     rec.last_seen = nowMs();
@@ -934,7 +1082,7 @@ async function handleAgentReport(request, env) {
   const sent = kvArray(await kvGetJson(env, `sent:${node.name}`), `sent:${node.name}`);
   const kept = sent.filter((e) => e.id !== cmd.id);
   if (kept.length !== sent.length) {
-    await kvPutJson(env, `sent:${node.name}`, kept);
+    await kvPutJson(env, `sent:${node.name}`, kept, { expirationTtl: CMD_TTL_S });
   }
 
   const snap = snapshotFromResult(body.result);
@@ -1092,11 +1240,19 @@ async function handleCompatStatus(request, env) {
   return json(await cachedStatus(env, node.name));
 }
 
-async function handleCompatEnqueue(request, env, action, paramsOf) {
-  const body = (await readJson(request)) || {};
-  const { node, error } = await resolveNode(request, env, body);
+async function handleCompatEnqueue(request, env, action, paramsOf, needsBody = false) {
+  const body = await readJson(request);
+  // R31-P2-1: body-reading actions (create_server/create_user) refuse
+  // a malformed / non-object / wrong-content-type body with 400, like
+  // Flask _json_body — the guard runs before any default or enqueue.
+  // Bare actions (start/stop/restart/test/enable/disable/revoke)
+  // ignore the body on both faces, so they keep the old `|| {}` and
+  // are deliberately NOT gated (gating them would break E19/E20).
+  if (needsBody && !body) return err("请求体须为 JSON 对象", 400);
+  const b = body || {};
+  const { node, error } = await resolveNode(request, env, b);
   if (error) return error;
-  const params = paramsOf ? paramsOf(body) : {};
+  const params = paramsOf ? paramsOf(b) : {};
   const cmd = await enqueueCommand(env, node.name, action, params);
   return json(
     { ok: true, cmd_id: cmd.id, node: node.name, action, status: "queued", queued: true },
@@ -1177,13 +1333,30 @@ async function handleCompatOvpnDownload(request, env, name) {
 // agent 强制要求 host+port，缺一律 400，不下发必败命令。
 // 密码框留空 = 不覆盖已存密码（P0-4 Worker 侧）；1-25 守卫见内联注释。
 async function handleCompatSk5Save(request, env) {
-  const b = (await readJson(request)) || {};
+  const { body, tokens } = await readJsonRaw(request);
+  // R31-P2-1: envelope guard (Flask _json_body parity). A null body
+  // used to fall through to the host check and 400 "host 不能为空";
+  // the verdict is unchanged (still 400), only the message unifies to
+  // the envelope wording. A valid JSON body with a non-JSON
+  // Content-Type now 400s here instead of executing (C5).
+  if (!body) return err("请求体须为 JSON 对象", 400);
+  const b = body;
   const { node, error } = await resolveNode(request, env, b);
   if (error) return error;
   const host = typeof b.host === "string" ? b.host.trim() : "";
   const port = b.port;
   if (!host) return err("host 不能为空", 400);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  // R30-P2-1: the port token must be a plain integer literal.
+  // Number.isInteger(1001.0) is true in JS, but Flask's
+  // `type(value) is int` rejects 1001.0 — check the raw token.
+  const portToken = tokens ? tokens.get("port") ?? null : null;
+  if (
+    typeof port !== "number" ||
+    portToken === null ||
+    !INT_TOKEN_RE.test(portToken) ||
+    port < 1 ||
+    port > 65535
+  ) {
     return err("port 须为 1-65535 的整数", 400);
   }
   const stored = (await kvGetJson(env, `sk5cfg:${node.name}`)) || {};
@@ -1228,16 +1401,60 @@ async function handleCompatSk5Save(request, env) {
 // fail-open / udp-over-tcp 开关（P0-2）：set_sk5 是全量覆盖，单字段必被 agent 拒收。
 // 下发前先读 sk5cfg:<node> 补齐 host/port/username/password/enabled，
 // 无已存配置时明确 400，绝不发缺字段的命令。
+// R29-P2-1：开关输入须严格规整（Flask _coerce_bool 同口径，R12-P2-1）。
+// 在键时只接受真布尔或 0/1 整数，其余一律 400——旧代码用 typeof 回落＋
+// 终端 `: false`，字符串 "true"／1 会静默入队 false（与 Flask 面反向）。
+// 缺键时：fail-open 只读本键，默认 False；udp-over-tcp 回落 `enabled`
+// 键（R12-P2-2 已裁定，与 Flask _toggle_value 同款），两者都缺才默认 False。
+// R30-P2-1: `token` is the raw source token for the field. After
+// JSON.parse, 1.0 and 1 are the same number, but Flask rejects 1.0
+// (isinstance float) — so a bare Number.isInteger check is not the
+// same口径. A number value passes only when its token is a plain
+// integer literal; `1.0`, `1.00`, `1e0`, `1.5` all 400.
+function coerceToggleBool(value, key, token) {
+  if (typeof value === "boolean") return { value, error: null };
+  if (
+    typeof value === "number" &&
+    token !== null &&
+    INT_TOKEN_RE.test(token) &&
+    (value === 0 || value === 1)
+  ) {
+    return { value: value === 1, error: null };
+  }
+  const got = token !== null ? token : typeof value;
+  return { value: null, error: `${key} 须为 JSON 布尔值（true/false）或 0/1，收到 ${got}` };
+}
+
 async function handleCompatSk5Toggle(request, env, key) {
-  const b = (await readJson(request)) || {};
+  const { body, tokens } = await readJsonRaw(request);
+  // R31-P2-1: envelope guard (Flask _json_body parity). A null body
+  // used to fall through to `{}` and silently enqueue the default
+  // (fail_open=false) with 202; now it 400s before any default or
+  // enqueue, like Flask.
+  if (!body) return err("请求体须为 JSON 对象", 400);
+  const b = body;
   const { node, error } = await resolveNode(request, env, b);
   if (error) return error;
   const stored = await kvGetJson(env, `sk5cfg:${node.name}`);
   if (!stored || !stored.host || !stored.port) {
     return err("先在 SK5 配置页保存完整 SK5 配置（host/port），再改这个开关", 400);
   }
-  const value =
-    typeof b[key] === "boolean" ? b[key] : typeof b.enabled === "boolean" ? b.enabled : false;
+  const tokenOf = (k) => (tokens ? tokens.get(k) ?? null : null);
+  let value;
+  if (key in b) {
+    const c = coerceToggleBool(b[key], key, tokenOf(key));
+    if (c.error) return err(c.error, 400);
+    value = c.value;
+  } else if (key === "udp_over_tcp" && "enabled" in b) {
+    // R12-P2-2 adjudicated: udp-over-tcp falls back to `enabled`
+    // (Flask _toggle_value parity). fail-open has NO such fallback.
+    // The fallback value goes through the same strict token check.
+    const c = coerceToggleBool(b.enabled, "enabled", tokenOf("enabled"));
+    if (c.error) return err(c.error, 400);
+    value = c.value;
+  } else {
+    value = false;
+  }
   const params = { ...stored, [key]: value };
   await kvPutJson(env, `sk5cfg:${node.name}`, params);
   const cmd = await enqueueCommand(env, node.name, "set_sk5", params);
@@ -1428,7 +1645,7 @@ async function handleFetch(request, env, ctx) {
       return handleCompatEnqueue(request, env, "create_server", (b) => ({
         port: b.port,
         proto: b.proto,
-      }));
+      }), true);
     }
     if (method === "POST" && path === "/api/openvpn/start") {
       return handleCompatEnqueue(request, env, "start_openvpn", () => ({}));
@@ -1444,7 +1661,7 @@ async function handleFetch(request, env, ctx) {
     }
     if (method === "GET" && path === "/api/openvpn/users") return handleCompatUsers(request, env);
     if (method === "POST" && path === "/api/openvpn/users") {
-      return handleCompatEnqueue(request, env, "create_user", (b) => ({ name: b.name }));
+      return handleCompatEnqueue(request, env, "create_user", (b) => ({ name: b.name }), true);
     }
     const revokeMatch = path.match(/^\/api\/openvpn\/users\/([^/]+)$/);
     if (method === "DELETE" && revokeMatch) {

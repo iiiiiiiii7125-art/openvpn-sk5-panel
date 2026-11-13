@@ -299,12 +299,23 @@ def _session_version():
         return 1
 
 
+# R31-P2-2: bcrypt 5.x hashpw raises ValueError past 72 bytes; the
+# boundary is by UTF-8 bytes, not characters (25 CJK chars already
+# exceed it). Reject over-long passwords at validation time with a
+# 400 that names the byte limit, and keep a ValueError guard around
+# _hash_password in change_password as defense in depth.
+_BCRYPT_MAX_BYTES = 72
+_PASSWORD_TOO_LONG = "新密码超过 72 字节上限（按 UTF-8 字节计，bcrypt 限制）"
+
+
 def _validate_new_password(old, new):
-    """新密码强度：>=12 字符、含字母与数字、与旧密码不同。"""
+    """新密码强度：>=12 字符、含字母与数字、与旧密码不同、UTF-8 不超过 72 字节。"""
     if len(new) < 12:
         return False, "新密码至少 12 个字符"
     if not re.search(r"[A-Za-z]", new) or not re.search(r"[0-9]", new):
         return False, "新密码须同时包含字母和数字"
+    if len(new.encode("utf-8")) > _BCRYPT_MAX_BYTES:
+        return False, _PASSWORD_TOO_LONG
     if new == old:
         return False, "新密码不能与旧密码相同"
     return True, ""
@@ -1363,9 +1374,17 @@ def change_password():
     if not ok:
         conn.close()
         return jsonify({"ok": False, "error": msg}), 400
+    try:
+        new_hash = _hash_password(new)
+    except ValueError:
+        # R31-P2-2 defense in depth: _validate_new_password already
+        # caps UTF-8 at 72 bytes, but a future bcrypt behavior change
+        # must not turn this into an unhandled 500 again.
+        conn.close()
+        return jsonify({"ok": False, "error": _PASSWORD_TOO_LONG}), 400
     conn.execute("UPDATE admin SET password_hash = ?,"
                  " session_version = session_version + 1 WHERE id = 1",
-                 (_hash_password(new),))
+                 (new_hash,))
     conn.commit()
     conn.close()
     for path in (ADMIN_PASS_PATH, ADMIN_PASS_FALLBACK):

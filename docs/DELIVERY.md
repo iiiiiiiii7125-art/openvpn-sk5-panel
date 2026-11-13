@@ -1,7 +1,7 @@
-# OpenVPN + SK5 面板 · 交付说明（1.0）
+# OpenVPN + SK5 面板 · 交付说明（1.0.1）
 
-> 发布包：`releases/ovpn-release-1.0.tar.gz`（包内清单与校验值见 §9；包自身的 sha256 全值见同目录伴生文件 `ovpn-release-1.0.tar.gz.sha256`）。
-> 交付日期：2026-11-13。AUDIT-R25 已判**可交付（差集 ∅，沙箱级）**，live-17 真机轮**全部通过、零新 bug**。历史台账 163 条：已修 160、部分 2（按设计）、未验 1（P0-1，Cloudflare 真实部署）、新 0、复发 0。
+> 发布包：`releases/ovpn-release-1.0.1.tar.gz`（包内清单与校验值见 §9；包自身的 sha256 全值见同目录伴生文件 `ovpn-release-1.0.1.tar.gz.sha256`）。
+> 交付日期：2026-11-13。AUDIT-R34 已判**可交付（差集 ∅）**，live-19 真机轮**全部通过、零新 bug**。历史台账 175 条：已修 171、部分 2（按设计）、未验 1（P0-1，Cloudflare 真实部署）、新 0、复发 0。
 > **未验清单（交付后仍未验，不冒充）**：Cloudflare Worker 真实部署（P0-1，见 §2）；arm64 安装校验（本机 x86_64，无 arm64 机）；SK5 端口 1001 vs 9000 仍待确认（面板默认 1001，见 §5）。
 
 ## 0. 这是什么
@@ -17,12 +17,19 @@
 ### 1.2 步骤（字段级）
 
 ```bash
-# 1. 传包（本机执行；<目标机> 换成服务器 IP 或域名）
-scp releases/ovpn-release-1.0.tar.gz root@<目标机>:/root/
-# 2. 解包并安装（目标机上执行）
-ssh root@<目标机> 'cd /root && tar xzf ovpn-release-1.0.tar.gz && cd openvpn-sk5-panel && bash install.sh'
+# 首选：目标机上直接克隆公开仓库后安装
+ssh root@<目标机> 'git clone https://github.com/iiiiiiiii7125-art/openvpn-sk5-panel && cd openvpn-sk5-panel && bash install.sh'
 # 默认 OpenVPN UDP 1194；TCP 模式：
 ssh root@<目标机> 'cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443 bash install.sh'
+```
+
+安装器只按固定清单复制文件，克隆来的 `.git/` 不会进 `/opt`。
+
+备选（目标机不能直连 GitHub 时）：传发布包再解包安装（本机执行；<目标机> 换成服务器 IP 或域名）：
+
+```bash
+scp releases/ovpn-release-1.0.1.tar.gz root@<目标机>:/root/
+ssh root@<目标机> 'cd /root && tar xzf ovpn-release-1.0.1.tar.gz && cd openvpn-sk5-panel && bash install.sh'
 ```
 
 可选环境变量：`OVPN_PROTO`（udp|tcp）、`OVPN_PORT`、`OVPN_SUBNET`（固定 `10.8.0.0/24`，设为其他值安装器直接拒绝）、`OVPN_DNS`（默认 `1.1.1.1`，写入 server.conf 的 `push "dhcp-option DNS …"`）。
@@ -33,7 +40,7 @@ ssh root@<目标机> 'cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443
 
 - 面板地址：`https://<服务器 IP>:8443`。初始管理员密码**仅在安装完成时打印一次**，也写在 `/etc/openvpn-sk5-panel/admin.pass`（0600，root 可读）。重装不会轮换密码、CA 与服务端证书。
 - **登录后立即改密**：面板右上角「修改密码」按钮（调 `POST /api/change-password`；成功后全部旧会话作废，须重新登录）。注意：首次登录**不强制**改密（P0-3，按设计未实现），改密全靠人工第一步，不要跳过。
-- 自检：目标机上跑 `bash /opt/openvpn-sk5-panel/verify.sh`（14 项端到端自检，逐项 PASS/FAIL/SKIP）。**安全警告：verify.sh 的 SK5 拨测会覆盖已填的 SK5 凭据**——已在面板里填了真实 SK5 后不要跑 verify.sh；跑完须重填 SK5。verify.sh 还会留下 `verify-*` 测试用户（脚本只建不删），属测试残留，面板行为本身正常。
+- 自检：目标机上跑 `bash /opt/openvpn-sk5-panel/verify.sh`（24 项检查，逐项 PASS/FAIL/SKIP）。已在面板里填了真实 SK5 也不怕：SK5 已启用时切换测试（sk5-toggle / sk5-egress-ip / sk5-disable）自动 SKIP，什么都不改；只有显式设 `VERIFY_ALLOW_OVERWRITE_SK5=1` 才会强制跑切换测试，跑之前脚本先备份 `sk5.json` 与 `sing-box.json`、退出时原样恢复，无须事后重填 SK5。失败路径例外：清理失败时文件故意不恢复（大声 FAIL，链路诚实保持禁用，备份留在工作目录供人工恢复）。verify.sh 还会留下 `verify-*` 测试用户（脚本只建不删），属测试残留，面板行为本身正常。
 
 ## 2. Cloudflare 模式部署（面板放 Worker，中转机只装 agent）
 
@@ -112,7 +119,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 
 - **SK5 凭据由用户自己在面板里填，绝不在聊天里要密码。** 本交付不含任何 SK5 账号密码；面板存量 SK5 密码为明文存储（设计决定，见 README），不要把面板数据库发给任何人。
 - **端口默认 1001，1001 vs 9000 仍待确认。** 面板 `端口` 字段默认填 1001；若商家给的是 9000，请填 9000 并回报。TCP 与 UDP 必须双通——验收要求 TCP 和 UDP 都走 SK5；若购买的 SK5 只通 TCP，OpenVPN 须用 TCP 443 模式。
-- SK5 拨测：面板「测试」按钮先做 TCP 拨测再做 UDP 拨测（native UDP ASSOCIATE + DNS to 1.1.1.1:53），两项都 ok 才算链路可用。
+- SK5 拨测：面板「测试」按钮先做 TCP 拨测再做 UDP 拨测（native UDP ASSOCIATE + DNS to 1.1.1.1:53；无应答时重试第二档 cloudflare.com / 8.8.8.8），两项都 ok 才算链路可用。
 
 ## 6. 已接受的限制清单（交付时即如此，不是 bug）
 
@@ -130,7 +137,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 
 ## 7. 升级与备份
 
-- **升级**：把新版发布包传到服务器、解包、默认重跑 `bash install.sh`（无任何 flag）。重跑不销毁线上 `panel.db`（R8-BUG-1 已修，并经 live-9 至 live-17 共九轮毒树默认重跑行级终验：admin/nodes/queue 行级一致，audit 仅增合法登录行）。重装不会轮换密码、CA 与服务端证书。
+- **升级**：把新版发布包传到服务器、解包、默认重跑 `bash install.sh`（无任何 flag）。重跑不销毁线上 `panel.db`（R8-BUG-1 已修，并经 live-9 至 live-19 共十一轮毒树默认重跑行级终验：admin/nodes/queue 行级一致，audit 仅增合法登录行）。重装不会轮换密码、CA 与服务端证书。
 - **升级前备份**（必做）：`cp -a /opt/openvpn-sk5-panel/panel/data /root/panel-data-backup-$(date +%Y%m%d)`。`panel/data/` 内含 `panel.db`（管理员、节点、审计）与 `agent_queue.json`（命令队列，内含 SK5 明文密码与 .ovpn 私钥回执）——备份文件本身须按凭据保管，不要外发。
 - **回滚**：升级出问题时停面板服务，把备份的 `panel/data/` 拷回 `/opt/openvpn-sk5-panel/panel/data/`，重起 `openvpn-sk5-panel` 服务。
 
@@ -149,7 +156,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 
 ## 9. 发布包清单与校验
 
-发布包：`releases/ovpn-release-1.0.tar.gz`（顶层目录 `openvpn-sk5-panel/`）。包内清单（78 个文件；不含 `tests/`、`__pycache__`、`*.pyc`、`.gitignore`、`cloudflare/.wrangler`、`panel/data/` 内一切运行时文件）：
+发布包：`releases/ovpn-release-1.0.1.tar.gz`（顶层目录 `openvpn-sk5-panel/`）。包内清单（90 个文件；不含 `tests/`、`__pycache__`、`*.pyc`、`.gitignore`、`cloudflare/.wrangler`、`panel/data/` 内一切运行时文件）：
 
 - 顶层：`install.sh`、`verify.sh`、`verify-integration.sh`（29 格门禁，见下）、`README.md`
 - `panel/`：`app.py`、`requirements.txt`、`README.md`、`templates/index.html`、`static/contrast-check.py`
@@ -158,26 +165,26 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 - `egress/`：`sk5_manager.py`、`policy-routing.sh`、`sing-box.json.template`、`test-egress.sh`、`README.md`
 - `systemd/`：5 个单元（`openvpn-sk5-panel`、`openvpn-sk5-singbox`、`openvpn-sk5-policy`、`openvpn-sk5-healthcheck` 服务＋定时器）
 - `cloudflare/`：`src/index.js`、`wrangler.toml`、`README.md`、`server-mode.md`
-- `docs/`：本文件、`security.md`、`flmx-reference.md`、live-verify 报告 17 份、`audit/` 审计报告 25 份（AUDIT-R1–R25）
+- `docs/`：本文件、`security.md`、`flmx-reference.md`、live-verify 报告 20 份、`audit/` 审计报告 34 份（AUDIT-R1–R34）
 
-关键文件 sha256（前 12 位；与 live-17 §0 的树版本逐项一致）：
+关键文件 sha256（前 12 位；与 live-19 §0 的树版本逐项一致）：
 
 | 文件 | sha256（前 12 位） |
 |---|---|
 | install.sh | `3f050f037e7a` |
-| egress/sk5_manager.py | `e209084f0915` |
+| egress/sk5_manager.py | `6eaf4d59ec35` |
 | egress/policy-routing.sh | `fbfb29a49164` |
-| panel/app.py | `40868bbfd8b9` |
-| cloudflare/src/index.js | `f43180976393` |
+| panel/app.py | `f7f60fa53bd0` |
+| cloudflare/src/index.js | `71c33ffe46c7` |
 | agent/agent.py | `f303af828555` |
 | core/openvpn_manager.py | `3b5d7dfe9ea1` |
 | verify-integration.sh | `2d110ff4ffec` |
-| verify.sh | `7867f557c6bb` |
+| verify.sh | `e36fc2003503` |
 
-核对方法（本机）：`sha256sum -c releases/ovpn-release-1.0.tar.gz.sha256`；解包后 `tar tzf releases/ovpn-release-1.0.tar.gz | wc -l` 应为 78 个文件 + 目录条目。门禁：`bash verify-integration.sh` 应为 `PASS=29 FAIL=0 SKIP=0`（29 格，含 §7 哈希钉死两层；脚本用固定 `/tmp/ovpn-int-test`＋8443 端口，须串行跑）。
+核对方法（本机）：`sha256sum -c releases/ovpn-release-1.0.1.tar.gz.sha256`；解包后 `tar tzf releases/ovpn-release-1.0.1.tar.gz | wc -l` 应为 90 个文件 + 目录条目。门禁：`bash verify-integration.sh` 应为 `PASS=29 FAIL=0 SKIP=0`（29 格，含 §7 哈希钉死两层；脚本用固定 `/tmp/ovpn-int-test`＋8443 端口，须串行跑）。
 
 ## 10. 审计与真机证据索引
 
-- 审计：`docs/audit/AUDIT-R25.md`（215 行，可交付，差集 ∅，沙箱级）为终审；此前 R1–R24 轮轮不能交付，历史 163 条全在 R25 §6 复扫（160 已修、2 部分按设计、1 未验 P0-1、0 复发）。
-- 真机：`docs/live-verify-R17.md`（180 行，全部通过、零新 bug）为终轮；BT 真机格（慢启动大声失败、楔死态一次 enable 恢复、健康检查删占位、三轮自动重启竞态、linkdown 拒认）全过，R24-P2-1 真机关闭；S0–S4 与 headline 六项全过。
+- 审计：`docs/audit/AUDIT-R34.md`（189 行，可交付，差集 ∅）为终审；此前 R26–R33 各轮差集 1–3 条（R27 一 P1 其余全 P2）均已修复闭合，历史 175 条全在 R34 §6 复扫（171 已修、2 部分按设计、1 未验 P0-1、0 复发）。
+- 真机：`docs/live-verify-R19.md`（197 行，全部通过、零新 bug）为终轮；R27–R33 修复格全过（verify.sh 强制路径 API 优先恢复、UDP verdict 往返实证、Worker 队列 TTL、toggle／1.0／信封／bcrypt 双面、enable 窄带 4.7 秒、前/端预拦零请求），headline-9 毒树重跑硬门通过；S0–S4 与 headline 六项全过。
 - 探针资产在包外：`tests/` 未进发布包（开发验证用，见树内 `tests/README.md`）。

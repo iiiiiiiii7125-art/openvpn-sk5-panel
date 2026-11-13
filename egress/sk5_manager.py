@@ -61,6 +61,13 @@ SYSTEMD_UNIT = "openvpn-sk5-singbox.service"
 VPN_NET = "10.8.0.0/24"
 DNS_SERVER = "1.1.1.1"          # UDP probe target (port 53)
 DNS_QUERY_NAME = "example.com"  # A query sent through the UDP relay
+# R27-P2-1 depth retry: a second query name + a second resolver, so
+# one resolver's empty answer database (live-18: 1.1.1.1 answered
+# example.com with ancount=0 while the relay demonstrably worked)
+# or one lost packet cannot condemn UDP. Attempt 2 only runs when
+# attempt 1 produced no txid-matching reply.
+DNS_SERVER2 = "8.8.8.8"
+DNS_QUERY_NAME2 = "cloudflare.com"
 EGRESS_CHECK_URL = "http://ifconfig.me"
 TIMEOUT = 10                    # seconds, per probe
 # NOTE: the UoT probe used to listen on a fixed 127.0.0.1:18080; it now
@@ -478,56 +485,105 @@ def _build_dns_query(name: str, txid: int) -> bytes:
     return header + qname + b"\x00" + struct.pack(">HH", 1, 1)  # A, IN
 
 
-def _parse_socks_udp_dns_reply(data: bytes, txid: int) -> bool:
-    """Pure parser: SOCKS UDP reply -> does it carry a DNS response
-    with the expected transaction ID and at least one answer?
-
-    Split out of _socks5_udp_associate_dns so the logic is unit-
-    testable without any socket (the sandbox blocks UDP sendto, so
-    live UDP tests can only run on a real machine -- see README).
-    """
+def _strip_socks_udp_header(data: bytes) -> bytes | None:
+    """SOCKS UDP reply -> inner payload, or None if the datagram is
+    not a well-formed SOCKS UDP reply (too short, unknown ATYP).
+    Shared by the verdict parser and the reply-note helper so the
+    header walk lives in exactly one place."""
     if len(data) < 14:
-        return False
+        return None
     off = 3  # skip RSV(2) + FRAG(1), data[3] is ATYP
     atyp = data[off]
     if atyp == 0x01:
         off += 1 + 4 + 2
     elif atyp == 0x03:
         if off + 1 >= len(data):
-            return False
+            return None
         off += 1 + 1 + data[off + 1] + 2
     elif atyp == 0x04:
         off += 1 + 16 + 2
     else:
+        return None
+    return data[off:]
+
+
+_DNS_RCODES = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN",
+               4: "NOTIMP", 5: "REFUSED"}
+
+
+def _parse_socks_udp_dns_reply(data: bytes, txid: int) -> bool:
+    """Pure parser: SOCKS UDP reply -> does it carry a legitimate DNS
+    response with the expected transaction ID?
+
+    Round-trip proof, NOT answer proof (R27-P2-1): a txid-matching
+    DNS response proves the relay carried a packet both ways, whatever
+    the resolver's answer database says about the queried name -- an
+    empty NOERROR (ancount=0; live-18: upstream 1.1.1.1 answered
+    example.com with zero answers while the relay demonstrably worked,
+    39-byte query out, 29-byte reply back, txid matched) is a PASS.
+    Answer content (ancount, rcode) is the resolver's business, never
+    the relay's verdict; it is recorded in the probe note instead
+    (see _dns_reply_note).
+
+    "Legitimate" means: a well-formed DNS header (12 bytes) with the
+    QR bit set (it IS a response, not a stray query) and the expected
+    transaction ID. Any rcode passes, including NXDOMAIN and SERVFAIL
+    -- the resolver answered, so the relay worked.
+
+    Split out of _socks5_udp_associate_dns so the logic is unit-
+    testable without any socket (the sandbox blocks UDP sendto, so
+    live UDP tests can only run on a real machine -- see README).
+    """
+    dns = _strip_socks_udp_header(data)
+    if dns is None or len(dns) < 12:
         return False
-    dns = data[off:]
-    if len(dns) < 12:
-        return False
-    resp_txid, _flags, _qd, ancount = struct.unpack(">HHHH", dns[:8])
-    return resp_txid == txid and ancount >= 1
+    resp_txid, flags, _qd, _an = struct.unpack(">HHHH", dns[:8])
+    return resp_txid == txid and bool(flags & 0x8000)
+
+
+def _dns_reply_note(data: bytes, txid: int) -> str:
+    """One-line summary of a txid-matching DNS reply for the probe
+    note (R27-P2-1): answer content is recorded HERE, never in the
+    verdict. E.g. "reply NOERROR an=0" / "reply NXDOMAIN an=0".
+    Returns "" when the packet is not a matching DNS response."""
+    dns = _strip_socks_udp_header(data)
+    if dns is None or len(dns) < 12:
+        return ""
+    resp_txid, flags, _qd, ancount = struct.unpack(">HHHH", dns[:8])
+    if resp_txid != txid or not (flags & 0x8000):
+        return ""
+    rcode = flags & 0x000F
+    return "reply %s an=%d" % (_DNS_RCODES.get(rcode, "rcode=%d" % rcode),
+                               ancount)
 
 
 def _socks5_udp_associate_dns(
     proxy_host: str, proxy_port: int, username: str, password: str,
     timeout: int = TIMEOUT,
-) -> tuple[bool, float]:
+) -> tuple[bool, float, str]:
     """Real UDP probe: SOCKS5 UDP ASSOCIATE + DNS query via the relay.
 
     1. TCP handshake to the SOCKS5 (auth 0x00, or 0x02 user/pass).
     2. CMD 0x03 UDP ASSOCIATE -> relay IP:port from the server.
-    3. Send a DNS A query for example.com to 1.1.1.1:53 *through*
-       the relay (SOCKS UDP header + DNS payload), wait for a DNS
-       response with the same transaction ID.
-    Returns (udp_ok, latency_ms). No TCP result is ever reported here.
+    3. Send a DNS A query through the relay (SOCKS UDP header + DNS
+       payload), wait for a DNS response with the same transaction ID.
+    Returns (udp_ok, latency_ms, note). No TCP result is ever reported
+    here.
+
+    Verdict (R27-P2-1): udp_ok is ROUND-TRIP proof -- any txid-matching
+    legitimate DNS response passes, even an empty NOERROR (ancount=0)
+    or NXDOMAIN; the answer content is recorded in the note, never in
+    the verdict. Depth: two attempts -- (example.com, 1.1.1.1) then
+    (cloudflare.com, 8.8.8.8) -- so one resolver's empty answer
+    database or one lost packet cannot condemn UDP; a timeout or a
+    non-matching reply falls through to the next attempt.
     """
     start = time.monotonic()
-    txid = random.randint(0, 0xFFFF)
-    query = _build_dns_query(DNS_QUERY_NAME, txid)
     tcp = None
     udp = None
     try:
         # Inside try on purpose: an unreachable/refused proxy must
-        # return (False, ms), never raise into the caller.
+        # return (False, ms, note), never raise into the caller.
         tcp = socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout)
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         tcp.settimeout(timeout)
@@ -536,17 +592,20 @@ def _socks5_udp_associate_dns(
         tcp.sendall(b"\x05\x01" + methods)
         resp = tcp.recv(2)
         if len(resp) != 2 or resp[0] != 0x05 or resp[1] not in (0x00, 0x02):
-            return False, (time.monotonic() - start) * 1000.0
+            return False, (time.monotonic() - start) * 1000.0, \
+                "UDP ASSOCIATE handshake rejected"
         if resp[1] == 0x02:
             u, p = username.encode(), password.encode()
             tcp.sendall(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
             auth = tcp.recv(2)
             if len(auth) != 2 or auth[1] != 0x00:
-                return False, (time.monotonic() - start) * 1000.0
+                return False, (time.monotonic() - start) * 1000.0, \
+                    "UDP ASSOCIATE auth failed"
         tcp.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
         reply = tcp.recv(64)
         if len(reply) < 10 or reply[1] != 0x00:
-            return False, (time.monotonic() - start) * 1000.0
+            return False, (time.monotonic() - start) * 1000.0, \
+                "UDP ASSOCIATE refused"
         atyp = reply[3]
         if atyp == 0x01:
             relay = (socket.inet_ntoa(reply[4:8]), struct.unpack(">H", reply[8:10])[0])
@@ -557,16 +616,35 @@ def _socks5_udp_associate_dns(
             relay = (socket.inet_ntop(socket.AF_INET6, reply[4:20]),
                      struct.unpack(">H", reply[20:22])[0])
         else:
-            return False, (time.monotonic() - start) * 1000.0
-        # SOCKS UDP header: RSV(2) FRAG(1) ATYP(1) DST(4) PORT(2) + DNS.
-        packet = b"\x00\x00\x00\x01" + socket.inet_aton(DNS_SERVER) \
-            + struct.pack(">H", 53) + query
-        udp.sendto(packet, relay)
-        data, _ = udp.recvfrom(2048)
-        ok = _parse_socks_udp_dns_reply(data, txid)
-        return ok, (time.monotonic() - start) * 1000.0
+            return False, (time.monotonic() - start) * 1000.0, \
+                "UDP ASSOCIATE returned unknown ATYP"
+        # Two attempts, one sendto/recvfrom call site each inside the
+        # loop: (example.com, 1.1.1.1) then the depth retry
+        # (cloudflare.com, 8.8.8.8). A timeout or a non-matching reply
+        # falls through to the next attempt instead of condemning UDP.
+        attempts = [(DNS_QUERY_NAME, DNS_SERVER),
+                    (DNS_QUERY_NAME2, DNS_SERVER2)]
+        for name, server in attempts:
+            txid = random.randint(0, 0xFFFF)
+            query = _build_dns_query(name, txid)
+            # SOCKS UDP header: RSV(2) FRAG(1) ATYP(1) DST(4) PORT(2) + DNS.
+            packet = b"\x00\x00\x00\x01" + socket.inet_aton(server) \
+                + struct.pack(">H", 53) + query
+            try:
+                udp.sendto(packet, relay)
+                data, _ = udp.recvfrom(2048)
+            except (OSError, socket.timeout):
+                continue
+            if _parse_socks_udp_dns_reply(data, txid):
+                return True, (time.monotonic() - start) * 1000.0, \
+                    "native UDP ASSOCIATE + DNS to %s:53 (%s, %s)" % (
+                        server, name, _dns_reply_note(data, txid))
+        return False, (time.monotonic() - start) * 1000.0, \
+            "native UDP ASSOCIATE + DNS: no txid-matching reply from " \
+            "1.1.1.1:53 (example.com) or 8.8.8.8:53 (cloudflare.com)"
     except (OSError, socket.timeout, struct.error, ValueError, IndexError):
-        return False, (time.monotonic() - start) * 1000.0
+        return False, (time.monotonic() - start) * 1000.0, \
+            "UDP ASSOCIATE raised (network unreachable?)"
     finally:
         for sock in (tcp, udp):
             if sock is not None:
@@ -641,8 +719,9 @@ def _udp_probe_via_uot_singbox(cfg: dict) -> tuple[bool, float, str]:
                 continue
         else:
             return False, 0.0, "temp sing-box did not listen in time"
-        ok, ms = _socks5_udp_associate_dns("127.0.0.1", probe_port, "", "")
-        return ok, ms, "udp_over_tcp via temp sing-box (127.0.0.1:%d)" % probe_port
+        ok, ms, inner_note = _socks5_udp_associate_dns("127.0.0.1", probe_port, "", "")
+        return ok, ms, "udp_over_tcp via temp sing-box (127.0.0.1:%d) (%s)" % (
+            probe_port, inner_note)
     finally:
         proc.terminate()
         try:
@@ -801,8 +880,11 @@ def test_sk5() -> dict:
     Returns {"tcp_ok","udp_ok","egress_ip","latency_ms",
              "udp_mode","udp_note","host","port"}.
     tcp_ok: curl --socks5-hostname fetched ifconfig.me through the SK5.
-    udp_ok: SOCKS5 UDP ASSOCIATE + DNS query to 1.1.1.1 through the
-    relay returned a matching DNS response. If udp_over_tcp is on,
+    udp_ok: SOCKS5 UDP ASSOCIATE + DNS query through the relay returned
+    a txid-matching DNS response (R27-P2-1: any rcode, even an empty
+    NOERROR -- the answer content is the resolver's business, recorded
+    in udp_note, never the verdict; on no reply it retries once with a
+    second name + second resolver). If udp_over_tcp is on,
     the UDP probe runs through a throwaway sing-box so it exercises
     the UoT encapsulation. A TCP pass never sets udp_ok.
     """
@@ -818,10 +900,9 @@ def test_sk5() -> dict:
         udp_mode = "udp_over_tcp"
     else:
         try:
-            udp_ok, _udp_ms = _socks5_udp_associate_dns(
+            udp_ok, _udp_ms, note = _socks5_udp_associate_dns(
                 cfg["host"], int(cfg["port"]),
                 cfg.get("username", ""), cfg.get("password", ""))
-            note = "native UDP ASSOCIATE + DNS to 1.1.1.1:53"
         except (OSError, socket.timeout, ValueError):
             udp_ok, note = False, "UDP ASSOCIATE raised (network unreachable?)"
         udp_mode = "native"
@@ -1142,16 +1223,23 @@ def enable() -> dict:
     # AND bring it up (LOWER_UP). Mere existence is not enough: a
     # dead placeholder exists too, and routing via it installs a
     # linkdown route that carries nothing (R24-P2-1).
-    for _ in range(10):
+    # R32-P2-1: deadline loop, not `for _ in range(10)` with
+    # check-then-sleep -- the old shape checked liveness only at
+    # 0.0..4.5 s and raised at 5.0 s without ever checking at 5.0 s,
+    # so a tun1 going live at 4.6..5.0 s was missed. This loop
+    # checks at 0.0, 0.5, ..., 5.0 s (11 checks); the 5 s hard
+    # cutoff is unchanged (DELIVERY.md:131, O-R25-2).
+    deadline = time.monotonic() + 5.0
+    while True:
         if _tun1_live():
             break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "sing-box did not create a live tun1 within 5 s "
+                "(no placeholder was created; check that sing-box is "
+                "running and its tun inbound is configured -- see "
+                "sing-box.log); enable aborted, no policy state changed")
         time.sleep(0.5)
-    else:
-        raise RuntimeError(
-            "sing-box did not create a live tun1 within 5 s "
-            "(no placeholder was created; check that sing-box is "
-            "running and its tun inbound is configured -- see "
-            "sing-box.log); enable aborted, no policy state changed")
     _apply_policy(verb="repair")
     if not _policy_active({**cfg, "enabled": True}):
         raise RuntimeError(

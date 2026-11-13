@@ -1,5 +1,7 @@
 # OpenVPN + SK5 面板 — Cloudflare 部署
 
+> **未验（P0-1）：Cloudflare 模式从未在真实部署上验证。** `wrangler deploy --dry-run` 通过不等于部署可用；`wrangler.toml` 里的 KV id 仍为占位符。
+
 控制面跑在 Cloudflare Workers 上，执行面是中转机上的 agent（agent 路另行实现）。
 面板只管节点注册、命令下发、结果回执；真正装 OpenVPN、切 SK5 的活都在 agent 那头做。
 

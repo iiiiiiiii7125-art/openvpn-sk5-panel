@@ -37,12 +37,17 @@
 #      /api/agent/bundle containing agent/agent.py and
 #      /install-agent.sh -> 200
 #
-# Safety: the SK5 toggle test OVERWRITES the stored SK5 credential.
-# It only runs when no merchant SK5 is currently configured
-# (host empty / disabled). If a real SK5 is configured the toggle
-# checks are SKIPped; set VERIFY_ALLOW_OVERWRITE_SK5=1 to force it
-# (the merchant password cannot be restored afterwards -- you will
-# have to re-enter it in the panel).
+# Safety: when a real merchant SK5 is already enabled, the toggle
+# checks (sk5-toggle / sk5-egress-ip / sk5-disable) are auto-SKIPped
+# and nothing is overwritten. Set VERIFY_ALLOW_OVERWRITE_SK5=1 to
+# force the toggle test; before it runs, sk5.json and sing-box.json
+# are backed up and cleanup() restores the RUNNING chain via the
+# API (POST /api/sk5 enabled=true with the backed-up host/port,
+# password kept stored -- never sent) and then copies the backed-up
+# files back, so no re-entry of the merchant password is needed
+# afterwards. A failed restore is a loud FAIL and leaves the chain
+# honestly disabled; a file-only restore would leave enabled=true
+# on disk over a direct-mode daemon (R27-P1-1).
 #
 # Environment-limited checks become SKIP (with the reason), never a
 # fake PASS: e.g. no CAP_NET_ADMIN in a sandbox, or no route to
@@ -87,6 +92,12 @@ print('' if v is None else (str(v).lower() if isinstance(v,bool) else v))" "$1" 
 }
 
 cleanup() {
+    # This runs on EXIT, so $? at entry is the exit status the
+    # script is leaving with; preserve it unless a restore step
+    # below fails, in which case force a non-zero exit (a restore
+    # failure must never hide behind an ALL GREEN summary).
+    local _rc=$?
+    local _restore_failed=0
     # Restore prior SK5 state first (best effort, never fatal).
     if [ "$SK5_TOGGLED" -eq 1 ] && [ "$LOGGED_IN" -eq 1 ]; then
         curl -ks --max-time 10 -b "$COOKIE_JAR" -o /dev/null \
@@ -99,15 +110,92 @@ cleanup() {
     if [ -n "$STUB_PID" ] && kill -0 "$STUB_PID" 2>/dev/null; then
         kill "$STUB_PID" 2>/dev/null || true
     fi
-    if [ "$SK5_JSON_BACKED_UP" -eq 1 ]; then
-        cp "$WORKDIR/sk5.json.bak" "$CONFIG_DIR/sk5.json" 2>/dev/null || true
-    elif [ -f "$CONFIG_DIR/sk5.json" ] && [ "${SK5_JSON_EXISTED:-0}" -eq 0 ]; then
-        rm -f "$CONFIG_DIR/sk5.json" 2>/dev/null || true
+    # R27-P1-1: restoring the FILES is not restoring the chain.
+    # The toggle test's disable rendered a DIRECT sing-box config
+    # and restarted the daemon on it; if the pre-verify state had
+    # a real SK5 enabled, copying the backed-up sk5.json
+    # (enabled=true) and sing-box.json back leaves the RUNNING
+    # sing-box direct while the disk says SK5 -- and the next
+    # healthcheck tick whitewashes it healthy (the policy
+    # re-applies over the live tun1 and test_sk5 dials the
+    # merchant SOCKS directly, bypassing the chain). Restore via
+    # the API FIRST, while the disk still says enabled=false, so
+    # set_sk5 takes the disabled->enabled flip and runs the full
+    # enable(): re-render + sing-box restart + policy. The order
+    # is load-bearing: restoring the files first and then posting
+    # the same values takes set_sk5's still-enabled branch, whose
+    # repair only re-applies the policy when the daemon is alive
+    # and never restarts it -- the daemon would stay direct.
+    # The merchant password is NOT sent: the panel keeps the
+    # stored password when the field is absent (P0-4). Only after
+    # the API re-enable succeeds are the backed-up files copied
+    # back over the identical state enable() just persisted; if
+    # the API call fails, the files are NOT restored -- a
+    # file-only restore is exactly the divergence -- and the
+    # chain is left honestly disabled (re-enable it from the
+    # panel; the password is still stored).
+    local _PRIOR_ENABLED=""
+    if [ "$SK5_JSON_BACKED_UP" -eq 1 ] && [ -f "$WORKDIR/sk5.json.bak" ]; then
+        _PRIOR_ENABLED="$(json_get "$WORKDIR/sk5.json.bak" enabled)"
     fi
-    if [ "$SINGBOX_JSON_BACKED_UP" -eq 1 ]; then
-        cp "$WORKDIR/sing-box.json.bak" "$CONFIG_DIR/sing-box.json" 2>/dev/null || true
+    if [ "$_PRIOR_ENABLED" = "true" ]; then
+        local _BAK_HOST _BAK_PORT _BAK_USER
+        _BAK_HOST="$(json_get "$WORKDIR/sk5.json.bak" host)"
+        _BAK_PORT="$(json_get "$WORKDIR/sk5.json.bak" port)"
+        _BAK_USER="$(json_get "$WORKDIR/sk5.json.bak" username)"
+        if [ -z "$_BAK_HOST" ] || [ -z "$_BAK_PORT" ]; then
+            echo "[FAIL] cleanup-restore-sk5 -- backed-up sk5.json has no usable host/port; merchant SK5 left DISABLED (re-enable it from the panel; the password is still stored); backup kept in $WORKDIR"
+            _restore_failed=1
+        elif [ "$LOGGED_IN" -ne 1 ]; then
+            echo "[FAIL] cleanup-restore-sk5 -- not logged in; cannot re-enable the merchant SK5 via the API; merchant SK5 left DISABLED (re-enable it from the panel); backup kept in $WORKDIR"
+            _restore_failed=1
+        else
+            local _REENABLE_BODY _REENABLE_CODE
+            _REENABLE_BODY="$(python3 -c "import json,sys; print(json.dumps({'host': sys.argv[1], 'port': int(sys.argv[2]), 'username': sys.argv[3], 'enabled': True}))" "$_BAK_HOST" "$_BAK_PORT" "$_BAK_USER" 2>/dev/null || true)"
+            _REENABLE_CODE="$(curl -ks --max-time 30 -b "$COOKIE_JAR" -o "$WORKDIR/sk5reenable.json" \
+                -w '%{http_code}' -X POST "$PANEL_URL/api/sk5" \
+                -H 'Content-Type: application/json' \
+                -d "$_REENABLE_BODY" 2>/dev/null || true)"
+            if [ "$_REENABLE_CODE" = "200" ] && [ "$(json_get "$WORKDIR/sk5reenable.json" ok)" = "true" ]; then
+                echo "[PASS] cleanup-restore-sk5 -- merchant SK5 re-enabled via API (host=$_BAK_HOST port=$_BAK_PORT, password kept stored); running chain restored, not just the files"
+            else
+                echo "[FAIL] cleanup-restore-sk5 -- POST /api/sk5 enabled=true -> HTTP $_REENABLE_CODE body: $(head -c 300 "$WORKDIR/sk5reenable.json" 2>/dev/null); merchant SK5 left DISABLED (re-enable it from the panel; the password is still stored); backup kept in $WORKDIR"
+                _restore_failed=1
+            fi
+        fi
+    fi
+    # Copy the backed-up files back -- but never over a failed API
+    # re-enable: files saying enabled=true over a direct daemon is
+    # the divergence this restores from. A failed cp is a loud
+    # FAIL, never a silent `|| true`.
+    if [ "$_restore_failed" -eq 0 ]; then
+        if [ "$SK5_JSON_BACKED_UP" -eq 1 ]; then
+            if ! cp "$WORKDIR/sk5.json.bak" "$CONFIG_DIR/sk5.json" 2>/dev/null; then
+                echo "[FAIL] cleanup-restore-sk5 -- cp sk5.json.bak -> $CONFIG_DIR/sk5.json failed; the running chain was already restored by the API above, but the file copy did not land -- check $CONFIG_DIR/sk5.json; backup kept in $WORKDIR"
+                _restore_failed=1
+            fi
+        elif [ -f "$CONFIG_DIR/sk5.json" ] && [ "${SK5_JSON_EXISTED:-0}" -eq 0 ]; then
+            if ! rm -f "$CONFIG_DIR/sk5.json" 2>/dev/null; then
+                echo "[FAIL] cleanup-restore-sk5 -- rm of toggle-created $CONFIG_DIR/sk5.json failed; a disabled stub config was left behind -- remove it by hand; workdir kept in $WORKDIR"
+                _restore_failed=1
+            fi
+        fi
+        if [ "$SINGBOX_JSON_BACKED_UP" -eq 1 ]; then
+            if ! cp "$WORKDIR/sing-box.json.bak" "$CONFIG_DIR/sing-box.json" 2>/dev/null; then
+                echo "[FAIL] cleanup-restore-sk5 -- cp sing-box.json.bak -> $CONFIG_DIR/sing-box.json failed; the running chain was already restored by the API above, but the file copy did not land -- check $CONFIG_DIR/sing-box.json; backup kept in $WORKDIR"
+                _restore_failed=1
+            fi
+        fi
+    fi
+    if [ "$_restore_failed" -eq 1 ]; then
+        # Keep the workdir (backups + API responses) for manual
+        # recovery; force a non-zero exit even if every check
+        # passed -- the ALL GREEN line above does not cover cleanup.
+        echo "[FAIL] cleanup-restore-sk5 -- restore FAILED (see lines above); workdir kept at $WORKDIR"
+        if [ "$_rc" -ne 0 ]; then exit "$_rc"; else exit 1; fi
     fi
     rm -rf "$WORKDIR"
+    exit "$_rc"
 }
 trap cleanup EXIT
 
