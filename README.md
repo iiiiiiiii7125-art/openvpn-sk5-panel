@@ -52,24 +52,33 @@
 
 目标机：全新 Debian 12 / Ubuntu 22.04 / 24.04，root，amd64 或 arm64。
 
+以下命令全部在目标机上执行（先 ssh 登录到机器），直接粘贴即可。
+
 首选 `git clone`（公开仓库）：
 
 ```bash
-ssh root@<目标机> 'git clone https://github.com/iiiiiiiii7125-art/openvpn-sk5-panel && cd openvpn-sk5-panel && bash install.sh'   # 默认 OpenVPN UDP 1194
+git clone https://github.com/iiiiiiiii7125-art/openvpn-sk5-panel && cd openvpn-sk5-panel && bash install.sh   # 默认 OpenVPN UDP 1194
 # 或 TCP 模式：
-ssh root@<目标机> 'cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443 bash install.sh'
+cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443 bash install.sh
 ```
 
 安装器只按固定清单复制文件（`agent core egress panel systemd install.sh verify.sh verify-integration.sh README.md`），克隆来的 `.git/` 不会进 `/opt`。
 
-备选（目标机不能直连 GitHub 时）：把整个 `openvpn-sk5-panel/` 目录拷到目标机（`scp -r` / `rsync` 任选），或传发布包 `releases/ovpn-release-1.0.tar.gz` 后解包，再进目录安装：
+备选（目标机不能直连 GitHub 时）：在本机把整个 `openvpn-sk5-panel/` 目录拷到目标机（`scp -r` / `rsync` 任选），或在目标机上直接下载发布包后解包安装：
 
 ```bash
+# 本机执行（传目录）：
 scp -r openvpn-sk5-panel root@<目标机>:/root/
-ssh root@<目标机> 'cd /root/openvpn-sk5-panel && bash install.sh'
+# 然后在目标机上执行：
+cd /root/openvpn-sk5-panel && bash install.sh
 ```
 
-安装完打印面板地址 `https://<服务器 IP>:8443` + 初始管理员密码（仅显示一次，也写在 `/etc/openvpn-sk5-panel/admin.pass`，0600）。重装不会轮换密码、CA 与服务端证书。
+```bash
+# 或在目标机上直接下载发布包安装：
+cd /root && curl -L -o ovpn-release-1.0.1.tar.gz https://raw.githubusercontent.com/iiiiiiiii7125-art/openvpn-sk5-panel/1.0.1/releases/ovpn-release-1.0.1.tar.gz && tar xzf ovpn-release-1.0.1.tar.gz && cd openvpn-sk5-panel && bash install.sh
+```
+
+安装完打印面板地址 `https://<服务器 IP>:8443` + 初始管理员密码（仅显示一次，也写在 `/etc/openvpn-sk5-panel/admin.pass`，0600）。重装不会轮换密码、CA 与服务端证书。装完自检：`bash /opt/openvpn-sk5-panel/verify.sh`（24 项检查，逐项 PASS/FAIL/SKIP）。
 
 可选环境变量：`OVPN_PROTO`（udp|tcp）、`OVPN_PORT`、`OVPN_SUBNET`（固定 `10.8.0.0/24`，core 模板写死该子网；设为其他值安装器直接拒绝，否则 NAT 规则与已服务子网错位、出口断流）、`OVPN_DNS`（默认 `1.1.1.1`，写入 `server.conf` 的 `push "dhcp-option DNS …"`）；`SINGBOX_SHA256` / `TUN2SOCKS_SHA256`（见下「二进制校验」）。
 

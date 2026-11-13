@@ -16,20 +16,26 @@
 
 ### 1.2 步骤（字段级）
 
+以下命令全部在目标机上执行（先 ssh 登录到机器），直接粘贴即可。
+
 ```bash
 # 首选：目标机上直接克隆公开仓库后安装
-ssh root@<目标机> 'git clone https://github.com/iiiiiiiii7125-art/openvpn-sk5-panel && cd openvpn-sk5-panel && bash install.sh'
+git clone https://github.com/iiiiiiiii7125-art/openvpn-sk5-panel && cd openvpn-sk5-panel && bash install.sh
 # 默认 OpenVPN UDP 1194；TCP 模式：
-ssh root@<目标机> 'cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443 bash install.sh'
+cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443 bash install.sh
 ```
 
 安装器只按固定清单复制文件，克隆来的 `.git/` 不会进 `/opt`。
 
-备选（目标机不能直连 GitHub 时）：传发布包再解包安装（本机执行；<目标机> 换成服务器 IP 或域名）：
+备选（目标机不能直连 GitHub 时）：在本机传发布包到目标机（本机执行；<目标机> 换成服务器 IP 或域名），再在目标机上解包安装；或在目标机上直接下载发布包：
 
 ```bash
+# 本机执行（传包）：
 scp releases/ovpn-release-1.0.1.tar.gz root@<目标机>:/root/
-ssh root@<目标机> 'cd /root && tar xzf ovpn-release-1.0.1.tar.gz && cd openvpn-sk5-panel && bash install.sh'
+# 然后在目标机上执行：
+cd /root && tar xzf ovpn-release-1.0.1.tar.gz && cd openvpn-sk5-panel && bash install.sh
+# 或在目标机上直接下载发布包安装：
+cd /root && curl -L -o ovpn-release-1.0.1.tar.gz https://raw.githubusercontent.com/iiiiiiiii7125-art/openvpn-sk5-panel/1.0.1/releases/ovpn-release-1.0.1.tar.gz && tar xzf ovpn-release-1.0.1.tar.gz && cd openvpn-sk5-panel && bash install.sh
 ```
 
 可选环境变量：`OVPN_PROTO`（udp|tcp）、`OVPN_PORT`、`OVPN_SUBNET`（固定 `10.8.0.0/24`，设为其他值安装器直接拒绝）、`OVPN_DNS`（默认 `1.1.1.1`，写入 server.conf 的 `push "dhcp-option DNS …"`）。
