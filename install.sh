@@ -1341,7 +1341,7 @@ rm -f "$WORKDIR/login-payload.json" "$PASS_FILE"
 if [ "$LOGIN_CODE" != "200" ] || ! grep -q '"ok": *true' "$WORKDIR/login.json" 2>/dev/null; then
     die "panel login check failed (HTTP $LOGIN_CODE) -- password file and panel DB disagree; see journalctl -u openvpn-sk5-panel"
 fi
-STATUS_CODE="$(curl -ks --max-time 10 -b "$COOKIE_JAR" -o /dev/null -w '%{http_code}' \
+STATUS_CODE="$(curl -ks --max-time 15 -b "$COOKIE_JAR" -o /dev/null -w '%{http_code}' \
     "https://127.0.0.1:$PANEL_PORT/api/status" 2>/dev/null || true)"
 [ "$STATUS_CODE" = "200" ] \
     || die "panel /api/status returned HTTP $STATUS_CODE after login"

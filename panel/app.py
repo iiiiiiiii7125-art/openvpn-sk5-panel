@@ -1436,36 +1436,130 @@ _SK5_STATUS_LOCK = threading.Lock()
 _EGRESS_CACHE = {"at": 0.0, "ip": None, "error": None}
 _EGRESS_CACHE_TTL = 10.0
 _EGRESS_CACHE_LOCK = threading.Lock()
+# R41-L4-P1-1 / R41-L1-7: the probe must never eat the caller's whole
+# budget. The old code ran the (up to 10 s) egress probe synchronously
+# on a cold cache, so the install gate's single 10 s curl always lost
+# to it; GET /api/sk5 even probed on every call. Both caches below are
+# stale-while-revalidate now: a stale read returns the last known value
+# immediately (or a probe-free snapshot when nothing was ever probed)
+# and refreshes in a single-flight daemon thread. The request path
+# performs no network probe any more; the probe still runs, it just no
+# longer blocks the caller. Refresh threads are daemons (never block
+# exit) and swallow their own exceptions.
+_SK5_REFRESHING = {"busy": False}
+_EGRESS_REFRESHING = {"busy": False}
+# Cache generation: bumped by _invalidate_sk5_status_cache(). A
+# background refresh (or a probe-free snapshot) computed from the old
+# config must not land in the cache after a mutation; the writer checks
+# the generation under _SK5_STATUS_LOCK before storing.
+_SK5_STATUS_GEN = {"n": 0}
+
+
+def _refresh_in_background(flag, lock, fn):
+    """Run fn() in a daemon thread unless a refresh is already running.
+    fn() updates its own cache (timestamped at completion) and must
+    never raise out. The flag check/set happens under lock; fn() itself
+    runs outside it, so this never nests locks."""
+    with lock:
+        if flag["busy"]:
+            return
+        flag["busy"] = True
+
+    def _run():
+        try:
+            fn()
+        finally:
+            with lock:
+                flag["busy"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _refresh_sk5_status():
+    gen = _SK5_STATUS_GEN["n"]
+    try:
+        sk5 = dict(sk5_get_status())
+    except Exception:  # noqa: BLE001 - 后台刷新失败不惊动请求路径
+        return
+    with _SK5_STATUS_LOCK:
+        # A mutation that landed mid-refresh bumps the generation; drop
+        # this snapshot instead of resurrecting pre-mutation config.
+        if gen != _SK5_STATUS_GEN["n"]:
+            return
+        _SK5_STATUS_CACHE.update({"at": time.time(), "sk5": sk5})
+
+
+def _refresh_egress():
+    try:
+        ip = current_egress_ip()
+        err = None
+    except Exception as exc:  # noqa: BLE001
+        ip, err = None, str(exc)
+    with _EGRESS_CACHE_LOCK:
+        _EGRESS_CACHE.update({"at": time.time(), "ip": ip, "error": err})
+
+
+def _invalidate_sk5_status_cache():
+    """Drop the cached get_status() result. Call after any local SK5
+    mutation (save / enable / disable / fail-open / udp-over-tcp) so
+    the next read sees the new config instead of the pre-mutation
+    snapshot (R41-L4-P2-5 follow-up: GET /api/sk5 used to read live
+    state on every call; now that it reads the cache, a save without
+    invalidation would answer the next GET with stale data). The next
+    _cached_sk5_status() call rebuilds a fast probe-free snapshot
+    synchronously and refreshes the probed value behind it, so
+    invalidation costs no probe wait. Bumps the generation so a
+    refresh already in flight cannot resurrect the old snapshot."""
+    with _SK5_STATUS_LOCK:
+        _SK5_STATUS_GEN["n"] += 1
+        _SK5_STATUS_CACHE.update({"at": 0.0, "sk5": None})
 
 
 def _cached_sk5_status():
-    """10 秒内复用上一次 get_status() 结果（含它内部那次探针）。
-    注意：缓存时间戳取探针完成时——取开始时的话，一次 10 秒探针
-    跑完缓存就已过期，等于没缓存。"""
+    """10 秒缓存的 get_status()，stale-while-revalidate。
+    缓存新鲜时直接返回；过期时已有旧值则立刻返回旧值并后台刷新；
+    从未探过时同步算一次不含探针的快照（probe_egress=False：只读
+    配置 + 本地检查，egress_ip 为 None）并后台刷新完整值。请求路
+    径永不等待 egress 探针。"""
     with _SK5_STATUS_LOCK:
         now = time.time()
-        if (_SK5_STATUS_CACHE["sk5"] is not None
+        cached = _SK5_STATUS_CACHE["sk5"]
+        if (cached is not None
                 and now - _SK5_STATUS_CACHE["at"] < _SK5_STATUS_CACHE_TTL):
-            return dict(_SK5_STATUS_CACHE["sk5"])
-        sk5 = dict(sk5_get_status())
-        _SK5_STATUS_CACHE.update({"at": time.time(), "sk5": sk5})
-        return dict(sk5)
+            return dict(cached)
+        stale = dict(cached) if cached is not None else None
+    if stale is not None:
+        _refresh_in_background(_SK5_REFRESHING, _SK5_STATUS_LOCK,
+                               _refresh_sk5_status)
+        return stale
+    # No cached value yet: probe-free snapshot now (fast, local only),
+    # full probed value in the background. Generation-guarded like the
+    # refresh: a mutation that landed mid-computation must not let a
+    # stale snapshot into the cache (returning it to this caller is
+    # fine: that read raced the mutation).
+    gen = _SK5_STATUS_GEN["n"]
+    sk5 = dict(sk5_get_status(probe_egress=False))
+    with _SK5_STATUS_LOCK:
+        if gen == _SK5_STATUS_GEN["n"]:
+            _SK5_STATUS_CACHE.update({"at": time.time(), "sk5": sk5})
+    _refresh_in_background(_SK5_REFRESHING, _SK5_STATUS_LOCK,
+                           _refresh_sk5_status)
+    return dict(sk5)
 
 
 def _probe_egress_cached():
-    """直连出口探针（SK5 未启用时用），10 秒缓存（时间戳同上，
-    取探针完成时）。"""
+    """直连出口探针（SK5 未启用时用），10 秒缓存，
+    stale-while-revalidate：缓存新鲜时直接返回；过期时立刻返回上一
+    次的值（从未探过则 (None, None)，与探针失败同款）并后台刷新。
+    请求路径永不等待探针。"""
     with _EGRESS_CACHE_LOCK:
         now = time.time()
         if now - _EGRESS_CACHE["at"] < _EGRESS_CACHE_TTL:
             return _EGRESS_CACHE["ip"], _EGRESS_CACHE["error"]
-        try:
-            ip = current_egress_ip()
-            err = None
-        except Exception as exc:  # noqa: BLE001
-            ip, err = None, str(exc)
-        _EGRESS_CACHE.update({"at": time.time(), "ip": ip, "error": err})
-        return ip, err
+        ip, err = _EGRESS_CACHE["ip"], _EGRESS_CACHE["error"]
+    _refresh_in_background(_EGRESS_REFRESHING, _EGRESS_CACHE_LOCK,
+                           _refresh_egress)
+    return ip, err
 
 
 @app.route("/api/status", methods=["GET"])
@@ -1967,7 +2061,9 @@ def sk5_get():
     if missing:
         return missing
     try:
-        return jsonify({"ok": True, "sk5": sk5_get_status()})
+        # R41-L4-P2-5：走 _cached_sk5_status()（10 秒缓存，后台刷新），
+        # 不再每次现探 egress（SK5 启用且探针慢时每调一次 stall 10 秒）。
+        return jsonify({"ok": True, "sk5": _cached_sk5_status()})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -2144,6 +2240,7 @@ def sk5_save():
                       % (stored.get("host"), stored.get("port"),
                          sorted(k for k in ("enabled", "fail_open",
                                             "udp_over_tcp") if k in data)))
+        _invalidate_sk5_status_cache()
         return jsonify({"ok": True, "sk5": result})
     if not host:
         return jsonify({"ok": False, "error": "host 不能为空"}), 400
@@ -2176,6 +2273,7 @@ def sk5_save():
     # 审计只记 host/port/开关，绝不记 SK5 密码。
     _audit("sk5_save", result="ok",
            detail="host=%s port=%s enabled=%s" % (host, port, enabled))
+    _invalidate_sk5_status_cache()
     return jsonify({"ok": True, "sk5": result})
 
 
@@ -2233,6 +2331,7 @@ def sk5_enable():
         with _SK5_MUTATE_LOCK:
             result = sk5_set_sk5(enabled=True)
         _audit("sk5_enable", result="ok")
+        _invalidate_sk5_status_cache()
         return jsonify({"ok": True, "result": result})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -2267,6 +2366,7 @@ def sk5_disable():
                 return jsonify({"ok": True, "result": stored})
             result = sk5_set_sk5(enabled=False)
         _audit("sk5_disable", result="ok")
+        _invalidate_sk5_status_cache()
         return jsonify({"ok": True, "result": result})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -2304,6 +2404,7 @@ def sk5_fail_open():
             result = sk5_set_fail_open(fail_open)
         _audit("sk5_fail_open", result="ok",
                detail="fail_open=%s" % fail_open)
+        _invalidate_sk5_status_cache()
         return jsonify({"ok": True, "result": result})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -2342,6 +2443,7 @@ def sk5_udp_over_tcp():
             result = sk5_set_udp_over_tcp(uot)
         _audit("sk5_udp_over_tcp", result="ok",
                detail="udp_over_tcp=%s" % uot)
+        _invalidate_sk5_status_cache()
         return jsonify({"ok": True, "result": result})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(exc)}), 500
