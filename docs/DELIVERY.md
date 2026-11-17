@@ -63,7 +63,7 @@ cd /root && curl -L -o ovpn-release-1.0.2.tar.gz https://raw.githubusercontent.c
 
 - 面板地址：`https://<服务器 IP>:8443`。初始管理员密码**仅在安装完成时打印一次**，也写在 `/etc/openvpn-sk5-panel/admin.pass`（0600，root 可读）。重装不会轮换密码、CA 与服务端证书。**首次打开浏览器会提示“不安全 / 证书不受信任”，属预期**（面板证书是自签的）：点「高级」→「继续前往」即可；安装时填域名（Caddy + Let's Encrypt）可彻底消除该提示。
 - **登录后立即改密**：面板右上角「修改密码」按钮（调 `POST /api/change-password`；成功后全部旧会话作废，须重新登录）。注意：首次登录**不强制**改密（P0-3，按设计未实现），改密全靠人工第一步，不要跳过。
-- 自检：目标机上跑 `bash /opt/openvpn-sk5-panel/verify.sh`（24 项检查，逐项 PASS/FAIL/SKIP）。已在面板里填了真实 SK5 也不怕：SK5 已启用时切换测试（sk5-toggle / sk5-egress-ip / sk5-disable）自动 SKIP，什么都不改；只有显式设 `VERIFY_ALLOW_OVERWRITE_SK5=1` 才会强制跑切换测试，跑之前脚本先备份 `sk5.json` 与 `sing-box.json`、退出时原样恢复，无须事后重填 SK5。失败路径例外：清理失败时文件故意不恢复（大声 FAIL，链路诚实保持禁用，备份留在工作目录供人工恢复）。verify.sh 退出时 EXIT trap 会吊销 `verify-*` 测试用户（尽力而为，仅切换测试跑过且已登录时；吊销失败则残留，面板行为本身正常）。
+- 自检：目标机上跑 `bash /opt/openvpn-sk5-panel/verify.sh`（24 项检查，逐项 PASS/FAIL/SKIP）。已在面板里填了真实 SK5 也不怕：SK5 已启用时切换测试（sk5-toggle / sk5-egress-ip / sk5-disable）自动 SKIP，什么都不改；只有显式设 `VERIFY_ALLOW_OVERWRITE_SK5=1` 才会强制跑切换测试，跑之前脚本先备份 `sk5.json` 与 `sing-box.json`、退出时原样恢复，无须事后重填 SK5。失败路径例外：清理失败时文件故意不恢复（大声 FAIL，链路诚实保持禁用，备份留在工作目录供人工恢复）。verify.sh 退出时 EXIT trap 会吊销 §7 建的 `verify-*` 测试用户（尽力而为：只要已登录且 §7 建用户成功，无论切换测试是否跑过、链路最终是否启用；吊销失败则残留，面板行为本身正常）。
 
 ## 2. Cloudflare 模式部署（面板放 Worker，中转机只装 agent）
 
@@ -205,7 +205,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 | verify-integration.sh | `2d110ff4ffec` |
 | verify.sh | `e36fc2003503` |
 
-核对方法（本机）：`sha256sum -c releases/ovpn-release-1.0.2.tar.gz.sha256`；解包后 `tar tzf releases/ovpn-release-1.0.2.tar.gz | wc -l` 应为 97 个文件 + 目录条目。门禁：`bash verify-integration.sh` 应为 `PASS=30 FAIL=0 SKIP=0`（30 格，含 §7 哈希钉死两层；脚本用固定 `/tmp/ovpn-int-test`＋8443 端口，须串行跑）。§9 的关键文件哈希表是 1.0.2 发布快照（与 live-21 的树一致），改动文件的哈希在打包时按 R34 §6 惯例刷新，不随每次修复提交改。
+核对方法（本机）：`sha256sum -c releases/ovpn-release-1.0.2.tar.gz.sha256`；解包后 `tar tzf releases/ovpn-release-1.0.2.tar.gz | wc -l` 应为 97 个文件 + 目录条目。伴生校验文件须从仓库根目录生成（`sha256sum releases/ovpn-release-<版本>.tar.gz > releases/ovpn-release-<版本>.tar.gz.sha256`，不得先 `cd releases` 再生成，否则文件里只有裸文件名、根目录下核对失败——1.0.2 发布时即因此错过前缀，R45-L4-1；树内文件已纠正，已发布的 1.0.2 tag 上的伴生文件仍为裸文件名，核对该 tag 的包时须进 `releases/` 再跑 `sha256sum -c`）。门禁：`bash verify-integration.sh` 应为 `PASS=30 FAIL=0 SKIP=0`（30 格，含 §7 哈希钉死两层；脚本用固定 `/tmp/ovpn-int-test`＋8443 端口，须串行跑）。§9 的关键文件哈希表是 1.0.2 发布快照（与 live-21 的树一致），改动文件的哈希在打包时按 R34 §6 惯例刷新，不随每次修复提交改。
 
 **凭据扫描（R41-L7-P2-3，强制门禁）**：`scripts/check-no-secrets.sh` 检查已追踪文件是否含凭据——敏感文件名（`secret.key` / `admin.pass` / `panel.db` / `sk5.json` / `agent_queue.json`）、`panel/data/` 内文件、已发货密钥的 SHA-256（`panel/app.py` 的 tripwire 值，定义处除外）、私钥 PEM 块（`tests/r17_core.py` 的 FAKE 夹具除外）、发布包内凭据条目；只报文件路径，不打印匹配内容。两个执行点：① `verify-integration.sh` 的 0 号格（计入 30 格，跑在 venv 之前）；② pre-push hook（每 clone 装一次：`cp scripts/git-hooks/pre-push .git/hooks/pre-push`，或 `git config core.hooksPath scripts/git-hooks`）。
 
