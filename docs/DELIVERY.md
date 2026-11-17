@@ -2,6 +2,7 @@
 
 > 发布包：`releases/ovpn-release-1.0.2.tar.gz`（包内清单与校验值见 §9；包自身的 sha256 全值见同目录伴生文件 `ovpn-release-1.0.2.tar.gz.sha256`）。
 > 交付日期：2026-11-13。AUDIT-R39 已判**可交付（差集 ∅）**，live-21 真机轮**全部通过、零新 bug**。历史台账 185 条：已修 174、部分 2（按设计）、未验 1（P0-1，Cloudflare 真实部署）、新 0、复发 0。
+> 以上是 1.0.2 发布时的快照（基线 tag 1.0.2）。1.0.2 之后又跑了 AUDIT-R41（30 条：P0 1/P1 9/P2 20，Fix-A～G 全修）、AUDIT-R42（24 条＋1 瞬态残留：P1 3/P2 21，Fix-H～M＋Fix-N 全修）、AUDIT-R43（7 条，Fix-O～R 全修），索引见 `docs/audit/AUDIT-R41.md`、`docs/audit/AUDIT-R42.md`、`docs/audit/AUDIT-R43.md`；历史台账现为 246 条（185＋61），三轮差集均已清空。
 > **未验清单（交付后仍未验，不冒充）**：Cloudflare Worker 真实部署（P0-1，见 §2）；arm64 安装校验（本机 x86_64，无 arm64 机）；SK5 端口 1001 vs 9000 仍待确认（面板默认 1001，见 §5）。
 
 ## 0. 这是什么
@@ -62,7 +63,7 @@ cd /root && curl -L -o ovpn-release-1.0.2.tar.gz https://raw.githubusercontent.c
 
 - 面板地址：`https://<服务器 IP>:8443`。初始管理员密码**仅在安装完成时打印一次**，也写在 `/etc/openvpn-sk5-panel/admin.pass`（0600，root 可读）。重装不会轮换密码、CA 与服务端证书。**首次打开浏览器会提示“不安全 / 证书不受信任”，属预期**（面板证书是自签的）：点「高级」→「继续前往」即可；安装时填域名（Caddy + Let's Encrypt）可彻底消除该提示。
 - **登录后立即改密**：面板右上角「修改密码」按钮（调 `POST /api/change-password`；成功后全部旧会话作废，须重新登录）。注意：首次登录**不强制**改密（P0-3，按设计未实现），改密全靠人工第一步，不要跳过。
-- 自检：目标机上跑 `bash /opt/openvpn-sk5-panel/verify.sh`（24 项检查，逐项 PASS/FAIL/SKIP）。已在面板里填了真实 SK5 也不怕：SK5 已启用时切换测试（sk5-toggle / sk5-egress-ip / sk5-disable）自动 SKIP，什么都不改；只有显式设 `VERIFY_ALLOW_OVERWRITE_SK5=1` 才会强制跑切换测试，跑之前脚本先备份 `sk5.json` 与 `sing-box.json`、退出时原样恢复，无须事后重填 SK5。失败路径例外：清理失败时文件故意不恢复（大声 FAIL，链路诚实保持禁用，备份留在工作目录供人工恢复）。verify.sh 还会留下 `verify-*` 测试用户（脚本只建不删），属测试残留，面板行为本身正常。
+- 自检：目标机上跑 `bash /opt/openvpn-sk5-panel/verify.sh`（24 项检查，逐项 PASS/FAIL/SKIP）。已在面板里填了真实 SK5 也不怕：SK5 已启用时切换测试（sk5-toggle / sk5-egress-ip / sk5-disable）自动 SKIP，什么都不改；只有显式设 `VERIFY_ALLOW_OVERWRITE_SK5=1` 才会强制跑切换测试，跑之前脚本先备份 `sk5.json` 与 `sing-box.json`、退出时原样恢复，无须事后重填 SK5。失败路径例外：清理失败时文件故意不恢复（大声 FAIL，链路诚实保持禁用，备份留在工作目录供人工恢复）。verify.sh 退出时 EXIT trap 会吊销 `verify-*` 测试用户（尽力而为，仅切换测试跑过且已登录时；吊销失败则残留，面板行为本身正常）。
 
 ## 2. Cloudflare 模式部署（面板放 Worker，中转机只装 agent）
 
@@ -147,7 +148,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 
 | # | 限制 | 说明 |
 |---|---|---|
-| 1 | ufw 机 NAT/FORWARD 规则 live-only | ufw 机器上安装器加的 NAT MASQUERADE 与 FORWARD 规则只在内存里，不 survive 重启；重启后重跑 `bash install.sh` 补回（install.log 有明文提示，README:71）。SK5 数据面不受影响（tun0↔tun1 规则由策略路由 enable 时加）。 |
+| 1 | ufw 机 NAT/FORWARD 规则 live-only | ufw 机器上安装器加的 NAT MASQUERADE 与 FORWARD 规则只在内存里，不 survive 重启；重启后重跑 `bash install.sh` 补回（install.log 有明文提示，README:90）。SK5 数据面不受影响（tun0↔tun1 规则由策略路由 enable 时加）。 |
 | 2 | DNS 默认走直连 | sing-box 模板规则 `protocol dns / port 53 → direct`：VPN 用户的 DNS 查询走中转机直连 IP，不经 SK5；只有 TCP/UDP 业务流量走 SK5。面板 SK5 卡片上已写明。 |
 | 3 | fail-open 单向 | SK5/sing-box 死后流量黑洞（不断网回落）；fail-open 须显式开启，且一旦 fail-over，enabled 保持 False，须手动重开。 |
 | 4 | 5 秒窗口（O-R25-2） | `enable()` 等 LIVE tun1，只等 5 秒：sing-box 启动慢于 5 秒时 enable 大声失败（`sing-box did not create a live tun1 within 5 s`），不建占位符、不改策略状态、enabled 保持 False，重试即可。本机（512MB）暖启动 0.84 秒，充足；若某机 sing-box 恒慢于 5 秒（持续过载或极慢磁盘），每次 enable 均会失败、永不收敛——这是 5 秒硬截止的设计取舍。 |
@@ -210,6 +211,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 
 ## 10. 审计与真机证据索引
 
-- 审计：`docs/audit/AUDIT-R39.md`（114 行，可交付，差集 ∅）为终审；此前 R26–R38 各轮差集 0–3 条（R27 一 P1 其余全 P2；R36 与 R39 差集 ∅）均已修复闭合，历史 185 条全在 R39 §6 复扫（174 已修、2 部分按设计、1 未验 P0-1、0 复发）。
-- 真机：`docs/live-verify-R21.md`（207 行，全部通过、零新 bug）为终轮；R35–R39 修复格与域名反代成功路径全过（交互真装真实 LE 证书、换域＋安装器重启＋NRestarts=0、空重跑 Caddy 存活、TCP-443 守卫、R37-P2-1 守卫恢复、R38-P2-1 目录 0755 自愈），headline-9 毒树重跑硬门通过；S0–S4 与 headline 六项全过。
+- 审计（1.0.2 发布时）：`docs/audit/AUDIT-R39.md`（114 行，可交付，差集 ∅）为该版本的终审；此前 R26–R38 各轮差集 0–3 条（R27 一 P1 其余全 P2；R36 与 R39 差集 ∅）均已修复闭合，历史 185 条全在 R39 §6 复扫（174 已修、2 部分按设计、1 未验 P0-1、0 复发）。
+- 审计（1.0.2 之后）：`docs/audit/AUDIT-R41.md`（30 条，P0 1/P1 9/P2 20，Fix-A～G 全修，差集 ∅）、`docs/audit/AUDIT-R42.md`（24 条＋1 瞬态，P1 3/P2 21，Fix-H～M＋Fix-N 全修，差集 ∅）、`docs/audit/AUDIT-R43.md`（7 条，Fix-O～R 全修，差集 ∅）。
+- 真机（1.0.2 发布时）：`docs/live-verify-R21.md`（207 行，全部通过、零新 bug）为该版本的终轮；R35–R39 修复格与域名反代成功路径全过（交互真装真实 LE 证书、换域＋安装器重启＋NRestarts=0、空重跑 Caddy 存活、TCP-443 守卫、R37-P2-1 守卫恢复、R38-P2-1 目录 0755 自愈），headline-9 毒树重跑硬门通过；S0–S4 与 headline 六项全过。1.0.2 之后又跑了 R41 真机轮（候选 c5bbd61，升级＋UDP 数据面通过；LIVE-R41-1 域名 502 已由 Fix-G 修）与 R42 真机轮（候选 9331daf，门禁 29/30、升级/新装/TCP 443/状态交叉全过；LIVE-R42-1 瞬态 502 已由 Fix-N 修，Fix-N 真机复验待补轮）。
 - 探针资产在包外：`tests/` 未进发布包（开发验证用，见树内 `tests/README.md`）。
