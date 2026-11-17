@@ -7,8 +7,13 @@ rotation keeps verifying against the pin agents already hold. Migration
 adopts an existing self-signed panel cert as the CA verbatim (openssl
 req -x509 emits CA:TRUE), so the upgrade itself bricks nobody. Only a
 fresh CA breaks old pins; that event is recorded in
-panel-ca-rotations.log and the panel flags nodes whose last_seen
-predates it (cert_pin_stale) in /api/nodes and /api/status.
+panel-ca-rotations.log by the panel itself at the first start that
+serves the new CA (panel/app.py _record_panel_ca_rotation_if_changed,
+called from __main__ only), and the panel flags nodes whose last_seen
+predates it (cert_pin_stale) in /api/nodes and /api/status. The record
+timestamp is the go-live instant, not the installer's generation
+time: a heartbeat recorded between generation and the restart that
+served the new leaf must still read stale.
 
 Sections A/B run anywhere (openssl + python ssl only). Sections C/D
 need the Flask harness; run the whole file as nobody with:
@@ -19,12 +24,13 @@ need the Flask harness; run the whole file as nobody with:
     OVPN_SK5_CONFIG_DIR=<sk5cfg> \\
     python3 <tree>/tests/r46_fix_ah.py
 
-On baseline e7f18ff the product cells fail: B2/B3 have no CA files at
-all (the block never creates them), C1/C3 have no /api/agent/panel-ca
-endpoint and no cert_pin_stale field, D1 pins the leaf. The A cells pin
-the crypto mechanism itself (they pass on both trees by design: A3
-reproduces the original defect with pure openssl, proving why the old
-leaf pin broke).
+On baseline e7f18ff the product cells fail: B1/B2/B3/B4/B6/B7 have no
+CA files at all (the block never creates them), C1/C3/C4 have no
+/api/agent/panel-ca endpoint and no cert_pin_stale field, C5a-e have
+no startup hook, D1 pins the leaf. The A cells pin the crypto
+mechanism itself (they pass on both trees by design: A3 reproduces
+the original defect with pure openssl, proving why the old leaf pin
+broke).
 """
 import hashlib
 import json
@@ -37,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
 
 FAILURES = []
 CHECKS = [0]
@@ -311,16 +318,9 @@ check("B7 unparseable leaf: fresh CA + new leaf verifies against it",
       r.returncode == 0 and os.path.exists(ca_crt)
       and run(["openssl", "verify", "-CAfile", ca_crt, crt]).returncode == 0,
       r.stdout + r.stderr)
-rec_ok = False
-if os.path.exists(rot):
-    line = open(rot).read().strip().splitlines()[-1]
-    parts = line.split()
-    fp = run(["openssl", "x509", "-in", ca_crt, "-noout",
-              "-fingerprint", "-sha256"]).stdout
-    fp = fp.split("=", 1)[1].replace(":", "").strip().lower()
-    rec_ok = len(parts) == 2 and parts[1] == fp and "T" in parts[0]
-check("B7 CA rotation recorded (ISO time + new CA fingerprint)",
-      rec_ok, open(rot).read() if os.path.exists(rot) else "no record")
+check("B7 CA rotation is NOT recorded by the installer (panel logs it at first start serving the new CA)",
+      not os.path.exists(rot) and "panel CA rotated" in (r.stdout + r.stderr),
+      r.stdout + r.stderr)
 
 # ------------------------------------------------- C: panel endpoint + signal
 sys.path.insert(0, os.path.join(TREE, "panel"))
@@ -423,6 +423,84 @@ r = client.get("/api/status",
 check("C4 /api/status (remote) carries cert_pin_stale true",
       r.status_code == 200
       and r.get_json().get("cert_pin_stale") is True, r.status_code)
+
+# C5: the startup hook owns the rotations log (panel/app.py
+# _record_panel_ca_rotation_if_changed). It runs only from __main__,
+# so the probe calls it directly with the same env the C section
+# already sets (OVPN_PANEL_CA_CERT_PATH -> CA_DIR, rotations log ->
+# rot_path). The state file lands next to the CA cert. On a tree
+# without the hook (baseline) every C5 cell fails instead of crashing.
+hook = getattr(panel, "_record_panel_ca_rotation_if_changed", None)
+state_path = os.path.join(CA_DIR, "panel-ca-last-served")
+if hook is None:
+    for name in ("C5a first boot: state seeded, no rotation record "
+                 "(fresh CA is not a rotation)",
+                 "C5b CA changed: one record line (ISO time + new CA fingerprint)",
+                 "C5b state file updated to the new CA fingerprint",
+                 "C5c unchanged second start: no duplicate record line",
+                 "C5d legacy record re-stamped to the go-live instant (old timestamp gone)",
+                 "C5e heartbeat before the hook record -> cert_pin_stale true",
+                 "C5e heartbeat after the hook record -> cert_pin_stale false"):
+        check(name, False, "no _record_panel_ca_rotation_if_changed on this tree")
+    _C5_SKIP = True
+else:
+    _C5_SKIP = False
+if not _C5_SKIP:
+    if os.path.exists(state_path):
+        os.unlink(state_path)
+    if os.path.exists(rot_path):
+        os.unlink(rot_path)
+    # C5a: first boot ever (no state, no log) -> state seeded, no record.
+    hook()
+    check("C5a first boot: state seeded, no rotation record (fresh CA is not a rotation)",
+          os.path.exists(state_path) and not os.path.exists(rot_path),
+          open(state_path).read() if os.path.exists(state_path) else "no state")
+    # C5b: CA file swapped for a new CA -> hook appends one record line.
+    new_ca_crt = os.path.join(CA_DIR, "panel-ca-new.crt")
+    new_ca_key = os.path.join(CA_DIR, "panel-ca-new.key")
+    openssl_self_signed(new_ca_crt, new_ca_key)
+    open(ca_cert_path, "wb").write(open(new_ca_crt, "rb").read())
+    before = datetime.now(timezone.utc)
+    hook()
+    new_fp = panel._panel_ca_fingerprint()
+    rec_lines = open(rot_path).read().strip().splitlines() if os.path.exists(rot_path) else []
+    rec_ok = (len(rec_lines) == 1 and len(rec_lines[0].split()) == 2
+              and rec_lines[0].split()[1] == new_fp
+              and datetime.fromisoformat(rec_lines[0].split()[0]) >= before)
+    check("C5b CA changed: one record line (ISO time + new CA fingerprint)",
+          rec_ok, rec_lines)
+    check("C5b state file updated to the new CA fingerprint",
+          os.path.exists(state_path) and open(state_path).read().strip() == new_fp,
+          open(state_path).read() if os.path.exists(state_path) else "no state")
+    # C5c: unchanged second call -> no duplicate line.
+    hook()
+    check("C5c unchanged second start: no duplicate record line",
+          len(open(rot_path).read().strip().splitlines()) == 1,
+          open(rot_path).read())
+    # C5d: legacy installer-written record (old timestamp, current CA) +
+    # no state file -> hook re-stamps it to the go-live instant.
+    os.unlink(state_path)
+    old_ts = "2026-11-17T17:50:49+00:00"
+    open(rot_path, "w").write("%s %s\n" % (old_ts, new_fp))
+    hook()
+    re_lines = open(rot_path).read().strip().splitlines()
+    re_ok = (len(re_lines) == 1 and re_lines[0].split()[1] == new_fp
+             and datetime.fromisoformat(re_lines[0].split()[0])
+             >= datetime.now(timezone.utc) - timedelta(seconds=120))
+    check("C5d legacy record re-stamped to the go-live instant (old timestamp gone)",
+          re_ok, re_lines)
+    # C5e: the verdict with a hook-written record -- the live bug's exact
+    # shape: a heartbeat recorded between CA generation and the restart
+    # that served it must still read stale.
+    rot_ts = datetime.fromisoformat(re_lines[0].split()[0])
+    check("C5e heartbeat before the hook record -> cert_pin_stale true",
+          panel._cert_pin_stale(
+              (rot_ts - timedelta(seconds=60)).isoformat(),
+              panel._panel_ca_rotated_at()) is True)
+    check("C5e heartbeat after the hook record -> cert_pin_stale false",
+          panel._cert_pin_stale(
+              (rot_ts + timedelta(seconds=60)).isoformat(),
+              panel._panel_ca_rotated_at()) is False)
 
 # ------------------------------------------------- D: install-agent trust fetch
 AGENT_SRC = open(INSTALL_AGENT_SH).read()

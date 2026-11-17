@@ -665,10 +665,13 @@ PANEL_KEY="$CONFIG_DIR/panel-key.pem"
 # (openssl req -x509 emits CA:TRUE), so it is adopted as the panel CA
 # verbatim -- the old pin stays valid, no agent is bricked by the
 # upgrade itself. Only a fresh CA (fresh install, or the CA key lost)
-# breaks old pins; that event is recorded in panel-ca-rotations.log so
-# the panel can flag nodes whose last poll predates it. The Caddy copy
-# still carries the leaf (unchanged) and the dual-trust bundle still
-# applies to leaf rotations.
+# breaks old pins; that event is recorded in panel-ca-rotations.log by
+# the panel itself at the first start that serves the new CA (see
+# _record_panel_ca_rotation_if_changed in panel/app.py) -- the
+# timestamp must be the go-live instant, not the generation time, or
+# heartbeats recorded between generation and restart would clear the
+# stale verdict. The Caddy copy still carries the leaf (unchanged)
+# and the dual-trust bundle still applies to leaf rotations.
 _PANEL_CERT_STALE=0
 # R42-F2-1: whether this run actually ISSUED a new panel cert. The
 # generation block below fires for a stale cert AND for missing
@@ -682,7 +685,6 @@ _PANEL_CERT_KEEP_NOTE=""
 # harnesses, which define only PANEL_CERT/PANEL_KEY/SERVER_IP.
 PANEL_CA_CERT="${PANEL_CERT%/*}/panel-ca.crt"
 PANEL_CA_KEY="${PANEL_CERT%/*}/panel-ca.key"
-PANEL_CA_ROTATIONS="${PANEL_CERT%/*}/panel-ca-rotations.log"
 _issue_panel_leaf() { # _issue_panel_leaf <ca-cert> <ca-key> <leaf-cert> <leaf-key> <server-ip>
     local _ca_crt="$1" _ca_key="$2" _crt="$3" _key="$4" _ip="$5"
     local _csr _ext
@@ -740,10 +742,11 @@ _ensure_panel_ca() {
     fi
     chmod 600 "$PANEL_CA_KEY"; chmod 644 "$PANEL_CA_CERT"
     if [ -f "$PANEL_CERT" ]; then
-        _ca_fp="$(openssl x509 -in "$PANEL_CA_CERT" -noout -fingerprint -sha256 2>/dev/null \
-            | sed 's/.*=//;s/://g' | tr 'A-Z' 'a-z')"
-        printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" "$_ca_fp" \
-            >> "$PANEL_CA_ROTATIONS" 2>/dev/null || true
+        # The rotation is recorded by the panel itself at the first
+        # start serving this CA (panel/app.py
+        # _record_panel_ca_rotation_if_changed), not here: the record
+        # timestamp must be the go-live instant, and the panel may
+        # still serve the old leaf until it restarts.
         log "panel CA rotated -- agents pinned to the previous CA must re-run install-agent.sh --force to re-pin"
     fi
     return 0

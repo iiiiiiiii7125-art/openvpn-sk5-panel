@@ -3235,11 +3235,13 @@ def agent_bundle_sha256():
 
 def _panel_ca_rotated_at():
     """最近一次面板 CA 轮换时间（ISO 字符串），无轮换记录时回 None。
-    R46 Fix-AH：install.sh 在生成全新 CA 且此前已有叶证书时，把轮换
-    事件追加到 panel-ca-rotations.log（一行一条：<ISO 时间> <CA 指纹>）；
-    叶证书轮换不记——agent 钉的是 CA，叶轮换不断连。路径可用
-    OVPN_PANEL_CA_ROTATIONS_PATH 覆盖（测试用），默认
-    /etc/openvpn-sk5-panel/panel-ca-rotations.log。"""
+    R46 Fix-AH：面板每次启动时由 _record_panel_ca_rotation_if_changed
+    在 panel-ca-rotations.log 里记轮换事件（一行一条：<ISO 时间> <CA
+    指纹>）；时间戳是新 CA 首次被真正提供服务的时刻（面板启动时），
+    不是安装器生成 CA 的时刻——安装器生成与面板重启之间仍有 agent
+    心跳成功，那些心跳不得清除 stale 判定。叶证书轮换不记——agent
+    钉的是 CA，叶轮换不断连。路径可用 OVPN_PANEL_CA_ROTATIONS_PATH
+    覆盖（测试用），默认 /etc/openvpn-sk5-panel/panel-ca-rotations.log。"""
     path = os.environ.get("OVPN_PANEL_CA_ROTATIONS_PATH",
                           "/etc/openvpn-sk5-panel/panel-ca-rotations.log")
     try:
@@ -3250,6 +3252,82 @@ def _panel_ca_rotated_at():
     if not lines:
         return None
     return lines[-1].split()[0]
+
+
+def _panel_ca_fingerprint():
+    """面板 CA 证书的 SHA-256 指纹（小写 hex），无 CA 文件或不可解析时回 None。"""
+    ca_path = os.environ.get("OVPN_PANEL_CA_CERT_PATH",
+                             "/etc/openvpn-sk5-panel/panel-ca.crt")
+    try:
+        out = subprocess.run(
+            ["openssl", "x509", "-in", ca_path, "-noout",
+             "-fingerprint", "-sha256"],
+            capture_output=True, text=True, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"Fingerprint=([0-9A-Fa-f:]+)", out.stdout)
+    if not m:
+        return None
+    return m.group(1).replace(":", "").lower()
+
+
+def _record_panel_ca_rotation_if_changed():
+    """面板启动时记录 CA 轮换（若本次启动首次提供新 CA）。
+
+    只在 __main__ 里调一次，import 时不跑，Flask 测试客户端与探针
+    不受影响。面板把上次提供过的 CA 指纹记在 CA 证书旁的
+    panel-ca-last-served 文件里：
+
+    - 首次启动（无 state、无日志）：只写 state，不记——全新 CA 不是轮换。
+    - 指纹变了：本次启动即轮换生效时刻，追加 <now> <新指纹>。
+    - 无 state 但日志末行已是当前 CA（旧版安装器在生成时写的时间戳，
+      早于真正提供服务的重启）：把该行时间戳改写为 now——生成与重启
+      之间成功的心跳不得清除 stale 判定。
+    - 指纹不变：什么都不做。
+
+    只做记账：任何异常只打 stderr，绝不阻塞面板启动。
+    """
+    try:
+        current_fp = _panel_ca_fingerprint()
+        if not current_fp:
+            return
+        ca_path = os.environ.get("OVPN_PANEL_CA_CERT_PATH",
+                                 "/etc/openvpn-sk5-panel/panel-ca.crt")
+        ca_dir = os.path.dirname(ca_path)
+        state_path = os.path.join(ca_dir, "panel-ca-last-served")
+        log_path = os.environ.get(
+            "OVPN_PANEL_CA_ROTATIONS_PATH",
+            "/etc/openvpn-sk5-panel/panel-ca-rotations.log")
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                last_served = f.read().strip()
+        except OSError:
+            last_served = None
+        if last_served == current_fp:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        lines = []
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+        except OSError:
+            lines = []
+        if lines and lines[-1].split()[-1] == current_fp:
+            # 旧版安装器写下的本 CA 记录：把生成时刻改写为生效时刻。
+            lines[-1] = "%s %s" % (now, current_fp)
+        elif not lines and last_served is None:
+            # 首次启动：全新 CA，不是轮换。
+            pass
+        else:
+            lines.append("%s %s" % (now, current_fp))
+        if lines:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        with open(state_path, "w", encoding="utf-8") as f:
+            f.write(current_fp + "\n")
+    except Exception as exc:  # noqa: BLE001 - 记账失败绝不阻塞启动
+        print("panel CA rotation bookkeeping failed: %s" % exc,
+              file=sys.stderr)
 
 
 def _cert_pin_stale(last_seen, rotated_at):
@@ -3350,4 +3428,5 @@ def install_agent_script_sha256():
 
 if __name__ == "__main__":
     _ensure_admin_password()
+    _record_panel_ca_rotation_if_changed()
     app.run(host="0.0.0.0", port=8443)
