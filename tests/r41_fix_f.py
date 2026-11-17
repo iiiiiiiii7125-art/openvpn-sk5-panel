@@ -226,7 +226,17 @@ def plant_and_scan(relpath, content_bytes, force_add=False):
     return run(["bash", SCAN, d]).returncode
 
 
-SHIPPED_HASH = ("484fec07e813e9b9e57548d1992ce6767326fd8a82cfddd6fe0c595f93d7d5a5")
+# The shipped secret's SHA-256, derived from the panel tripwire at runtime.
+# It MUST NOT be a literal here: this probe verifies check-no-secrets.sh,
+# and a literal would make the scan flag the probe itself (R41 Fix-F2).
+def _shipped_hash():
+    text = read(os.path.join(ROOT, "panel", "app.py"))
+    m = re.search(r"_SHIPPED_SECRET_SHA256\s*=\s*\(\s*\"([0-9a-f]{64})\"", text)
+    assert m, "tripwire value not found in panel/app.py"
+    return m.group(1)
+
+
+SHIPPED_HASH = _shipped_hash()
 check("F6b staged fake secret.key blocked",
       plant_and_scan("secret.key", os.urandom(32)) == 1)
 check("F6c staged file with shipped hash blocked",

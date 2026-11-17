@@ -11,9 +11,11 @@
 #   1. sensitive filenames: secret.key, admin.pass, panel.db, sk5.json,
 #      agent_queue.json (in any directory), or anything under panel/data/;
 #   2. the shipped secret's SHA-256 (the panel/app.py tripwire value)
-#      appearing anywhere except the tripwire definition itself;
+#      appearing anywhere except the tripwire definition itself and this
+#      script's own detector value below (both are detectors, not secrets);
 #   3. PEM private-key blocks, except the documented fake fixture in
-#      tests/r17_core.py (single-line "FAKE" body, not a real key);
+#      tests/r17_core.py (a PEM header line plus a single "FAKE" body
+#      line, not a real key);
 #   4. release tarballs listing a sensitive entry (a shipped package must
 #      never contain panel/data/ or a credential file).
 #
@@ -59,10 +61,12 @@ $_FILES
 EOF
 
 # --- 2. shipped secret hash (except the tripwire definition itself) ----
+# Exempted: panel/app.py (the tripwire definition) and this script (its
+# SHIPPED_HASH literal below IS the detector value, not a shipped secret).
 while IFS= read -r _f; do
     [ -n "$_f" ] || continue
     case "$_f" in
-        panel/app.py) continue ;;  # the tripwire definition lives here
+        panel/app.py|scripts/check-no-secrets.sh) continue ;;
     esac
     fail "shipped secret hash present: $_f"
 done <<EOF
@@ -70,10 +74,13 @@ $(_grep "$SHIPPED_HASH")
 EOF
 
 # --- 3. PEM private-key blocks (except the fake fixture) --------------
+# Exempted: tests/r17_core.py (a PEM header line plus a single "FAKE"
+# body line, not a real key). NOTE: do not quote a PEM header literally
+# in a comment in this script -- check 3 would match this file itself.
 while IFS= read -r _f; do
     [ -n "$_f" ] || continue
     case "$_f" in
-        tests/r17_core.py) continue ;;  # fake key: PEM_KEY = "-----BEGIN PRIVATE KEY-----\nFAKE\n..."
+        tests/r17_core.py) continue ;;  # fake key, not a real one
     esac
     fail "private-key PEM block: $_f"
 done <<EOF
