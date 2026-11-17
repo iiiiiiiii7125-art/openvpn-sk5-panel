@@ -19,6 +19,11 @@ Run as ROOT from the repo root:
     R45AC_TREE=/path/to/tree python3 tests/r45_fix_ac_pidparent.py
 R45AC_TREE defaults to the repo this probe lives in. The probe asserts
 FIXED behaviour, so on the baseline tree (6eac5af) the defect cells FAIL.
+
+R46-L6-1: the A2b cell used to check the bare substring "writepid" in the
+failure message, but _run echoes the full command line (which itself
+contains --writepid) into every failure message, so that check could
+never fail. A2b now asserts on the stderr text "--writepid fails".
 """
 
 import os
@@ -30,6 +35,20 @@ import time
 from pathlib import Path
 
 RESULTS = []
+
+
+def _failure_names_writepid(err):
+    """True iff the failure text names a --writepid failure.
+
+    R46-L6-1: _run echoes the full command line (which itself contains
+    "--writepid <pidfile>") into every failure message, so a bare
+    "writepid" substring check can never fail -- any failure of the
+    start_server command passes it, including a --config error. The real
+    --writepid error text is "Options error: --writepid fails with ...",
+    and the phrase "--writepid fails" never appears in the command line,
+    so it isolates the stderr text.
+    """
+    return "--writepid fails" in err
 
 
 def cell(name, ok, detail=""):
@@ -135,7 +154,7 @@ def main():
         cell("A2 start_server succeeds with missing pid parent",
              started, "running=%s err=%s" % (started, err[:120]))
         cell("A2b failure names --writepid when it fails",
-             started or "writepid" in err, err[:120])
+             started or _failure_names_writepid(err), err[:120])
 
         # A3: the pid parent now exists and the daemon is alive + identified.
         pid_ok = pidfile.exists()
