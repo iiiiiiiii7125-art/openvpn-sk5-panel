@@ -204,7 +204,7 @@ AGENT_ACTIONS = frozenset({
     "create_user", "revoke_user", "set_sk5", "test_sk5",
     "enable_sk5", "disable_sk5", "get_status",
 })
-_NODE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+_NODE_NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,32}\Z")
 _SECRET_KEYS = {"password", "node_token", "token"}
 _SECRET_KV_RE = re.compile(
     r'("(?:password|node_token|token)"\s*:\s*")[^"]*', re.IGNORECASE)
@@ -1203,7 +1203,10 @@ def _parse_server_conf():
 # 显式地址在该模式下暂不起作用，agent 侧靠 core 的公网探测决定
 # remote——该限制写在面板 README 里，不静默假装生效。
 SERVER_SETTINGS_FILE = os.path.join(DATA_DIR, "server.json")
-_HOST_RE = re.compile(r"^[A-Za-z0-9._:-]{1,253}$")
+# R45-L5-1 同族：$ 在 Python 里会匹配末尾 \n 之前，须用 \A…\Z
+# 才算整串锚定（_valid_server_ip 先 strip，当前不可达；但校验
+# 本身必须是对的，不能靠调用方偶然的 strip 兜底）。
+_HOST_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,253}\Z")
 
 
 def _valid_server_ip(value):
