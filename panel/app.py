@@ -1758,10 +1758,16 @@ def ovpn_server():
         return missing
     # 观察-1：对外地址（.ovpn 的 remote）。显式传来即保存；传空串
     # 即清除保存值、恢复自动探测；不传则保持现有值。
-    server_ip = data.get("server_ip", None)
+    # R44-L7-1：server_ip 须为真字符串——str(123) 是 "123"，会骗过
+    # _valid_server_ip 的形状检查而被静默存下，之后下载的每个
+    # .ovpn remote 都是垃圾（与 R43-J7-1 的名字同族）。
+    server_ip, err = _strict_str(data, "server_ip", "server_ip",
+                                 default=None)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
     settings = _load_server_settings()
     if server_ip is not None:
-        server_ip = str(server_ip).strip()
+        server_ip = server_ip.strip()
         if server_ip and not _valid_server_ip(server_ip):
             return jsonify({"ok": False,
                             "error": "server_ip 不合法：须为 IP 或主机名"}), 400
@@ -2520,6 +2526,17 @@ def sk5_fail_open():
         # read-check-apply，须与 enable/disable/save 用同一把锁串行化，
         # 否则并发翻转会双双重起 daemon。
         with _SK5_MUTATE_LOCK:
+            # R44-L4-F3: 无存量配置时翻转开关是无意义的写（Worker 面
+            # 与本机 /api/sk5 开关分支同款 400）；set_fail_open 本身
+            # 不查 host，会静默存下一个无 host 的残配置并回 200。
+            try:
+                stored = sk5_get_status(probe_egress=False)
+            except Exception as exc:  # noqa: BLE001
+                return jsonify({"ok": False, "error": str(exc)}), 500
+            if not stored.get("host"):
+                return jsonify({"ok": False,
+                                "error": "先在 SK5 配置页保存完整 SK5 配置"
+                                         "（host/port），再改这个开关"}), 400
             result = sk5_set_fail_open(fail_open)
         _audit("sk5_fail_open", result="ok",
                detail="fail_open=%s" % fail_open)
@@ -2559,6 +2576,16 @@ def sk5_udp_over_tcp():
     try:
         # R7-BUG-3 同族：见 sk5_fail_open。
         with _SK5_MUTATE_LOCK:
+            # R44-L4-F3: 同 sk5_fail_open——无存量配置时翻转开关
+            # 是无意义的写，Worker 面与本机 /api/sk5 开关分支同款 400。
+            try:
+                stored = sk5_get_status(probe_egress=False)
+            except Exception as exc:  # noqa: BLE001
+                return jsonify({"ok": False, "error": str(exc)}), 500
+            if not stored.get("host"):
+                return jsonify({"ok": False,
+                                "error": "先在 SK5 配置页保存完整 SK5 配置"
+                                         "（host/port），再改这个开关"}), 400
             result = sk5_set_udp_over_tcp(uot)
         _audit("sk5_udp_over_tcp", result="ok",
                detail="udp_over_tcp=%s" % uot)
