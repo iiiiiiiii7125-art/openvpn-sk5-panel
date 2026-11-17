@@ -518,7 +518,8 @@
 
 <script>
 /* 接口与 panel/app.py 实物一一对应（不自造接口）：
-   GET /api/me, POST /api/login, POST /api/logout, GET /api/status,
+   GET /api/me, POST /api/login, POST /api/logout,
+   POST /api/change-password, GET /api/status,
    POST /api/openvpn/server, GET /api/openvpn/public-ip,
    POST /api/openvpn/start|stop|restart, POST /api/openvpn/init-pki,
    GET/POST /api/openvpn/users, DELETE /api/openvpn/users/<name>,
@@ -526,8 +527,12 @@
    GET/POST /api/sk5, POST /api/sk5/test|enable|disable,
    POST /api/sk5/fail-open, POST /api/sk5/udp-over-tcp,
    GET/POST /api/nodes, DELETE /api/nodes/<name>,
-   POST /api/nodes/<name>/rotate, POST /api/nodes/<name>/install,
+   POST /api/nodes/<name>/rotate,
    POST /api/cmd, GET /api/cmd/<id>
+   注意：POST /api/nodes/<name>/install 仅 Cloudflare Worker 实现，
+   Flask 不提供该接口；本前端不再调用它，安装命令由
+   buildInstallCommand() 就地拼装（与 Worker 模板逐字节一致，
+   探针 L6-08），故不在上面 Flask 接口清单里。
    写操作语义（P0-1）：Cloudflare 模式返回 202 + cmd_id 只表示“已排队”，
    必须用 apiWait() 按 cmd_id 轮询 /api/cmd/:id 等到 done/failed 才报
    成功/失败，绝不凭 202 报成功；Flask 直连模式直接返回结果，同样走 apiWait。
@@ -686,8 +691,10 @@ async function loadStatus() {
     sk5.singbox_running === true ? "运行中" : sk5.singbox_running === false ? "未运行" : "—";
   document.getElementById("sk5Policy").textContent =
     sk5.policy_routing_active === true ? "已生效" : sk5.policy_routing_active === false ? "未生效" : "—";
-  if (ovpn.port) { document.getElementById("port").value = ovpn.port; }
-  if (ovpn.proto) { document.getElementById("proto").value = ovpn.proto; }
+  /* R41-L2-P2-2：port/proto 只在用户没改过时回填；用户改过未保存时
+     跳过，绝不在 15 秒轮询里悄悄改回旧值（serverIp 同款 dirty 守卫）。 */
+  if (ovpn.port && !portDirty) { document.getElementById("port").value = ovpn.port; }
+  if (ovpn.proto && !protoDirty) { document.getElementById("proto").value = ovpn.proto; }
   if (ovpn.subnet) { document.getElementById("subnet").value = ovpn.subnet; }
   if (ovpn.dns) { document.getElementById("dns").value = ovpn.dns; }
   /* 对外地址：只在用户没在编辑时回填，不抢正在输入的内容 */
@@ -900,13 +907,11 @@ async function loadNodes() {
       useBtn.onclick = function () { setCurrentNode(n.name); showMsg("nodeMsg", "当前节点已切到 " + n.name, true); addLog("当前节点切到 " + n.name, true); refreshAll(); };
       var cmdBtn = document.createElement("button");
       cmdBtn.type = "button"; cmdBtn.className = "btn secondary small"; cmdBtn.textContent = "复制安装命令";
-      cmdBtn.onclick = async function () {
-        try {
-          var r = await api("/api/nodes/" + encodeURIComponent(n.name) + "/install", "POST", {});
-          copyText(r.command_template || "", "安装命令模板已复制（把 <NODE_TOKEN> 换成注册时记下的 token）");
-        } catch (e) {
-          copyText(buildInstallCommand(n.panel_url || location.origin, "<NODE_TOKEN>", n.name), "安装命令模板已复制（把 <NODE_TOKEN> 换成注册时记下的 token）");
-        }
+      cmdBtn.onclick = function () {
+        /* R41-L2-P2-1：不再调 POST /api/nodes/<name>/install——Flask
+           没有该接口（每次点击都 404），Worker 的同款模板与这里的
+           buildInstallCommand() 逐字节一致（探针 L6-08），就地拼装即可。 */
+        copyText(buildInstallCommand(n.panel_url || location.origin, "<NODE_TOKEN>", n.name), "安装命令模板已复制（把 <NODE_TOKEN> 换成注册时记下的 token）");
       };
       var rotBtn = document.createElement("button");
       rotBtn.type = "button"; rotBtn.className = "btn secondary small"; rotBtn.textContent = "轮换 token";
@@ -1085,6 +1090,13 @@ document.getElementById("serverIp").addEventListener("input", function () {
   serverIpDirty = true;
   this.dataset.auto = "";
 });
+/* R41-L2-P2-2：端口/协议一旦改过即记 dirty，loadStatus 的 15 秒轮询
+   不再回填覆盖；保存成功后清掉（见 saveServerBtn 成功分支）。 */
+var portDirty = false;
+var protoDirty = false;
+document.getElementById("port").addEventListener("input", function () { portDirty = true; });
+document.getElementById("proto").addEventListener("input", function () { protoDirty = true; });
+document.getElementById("proto").addEventListener("change", function () { protoDirty = true; });
 document.getElementById("detectIpBtn").onclick = async function () {
   try {
     var d = await api("/api/openvpn/public-ip");
@@ -1122,6 +1134,9 @@ document.getElementById("saveServerBtn").onclick = async function () {
     }
     var d = await apiWait("/api/openvpn/server", "POST", body,
       "serverMsg", "已下发保存服务配置，等待 agent 执行…");
+    /* R41-L2-P2-2：保存成功后脏标记清掉，下一次轮询恢复正常回填。 */
+    portDirty = false;
+    protoDirty = false;
     showMsg("serverMsg", "服务配置已保存" + (d.server && d.server.note ? "（" + d.server.note + "）" : ""), true);
     addLog("保存 OpenVPN 服务配置", true); loadStatus();
   } catch (e) { showMsg("serverMsg", e.message, false); addLog("保存服务配置失败：" + e.message, false); }
