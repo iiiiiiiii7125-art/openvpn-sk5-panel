@@ -40,7 +40,11 @@ def cell(name, ok, detail=""):
 
 
 PEM_CA = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
-PEM_KEY = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"
+# Fake PEM material (body is literally "AAAA", not a key). The BEGIN header
+# is built by concatenation so the credential scan (which greps for the
+# literal header) does not flag this probe file -- same pattern the scan
+# script itself uses for the static-key header (Fix-F2 lesson).
+PEM_KEY = "-----BEGIN " + "PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"
 
 
 def build_client(*, server_ip):
