@@ -148,10 +148,10 @@ UI 与 agent 日志都会告警）。重装换 panel-url/token 后安装器会�
 同一 agent、同一 13 个动作，只是指向的面板地址不同（见
 `cloudflare/server-mode.md` 对照表）。
 
-> 限制（观察-1）：Cloudflare 模式的 Worker 兼容层目前只转发
-> `port`/`proto`/`name`，面板上显式填的“对外地址”在该模式下暂不
-> 起作用；agent 侧靠 core 的公网 IP 自动探测决定 `.ovpn` 的 remote。
-> 如需显式指定，须在 Worker 兼容层补发 `server_ip`（不在本次修复范围）。
+> 对外地址（已修复，R45-L7-2）：Cloudflare 模式的 Worker 兼容层随建服务命令转发
+> `server_ip`，建服务成功后记入 `servercfg`，建用户时再随命令补发给 agent，
+> `.ovpn` 的 remote 即取该值；留空（或清除）则 agent 靠 core 的公网 IP 自动探测。
+> 状态页的 `remote_ip` / `remote_warning` 在 Worker 模式下与 Flask 同款（R45-L7-1）。
 
 ## 面板使用步骤
 
