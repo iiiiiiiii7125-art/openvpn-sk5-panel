@@ -66,6 +66,19 @@ TUN2SOCKS_SHA256_AMD64="a612baa287a3b6de6221f74fd02b442a50888508227ecf51e1288a5c
 TUN2SOCKS_SHA256_ARM64="3931476c9cfa8fa236d23aeaf36767df0eb27cc11ecaab699faba57744450f49"
 SINGBOX_BASE="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}"
 TUN2SOCKS_BASE="https://github.com/xjasonlyu/tun2socks/releases/download/v${TUN2SOCKS_VERSION}"
+# EasyRSA >= 3.1.0 (R41-L3-F1): distro easy-rsa on Ubuntu 20.04/22.04 is
+# 3.0.6, whose build-ca prompts for a PEM pass phrase because build_ca()
+# never passes -nodes to openssl req. install.sh installs EasyRSA 3.1.7
+# from GitHub into EASYRSA_INSTALL_DIR when the located binary is older
+# than EASYRSA_MIN_VERSION (easyrsa.sh prefers that dir). Arch-
+# independent: one pin for all arches. Hash verified 2026-11-17 against
+# the release tarball (also matches the audit's independently recorded
+# hash). $EASYRSA_SHA256 overrides the pin (operator-supplied, strict).
+EASYRSA_VERSION="3.1.7"
+EASYRSA_MIN_VERSION="3.1.0"
+EASYRSA_SHA256_PINNED="aaa48fadcbb77511b9c378554ef3eae09f8c7bc149d6f56ba209f1c9bab98c6e"
+EASYRSA_BASE="https://github.com/OpenVPN/easy-rsa/releases/download/v${EASYRSA_VERSION}"
+EASYRSA_INSTALL_DIR="/usr/local/share/easy-rsa"
 
 OVPN_PROTO_SET=0; [ -n "${OVPN_PROTO+x}" ] && OVPN_PROTO_SET=1
 OVPN_PORT_SET=0; [ -n "${OVPN_PORT+x}" ] && OVPN_PORT_SET=1
@@ -350,6 +363,75 @@ download() { # download <url> <dest>
         || die "download failed: $1"
 }
 
+# --- begin _ensure_easyrsa (tested by tests/r41_fix_a_pki.py) ---
+# R41-L3-F1: distro easy-rsa < 3.1.0 cannot build a CA non-interactively
+# (build_ca never passes -nodes to openssl req, so it prompts for a PEM
+# pass phrase). When the located binary is older than
+# EASYRSA_MIN_VERSION (or has no --version at all, i.e. 3.0.6), install
+# EasyRSA EASYRSA_VERSION from GitHub into EASYRSA_INSTALL_DIR.
+# Arch-independent: one pin for all arches; never clobbers apt-owned
+# /usr/share/easy-rsa. easyrsa.sh prefers the install dir. Idempotent:
+# a >= 3.1.0 install is kept and no download happens. The tarball is
+# verified against $EASYRSA_SHA256 (operator override) or the pinned
+# EASYRSA_SHA256_PINNED hash, fail closed. Self-contained (only log /
+# die plus system tools) so it can be unit-tested in isolation.
+_ensure_easyrsa() {
+    local bin="" ver="" major="" rest="" minor=""
+    for cand in "$EASYRSA_INSTALL_DIR/easyrsa" \
+                 /usr/local/share/easy-rsa/easyrsa \
+                 /usr/share/easy-rsa/easyrsa /usr/share/easy-rsa/3/easyrsa; do
+        if [ -x "$cand" ]; then bin="$cand"; break; fi
+    done
+    if [ -z "$bin" ]; then
+        bin="$(command -v easyrsa || true)"
+    fi
+    if [ -n "$bin" ] && [ -x "$bin" ]; then
+        ver="$("$bin" --version 2>/dev/null | sed -n 's/^Version:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1 || true)"
+        if [ -n "$ver" ]; then
+            major="${ver%%.*}"
+            rest="${ver#*.}"
+            minor="${rest%%.*}"
+            if [ "$major" -gt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -ge 1 ]; }; then
+                log "easy-rsa $ver already installed at $bin (>= $EASYRSA_MIN_VERSION) -- keeping it"
+                return 0
+            fi
+            log "installed easy-rsa $ver at $bin is older than $EASYRSA_MIN_VERSION -- upgrading to EasyRSA $EASYRSA_VERSION"
+        else
+            log "installed easy-rsa at $bin has no --version (pre-3.1.0) -- upgrading to EasyRSA $EASYRSA_VERSION"
+        fi
+    else
+        log "no easy-rsa found -- installing EasyRSA $EASYRSA_VERSION"
+    fi
+    local asset="EasyRSA-${EASYRSA_VERSION}.tgz"
+    local url="${EASYRSA_BASE}/${asset}"
+    local want="${EASYRSA_SHA256:-$EASYRSA_SHA256_PINNED}"
+    case "$want" in
+        *[!0-9a-f]*|'') die "refusing to verify EasyRSA: expected hash is not 64-hex" ;;
+    esac
+    [ "${#want}" -eq 64 ] || die "refusing to verify EasyRSA: expected hash is not 64-hex (length ${#want})"
+    local tmpdir=""
+    tmpdir="$(mktemp -d)"
+    curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o "$tmpdir/$asset" "$url" \
+        || die "download failed: $url"
+    printf '%s  %s\n' "$want" "$tmpdir/$asset" | sha256sum -c - \
+        || die "sha256 mismatch for $asset -- refusing to install (expected $want)"
+    log "sha256 OK: $asset"
+    mkdir -p "$EASYRSA_INSTALL_DIR"
+    tar -xzf "$tmpdir/$asset" -C "$tmpdir" \
+        || die "failed to extract $asset"
+    local srcdir="$tmpdir/EasyRSA-${EASYRSA_VERSION}"
+    [ -x "$srcdir/easyrsa" ] || die "easyrsa binary not found in $asset"
+    cp -a "$srcdir/." "$EASYRSA_INSTALL_DIR/"
+    chmod 755 "$EASYRSA_INSTALL_DIR/easyrsa"
+    rm -rf "$tmpdir"
+    local _ver2=""
+    _ver2="$("$EASYRSA_INSTALL_DIR/easyrsa" --version 2>/dev/null | grep '^Version:' | head -1 || true)"
+    printf '%s' "$_ver2" | grep -q "$EASYRSA_VERSION" \
+        || die "installed easy-rsa does not report $EASYRSA_VERSION (got '$_ver2')"
+    log "easy-rsa installed: $_ver2"
+}
+# --- end _ensure_easyrsa ---
+
 install_singbox() {
     if command -v sing-box >/dev/null 2>&1; then
         local cur=""
@@ -432,6 +514,7 @@ install_tun2socks() {
 
 install_singbox
 install_tun2socks
+_ensure_easyrsa
 
 # ------------------------------------------------------------------ install tree
 log "installing tree to $INSTALL_ROOT..."
@@ -1066,9 +1149,21 @@ chmod 750 /var/log/openvpn
 # A previous interrupted run can leave a server req/key with no issued
 # cert; Easy-RSA refuses to re-issue over those, so drop the stale pair
 # (only when the server cert itself is absent -- never touch a live CA).
+# R41-L3-F3: the pair may be operator key material (a foreign PKI whose
+# dh.pem/ta.key are absent) -- back it up before removing, same as
+# core/openvpn_manager.py build_server_cert does.
 if [ ! -f "$SERVER_DIR/server.crt" ]; then
+    _stale_backup=""
     for _stale in "$CA_DIR/pki/reqs/server.req" "$CA_DIR/pki/private/server.key"; do
         if [ -f "$_stale" ] && [ ! -f "$CA_DIR/pki/issued/server.crt" ]; then
+            if [ -z "$_stale_backup" ]; then
+                _stale_backup="$CA_DIR/pki/.server-key-backup-$(date -u +%Y%m%d%H%M%S)-$$"
+                mkdir -p "$_stale_backup"
+                chmod 700 "$_stale_backup"
+            fi
+            cp "$_stale" "$_stale_backup/"
+            chmod 600 "$_stale_backup/$(basename "$_stale")" 2>/dev/null || true
+            log "backed up stale partial file to $_stale_backup/$(basename "$_stale")"
             log "removing stale partial file: $_stale"
             rm -f "$_stale"
         fi
