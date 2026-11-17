@@ -1147,7 +1147,7 @@ def _chain_effective(cfg: dict) -> tuple[bool, list[str]]:
     return (not problems, problems)
 
 
-def get_status() -> dict:
+def get_status(probe_egress: bool = True) -> dict:
     """Public status: config (redacted) + live chain state.
 
     Read-only: an unreadable config file must not make status fail
@@ -1155,6 +1155,11 @@ def get_status() -> dict:
     raise out of every status poll). Report defaults plus a
     ``config_error`` field instead, so the panel can show the problem
     rather than a 500. Write paths (set_sk5/enable) still raise.
+    ``probe_egress=False`` skips the (up to 10 s) egress probe and
+    reports ``egress_ip=None`` (R41-L4-P1-1): the panel builds a fast
+    probe-free snapshot for its stale-while-revalidate cache from it,
+    and the full probed value still comes from the background refresh.
+    Default True: every existing caller keeps the probed value.
     """
     config_error = None
     try:
@@ -1175,7 +1180,13 @@ def get_status() -> dict:
     # Policy routing EFFECTIVE? See _policy_active() (R4-P2-1).
     status["policy_routing_active"] = _policy_active(cfg)
     status["vpn_net"] = VPN_NET
-    status["egress_ip"] = current_egress_ip() if cfg.get("enabled") else None
+    # R41-L4-P1-1: probe_egress=False skips the (up to 10 s) egress probe
+    # so the panel can build a fast probe-free snapshot for its
+    # stale-while-revalidate cache; the full value still comes from the
+    # background refresh. Default True: existing callers keep probing.
+    status["egress_ip"] = (current_egress_ip()
+                           if (probe_egress and cfg.get("enabled"))
+                           else None)
     status["last_health"] = last_health()
     return status
 
