@@ -571,7 +571,11 @@ async function api(path, method, body) {
   if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
   var res = await fetch(withNode(path), opts);
   var data = await res.json().catch(function () { return { ok: false, error: "响应不是 JSON" }; });
-  if (res.status === 401) { showLogin(); throw new Error("未登录"); }
+  /* R42-F5-1：401 别把服务端的错误体扔掉——登录 401 是“密码错误”，
+     改密 401 是“旧密码错误”，都得原样告诉用户。会话中途过期被弹回
+     登录页时，抛出的错误落在已隐藏的页面里看不见，所以同时写进登录
+     页的 loginMsg，让用户知道为什么被弹回来。 */
+  if (res.status === 401) { var msg401 = (data && data.error) || "未登录"; showLogin(); showMsg("loginMsg", msg401, false); throw new Error(msg401); }
   if (res.status === 429) { throw new Error(data.error || "请求过快，请稍后再试"); }
   if (!res.ok || data.ok === false) { throw new Error(data.error || ("HTTP " + res.status)); }
   return data;
@@ -772,16 +776,35 @@ async function loadUsers() {
     });
   } catch (e) { showMsg("userMsg", e.message, false); }
 }
+/* R42-F5-2：SK5 表单同样不能被 refreshAll 悄悄改回旧值。Fix-E 的
+   port/proto 用 input/change 事件记 dirty，但 loadSk5 的触发面更广
+   （手动刷新、节点切换、登录后），且值可能由程序填入——因此不用事件
+   记 dirty，改用“上次服务端值”快照比对：只有字段当前值等于上次服务
+   端值（或为空）时才回填；用户改过未保存的值一律保留。快照每次都更
+   新为服务端最新值，保存成功后下一次刷新即恢复正常回填。 */
+var lastSk5 = null;
 async function loadSk5() {
   try {
     var d = await api("/api/sk5");
     var c = d.sk5 || {};
-    if (c.host) { document.getElementById("sk5Host").value = c.host; }
-    if (c.port) { document.getElementById("sk5Port").value = c.port; }
-    if (c.username) { document.getElementById("sk5User").value = c.username; }
-    document.getElementById("sk5Enabled").checked = !!c.enabled;
-    document.getElementById("sk5FailOpen").checked = !!c.fail_open;
-    document.getElementById("sk5Uot").checked = !!c.udp_over_tcp;
+    var prev = lastSk5;
+    lastSk5 = {
+      host: c.host || null,
+      port: (c.port != null ? String(c.port) : null),
+      username: c.username || null,
+      enabled: !!c.enabled,
+      fail_open: !!c.fail_open,
+      udp_over_tcp: !!c.udp_over_tcp
+    };
+    var hostEl = document.getElementById("sk5Host");
+    if (c.host && (!prev || !hostEl.value || hostEl.value === prev.host)) { hostEl.value = c.host; }
+    var portEl = document.getElementById("sk5Port");
+    if (c.port && (!prev || !portEl.value || String(portEl.value) === prev.port)) { portEl.value = c.port; }
+    var userEl = document.getElementById("sk5User");
+    if (c.username && (!prev || !userEl.value || userEl.value === prev.username)) { userEl.value = c.username; }
+    if (!prev || document.getElementById("sk5Enabled").checked === prev.enabled) { document.getElementById("sk5Enabled").checked = !!c.enabled; }
+    if (!prev || document.getElementById("sk5FailOpen").checked === prev.fail_open) { document.getElementById("sk5FailOpen").checked = !!c.fail_open; }
+    if (!prev || document.getElementById("sk5Uot").checked === prev.udp_over_tcp) { document.getElementById("sk5Uot").checked = !!c.udp_over_tcp; }
   } catch (e) { showMsg("sk5Msg", e.message, false); }
 }
 async function refreshAll() {
@@ -1064,7 +1087,10 @@ document.getElementById("registerNodeBtn").onclick = async function () {
   try {
     var d = await api("/api/nodes", "POST", { name: name, panel_url: panelUrl });
     showTokenBox(d.token, (d.node && d.node.panel_url) || panelUrl, name);
-    showMsg("nodeMsg", "已注册节点 " + name + "，token 与安装命令只显示一次，请当场复制保存", true);
+    /* R42-F5-4：服务端发现 panel_url 不在面板证书 SAN 中时会带 warning
+       回来（空 panel_url 默认成当前访问地址时最常见），必须当场告诉用户，
+       否则节点永远只显示“从未上报”且无从查起。 */
+    showMsg("nodeMsg", "已注册节点 " + name + "，token 与安装命令只显示一次，请当场复制保存" + (d.warning ? "。⚠ " + d.warning : ""), true);
     addLog("注册节点 " + name, true);
     document.getElementById("newNodeName").value = "";
     loadNodes();
@@ -1113,7 +1139,16 @@ document.getElementById("detectIpBtn").onclick = async function () {
 };
 document.getElementById("saveServerBtn").onclick = async function () {
   try {
-    var newPort = parseInt(document.getElementById("port").value, 10);
+    /* R42-F5-3：端口为空或非法时直接拒绝——绝不弹“UDP/NaN”确认，
+       更不把 port: null 发下去（服务端会静默默认成 1194/443，
+       把定制端口悄悄重置）。 */
+    var portRaw = String(document.getElementById("port").value).trim();
+    var newPort = /^\d+$/.test(portRaw) ? parseInt(portRaw, 10) : NaN;
+    if (!Number.isInteger(newPort) || newPort < 1 || newPort > 65535) {
+      showMsg("serverMsg", "端口须为 1–65535 的整数", false);
+      addLog("保存服务配置失败：端口须为 1–65535 的整数", false);
+      return;
+    }
     var newProto = document.getElementById("proto").value;
     var body = {
       port: newPort,
