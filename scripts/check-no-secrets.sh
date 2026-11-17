@@ -53,17 +53,25 @@ else
     _grep() { (cd "$TARGET" && grep -rIl -e "$1" --exclude-dir=.git . 2>/dev/null | sed 's|^\./||' || true); }
 fi
 
-# --- sensitive-filename match (R43-J7-5) -------------------------------
+# --- sensitive-filename match (R43-J7-5, R44-L7-2) ---------------------
 # Exact-match only let "secret.key.bak", "SECRET.KEY" and "admin.pass␣"
 # (trailing space) through the gate. Normalize before matching: trim
 # surrounding whitespace, fold case, and treat "<name>.<suffix>" as
-# the same file. A bare stem is NOT a match ("mysecret.key",
-# "admin.password" and "secret.keystore" stay clean).
+# the same file. R44-L7-2: editor-backup and hidden shapes are the
+# same file too -- strip leading dots (".secret.key") and trailing
+# tildes ("secret.key~", "secret.key.bak~") before matching. A bare
+# stem is NOT a match ("mysecret.key", "admin.password" and
+# "secret.keystore" stay clean, with or without a trailing "~").
 _sensitive_name() {
     _n="$1"
     _n="${_n#"${_n%%[![:space:]]*}"}"
     _n="${_n%"${_n##*[![:space:]]}"}"
     _n="${_n,,}"
+    while [ "${_n#.}" != "$_n" ]; do _n="${_n#.}"; done
+    # NOTE: the "~" must be backslash-quoted here: an unquoted "~"
+    # alone in ${var%...} undergoes tilde expansion to $HOME and the
+    # pattern never matches (bash quirk, caught by the Fix-T probe).
+    while [ "${_n%\~}" != "$_n" ]; do _n="${_n%\~}"; done
     case "$_n" in
         secret.key|admin.pass|panel.db|sk5.json|agent_queue.json|ta.key) return 0 ;;
         secret.key.*|admin.pass.*|panel.db.*|sk5.json.*|agent_queue.json.*|ta.key.*) return 0 ;;
