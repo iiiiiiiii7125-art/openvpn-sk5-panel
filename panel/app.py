@@ -3225,20 +3225,15 @@ def agent_bundle_sha256():
         "Content-Type": "text/plain; charset=utf-8"}
 
 
-_BUNDLE_SHA256_CACHE = False  # False = not computed yet (None = failed)
-
-
 def _current_bundle_sha256():
-    """当前 agent 安装包的 SHA-256（进程内记忆：面板每次升级都重启
-    服务，记忆不可能滞后于磁盘上的代码；读不到时回 None，即未知）。"""
-    global _BUNDLE_SHA256_CACHE
-    if _BUNDLE_SHA256_CACHE is False:
-        try:
-            _BUNDLE_SHA256_CACHE = hashlib.sha256(
-                _build_agent_bundle().read()).hexdigest()
-        except Exception:  # noqa: BLE001 - bundle 不可读 -> 未知
-            _BUNDLE_SHA256_CACHE = None
-    return _BUNDLE_SHA256_CACHE
+    """当前 agent 安装包的 SHA-256（每次调用都重新算：面板进程可能在
+    代码升级后继续运行——install.sh 只在代码变化时才重启，而一次
+    无重启的升级也会换掉磁盘上的包文件；进程内记忆会在此滞后
+    （R46-L2-1），所以这里绝不缓存。读不到时回 None，即未知）。"""
+    try:
+        return hashlib.sha256(_build_agent_bundle().read()).hexdigest()
+    except Exception:  # noqa: BLE001 - bundle 不可读 -> 未知
+        return None
 
 
 def _agent_code_status(snap):

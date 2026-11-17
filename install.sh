@@ -517,6 +517,33 @@ install_tun2socks
 _ensure_easyrsa
 
 # ------------------------------------------------------------------ install tree
+# R46-L2-1 / LIVE-R45-4: the panel serves its code from memory. A re-run
+# that changes panel/app.py (or the TLS launcher) without restarting
+# the panel leaves the old code serving indefinitely -- and the old
+# process then compares agent hashes against a stale build. Record
+# the content hash of the installed panel code BEFORE the tree copy
+# below; after the copy + launcher regeneration the after-hash is
+# compared, and a difference restarts the panel via
+# _restart_panel_if_needed. Content-based (not mtime): cp -a preserves
+# mtimes, and a same-version re-run must not restart. panel/data/ is
+# live runtime state and __pycache__ is regenerated -- both excluded.
+# Fresh install: no installed tree yet, the before-hash is the hash of
+# empty input and the panel was never running, so no restart follows.
+_panel_code_hash() {
+    {
+        if [ -f "$INSTALL_ROOT/run-panel-tls.py" ]; then
+            sha256sum "$INSTALL_ROOT/run-panel-tls.py"
+        fi
+        if [ -d "$INSTALL_ROOT/panel" ]; then
+            find "$INSTALL_ROOT/panel" -type f -not -path "*/data/*" \
+                -not -path "*__pycache__*" -print0 2>/dev/null \
+                | sort -z | while IFS= read -r -d '' _f; do
+                    sha256sum "$_f"
+                done
+        fi
+    } | sha256sum | cut -d' ' -f1
+}
+_PANEL_CODE_BEFORE="$(_panel_code_hash)"
 log "installing tree to $INSTALL_ROOT..."
 mkdir -p "$INSTALL_ROOT" "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
@@ -704,8 +731,9 @@ fi
 # below, only when the cert was actually regenerated
 # (_PANEL_CERT_REGEN: stale-SAN/unparseable certs AND missing
 # cert/key files -- R42-F2-1: the missing-file path regenerates with
-# _PANEL_CERT_STALE still 0) or the proxy env vars changed. A fresh
-# install regenerates too, but the panel was never running so there
+# _PANEL_CERT_STALE still 0), the proxy env vars changed, or the
+# panel code changed (_PANEL_CODE_CHANGED -- R46-L2-1 / LIVE-R45-4).
+# A fresh install regenerates too, but the panel was never running so
 # is nothing to restart (it is started fresh with the new cert by
 # `enable --now` below); an inactive panel likewise.
 # R42-F1-7: the reload below is safe against the regen only because
@@ -725,7 +753,11 @@ _restart_panel_if_needed() { # _restart_panel_if_needed <domain-changed-0/1>
     # Fix-G probe harness drives this function with STALE alone, so
     # both trigger; ${...:-0} keeps this safe under `set -u` for
     # harnesses that never set REGEN), or the proxy env vars changed
-    # ($1). The panel reads panel.env and its TLS cert at start
+    # ($1), or the panel code on disk changed under it
+    # (_PANEL_CODE_CHANGED -- R46-L2-1 / LIVE-R45-4: a code-only
+    # upgrade used to leave the old process serving old code forever,
+    # and the bundle-hash comparison then lied in both directions).
+    # The panel reads panel.env and its TLS cert at start
     # only. No-op when nothing changed, when the panel was not
     # running before this run (it is started fresh below with the new
     # state), when it is not running now, or when this run already
@@ -740,6 +772,9 @@ _restart_panel_if_needed() { # _restart_panel_if_needed <domain-changed-0/1>
     fi
     if [ "$_PANEL_CERT_STALE" -eq 1 ] || [ "${_PANEL_CERT_REGEN:-0}" -eq 1 ]; then
         _reason="${_reason:+$_reason; }panel TLS cert regenerated"
+    fi
+    if [ "${_PANEL_CODE_CHANGED:-0}" -eq 1 ]; then
+        _reason="${_reason:+$_reason; }panel code changed"
     fi
     [ -n "$_reason" ] || return 0
     [ "$_PANEL_RESTARTED" -eq 0 ] || return 0
@@ -784,6 +819,19 @@ if __name__ == "__main__":
     panel_app.app.run(host="0.0.0.0", port=$PANEL_PORT, ssl_context=(CERT, KEY))
 EOF
 chmod 755 "$INSTALL_ROOT/run-panel-tls.py"
+
+# R46-L2-1 / LIVE-R45-4 (continued): the tree copy above and the
+# launcher regeneration just wrote the new panel code -- this is the
+# last point in the script that writes panel code (the domain and
+# service sections below touch panel.env, Caddy and systemd, never
+# $INSTALL_ROOT/panel). Compare with the before-hash: a content
+# difference means this run changed the code the panel serves, so
+# _restart_panel_if_needed must restart an already-running panel.
+# A same-version re-run copies identical content, so the hash matches
+# and no restart follows.
+_PANEL_CODE_AFTER="$(_panel_code_hash)"
+_PANEL_CODE_CHANGED=0
+[ "$_PANEL_CODE_AFTER" != "$_PANEL_CODE_BEFORE" ] && _PANEL_CODE_CHANGED=1
 
 # R2-§10: OPENVPN_SERVER_IP must never be the LAN IP. _outward_ip()
 # prefers an explicit env value over public-IP detection, so writing
@@ -1210,11 +1258,12 @@ if [ -n "$_PANEL_DOMAIN" ]; then
         # The panel reads panel.env at start, and serves its TLS cert
         # from memory. On a re-run it is already running with the old
         # environment and the old cert, so restart it when the proxy
-        # env vars changed or the cert was regenerated (fresh installs
-        # start it below, already with the new vars and cert). Without
-        # the cert reason, an unchanged domain left the panel serving
-        # the OLD cert after an upgrade while Caddy trusted only the
-        # NEW one -- every domain request 502d (LIVE-R41-1).
+        # env vars changed, the cert was regenerated, or the panel
+        # code changed (fresh installs start it below, already with
+        # the new vars and cert). Without the cert reason, an unchanged
+        # domain left the panel serving the OLD cert after an upgrade
+        # while Caddy trusted only the NEW one -- every domain request
+        # 502d (LIVE-R41-1).
         _DOMAIN_CHANGED=0
         [ "$_PANEL_DOMAIN" != "${_PREV_PANEL_DOMAIN:-}" ] && _DOMAIN_CHANGED=1
         _restart_panel_if_needed "$_DOMAIN_CHANGED"
@@ -1537,8 +1586,9 @@ systemctl enable --now openvpn-sk5-panel \
 # direct-IP clients still work (-k), but the agent's 127.0.0.1
 # hostname verification (the reason the cert was regenerated) keeps
 # failing until a manual restart. The call is a no-op when the domain
-# section already restarted it (_PANEL_RESTARTED), when the cert was
-# not regenerated, or when the panel was not running before this run.
+# section already restarted it (_PANEL_RESTARTED), when neither the
+# cert was regenerated nor the panel code changed, or when the panel
+# was not running before this run.
 _restart_panel_if_needed 0
 
 # P1-9: restore policy routing at boot (only when SK5 is enabled in
