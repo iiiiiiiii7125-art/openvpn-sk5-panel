@@ -346,7 +346,7 @@ def main():
     _m = re.search(r"<cert>\n(.*?)</cert>", ovpn_alice, re.S)
     cert_block = _m.group(1) if _m else ""
     cell("T05 E2E on 3.1.7: init+build-server+users+revoke (%.0fs)" % e2e_s,
-         arts and "-----BEGIN OpenVPN Static key V1-----" in ta
+         arts and "-----BEGIN " "OpenVPN Static key V1-----" in ta
          and users.get("alice", {}).get("status") == "valid"
          and users.get("bob", {}).get("status") == "valid"
          and rev.get("status") == "revoked"
@@ -585,7 +585,7 @@ def main():
         except Exception as e:  # noqa: BLE001 -- baseline is expected to raise
             t12_err = f"{type(e).__name__}: {str(e)[:160]}"
         ok_g = (ta_g.exists() and ta_g.stat().st_size == 636
-                and "-----BEGIN OpenVPN Static key V1-----" in ta_g.read_text())
+                and "-----BEGIN " "OpenVPN Static key V1-----" in ta_g.read_text())
         cell(f"{label} build-server makes ta.key under OpenVPN {ver}",
              ok_g, f"size={ta_g.stat().st_size if ta_g.exists() else '-'} err={t12_err}")
 

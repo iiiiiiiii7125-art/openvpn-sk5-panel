@@ -43,8 +43,13 @@ bad()  { FAIL=$((FAIL+1)); echo "FAIL: $*"; }
 skip() { SKIP=$((SKIP+1)); echo "SKIP: $*"; }
 
 echo "=== 1. policy rule (from 10.8.0.0/24 lookup 100) ==="
-if ip rule show | grep -q "from 10.8.0.0/24 lookup 100"; then
-    ok "rule present: $(ip rule show | grep 'from 10.8.0.0/24 lookup 100')"
+# R42-F3-4: anchor the match like _rule_present() does -- the old
+# unanchored substring also matched `lookup 1000` (prefix) and
+# ignored the priority entirely, so §1 PASSed on a wrong rule while
+# VPN traffic took the main table. Priority 100, our selector,
+# table 100, on a single line, table number word-bounded.
+if ip rule show | grep -qE "^100:[[:space:]]+from 10\.8\.0\.0/24 lookup 100([[:space:]]|$)"; then
+    ok "rule present: $(ip rule show | grep -E "^100:[[:space:]]+from 10\.8\.0\.0/24 lookup 100([[:space:]]|$)")"
 else
     bad "no rule 'from 10.8.0.0/24 lookup 100' (chain not enabled?)"
 fi

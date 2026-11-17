@@ -341,20 +341,49 @@ def _singbox_check() -> None:
 
 
 def _pid_is_singbox(pid: int) -> bool:
-    """Does this pid belong to a sing-box process? (R41-L4-P2-4)
-    Reads /proc/<pid>/cmdline and looks for the sing-box binary
-    name. A stale PID file pointing at an innocent pid reuser must
-    never be mistaken for our daemon: the old code trusted the
-    number alone, so _stop_singbox_direct() SIGTERMed whatever
-    reused the pid and _singbox_running() reported a dead daemon
-    alive. An unreadable cmdline (process gone, zombie, foreign
-    user) means "not ours"."""
+    """Does this pid belong to a sing-box process? (R41-L4-P2-4, R42-F3-3)
+    A stale PID file pointing at an innocent pid reuser must never be
+    mistaken for our daemon: the old code trusted the number alone,
+    so _stop_singbox_direct() SIGTERMed whatever reused the pid and
+    _singbox_running() reported a dead daemon alive. An unreadable
+    cmdline (process gone, zombie, foreign user) means "not ours".
+
+    Identity is the EXECUTABLE, not a substring of the cmdline:
+    R42-F3-3 proved `b"sing-box" in cmdline` matches any process
+    whose argv merely mentions sing-box -- a sleep spawned with
+    argv[0]="sing-box" was judged the daemon and SIGTERMed. Two
+    evidence forms count, and a bare argv[0] string is neither:
+      * /proc/<pid>/exe resolves to a binary named sing-box
+        (a " (deleted)" suffix -- binary replaced while running --
+        is stripped first); or
+      * some argv element is a PATH naming the sing-box binary
+        (basename "sing-box", with a "/"). This is the script case:
+        a sing-box launched as a script has exe == its interpreter
+        (/bin/sh), and the kernel passes the script path as an argv
+        element -- the Fix-C fake daemon relies on exactly that.
+    A bare "sing-box" argv[0] with no slash is just a claim any
+    process can make (execve lets the caller pick argv[0]); it
+    proves nothing and never counts on its own."""
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        exe = ""
+    exe_name = os.path.basename(exe)
+    if exe_name.endswith(" (deleted)"):
+        exe_name = exe_name[: -len(" (deleted)")]
+    if exe_name == "sing-box":
+        return True
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             cmdline = f.read()
     except OSError:
         return False
-    return b"sing-box" in cmdline
+    for part in cmdline.split(b"\0"):
+        if not part or b"/" not in part:
+            continue
+        if os.path.basename(part.decode("utf-8", "replace")) == "sing-box":
+            return True
+    return False
 
 
 def _singbox_running() -> bool:
