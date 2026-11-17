@@ -836,9 +836,12 @@ function normalizeNode(n) {
     proto: ovpn.proto || null,
     port: ovpn.port || null,
     /* R45-LIVE-2: agent 代码过期标记（服务端比对心跳上报的安装包
-       哈希与当前包；顶层键优先，快照里的 bundle_sha256 兜底）。 */
+       哈希与当前包；顶层键优先，快照里的 bundle_sha256 兜底）。
+       R46 Fix-AH：面板 CA 轮换后钉着旧 CA 的 agent 再也 poll 不上来，
+       cert_pin_stale 即该信号（last_seen 早于轮换时间）。 */
     agent_bundle_sha256: (n.agent_bundle_sha256 != null ? n.agent_bundle_sha256 : (ls.bundle_sha256 || null)),
-    agent_code_outdated: (n.agent_code_outdated != null ? n.agent_code_outdated : null)
+    agent_code_outdated: (n.agent_code_outdated != null ? n.agent_code_outdated : null),
+    cert_pin_stale: (n.cert_pin_stale != null ? n.cert_pin_stale : null)
   };
 }
 function setCurrentNode(name) {
@@ -941,12 +944,21 @@ async function loadNodes() {
       tdOn.appendChild(ob);
       /* R45-LIVE-2: agent 代码过期（心跳上报的安装包哈希与当前包
          不同）-- 面板升级不动已部署的 agent，须在 agent 机器上
-         重跑更新命令；未上报哈希时不显示（未知，不谎报）。 */
+         重跑更新命令；未上报哈希时不显示（未知，不谎报）。
+         R46 Fix-AH：面板 CA 轮换后钉着旧 CA 的 agent 每次 poll 都
+         CERTIFICATE_VERIFY_FAILED，last_seen 冻结；该标记就是面板侧
+         的可见信号，恢复同样是重跑更新命令（--force 重新钉 CA）。 */
       if (n.agent_code_outdated === true) {
         tdOn.appendChild(document.createTextNode(" "));
         var wb = document.createElement("span");
         wb.className = "badge warn"; wb.textContent = "agent 代码过期";
         tdOn.appendChild(wb);
+      }
+      if (n.cert_pin_stale === true) {
+        tdOn.appendChild(document.createTextNode(" "));
+        var cb = document.createElement("span");
+        cb.className = "badge warn"; cb.textContent = "证书已轮换";
+        tdOn.appendChild(cb);
       }
       tr.appendChild(tdOn);
       tr.appendChild(td(n.egress_ip || "—"));
@@ -988,8 +1000,9 @@ async function loadNodes() {
         } catch (e) { showMsg("nodeMsg", e.message, false); }
       };
       ops.appendChild(useBtn); ops.appendChild(cmdBtn); ops.appendChild(rotBtn); ops.appendChild(delBtn);
-      /* R45-LIVE-2: 代码过期时给更新命令（不带 token，带 --force）。 */
-      if (n.agent_code_outdated === true) {
+      /* R45-LIVE-2: 代码过期时给更新命令（不带 token，带 --force）。
+         R46 Fix-AH：证书已轮换时同样给更新命令——它会重新钉面板 CA。 */
+      if (n.agent_code_outdated === true || n.cert_pin_stale === true) {
         var upBtn = document.createElement("button");
         upBtn.type = "button"; upBtn.className = "btn secondary small"; upBtn.textContent = "更新 agent";
         upBtn.onclick = function () {

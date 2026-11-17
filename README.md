@@ -133,12 +133,14 @@ agent 安装器本身也是 fail-closed（FLMX §1-13 同款）：远程下载 b
 确定性 buffer 算 sha256，与 bundle 同源同版本），远程装 agent 不再卡在
 这一步；本地 bundle 分支（仓库 checkout 内直接装）不受影响。
 
-**面板证书信任（BUG-5）**：面板默认用自签 TLS 证书，agent 校验 TLS，
+**面板证书信任（BUG-5）**：面板默认用面板 CA 签发的 TLS 证书，agent 校验 TLS，
 没有信任锚点时 poll 会永远报 `CERTIFICATE_VERIFY_FAILED`、命令链全断。
 安装器在装 agent 时自动建立信任：先试系统信任库能直接验证的握手
 （公网 CA 面板，如 Cloudflare 前端，什么都不用做）；验证失败时把面板
-当前出示的证书 TOFU 钉到 `/etc/ovpn-agent/panel-ca.pem`，并写进
-`config.json` 的 `ca_cert`。面板换证书后须重跑安装器 `--force` 重新钉。
+CA 证书从 `/api/agent/panel-ca` 取回、TOFU 钉到 `/etc/ovpn-agent/panel-ca.pem`，并写进
+`config.json` 的 `ca_cert`。钉的是 CA 不是叶证书，面板叶证书轮换不断连；
+只有面板 CA 本身轮换后才须重跑安装器 `--force` 重新钉（面板会把这类节点
+标为“证书已轮换”）。
 也可显式给 `--ca-cert <panel.pem>`（直接钉该 PEM）或 `--insecure`
 （跳过校验，**仅调试用**：token 与用户 .ovpn 可被中间人截获，面板
 UI 与 agent 日志都会告警）。重装换 panel-url/token 后安装器会重启

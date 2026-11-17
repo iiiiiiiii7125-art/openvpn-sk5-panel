@@ -983,6 +983,10 @@ def _remote_status_payload(node):
     _installed, _outdated = _agent_code_status(snap)
     out["agent_bundle_sha256"] = _installed
     out["agent_code_outdated"] = _outdated
+    # R46 Fix-AH：面板 CA 轮换后钉着旧 CA 的 agent 再也 poll 不上来，
+    # last_seen 冻结在轮换时间之前；该标记就是面板侧的可见信号。
+    out["cert_pin_stale"] = _cert_pin_stale(_last_seen,
+                                            _panel_ca_rotated_at())
     if snap is None:
         out["note"] = "节点尚未上报状态：agent 首次 poll 后执行一次 get_status 即可"
     return out
@@ -2662,6 +2666,8 @@ def nodes_list():
         "SELECT name, panel_url, created_at, last_seen, last_status"
         " FROM nodes ORDER BY name").fetchall()
     conn.close()
+    # R46 Fix-AH：CA 轮换时间每请求只读一次（文件极小，读不到即无轮换）。
+    _ca_rotated_at = _panel_ca_rotated_at()
     nodes = []
     for r in rows:
         try:
@@ -2676,7 +2682,9 @@ def nodes_list():
                       "last_seen": r["last_seen"],
                       "last_status": last_status,
                       "agent_bundle_sha256": _installed,
-                      "agent_code_outdated": _outdated})
+                      "agent_code_outdated": _outdated,
+                      "cert_pin_stale": _cert_pin_stale(
+                          r["last_seen"], _ca_rotated_at)})
     return jsonify({"ok": True, "nodes": nodes})
 
 
@@ -3225,6 +3233,147 @@ def agent_bundle_sha256():
         "Content-Type": "text/plain; charset=utf-8"}
 
 
+def _panel_ca_rotated_at():
+    """最近一次面板 CA 轮换时间（ISO 字符串），无轮换记录时回 None。
+    R46 Fix-AH：面板每次启动时由 _record_panel_ca_rotation_if_changed
+    在 panel-ca-rotations.log 里记轮换事件（一行一条：<ISO 时间> <CA
+    指纹>）；时间戳是新 CA 首次被真正提供服务的时刻（面板启动时），
+    不是安装器生成 CA 的时刻——安装器生成与面板重启之间仍有 agent
+    心跳成功，那些心跳不得清除 stale 判定。叶证书轮换不记——agent
+    钉的是 CA，叶轮换不断连。路径可用 OVPN_PANEL_CA_ROTATIONS_PATH
+    覆盖（测试用），默认 /etc/openvpn-sk5-panel/panel-ca-rotations.log。"""
+    path = os.environ.get("OVPN_PANEL_CA_ROTATIONS_PATH",
+                          "/etc/openvpn-sk5-panel/panel-ca-rotations.log")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    return lines[-1].split()[0]
+
+
+def _panel_ca_fingerprint():
+    """面板 CA 证书的 SHA-256 指纹（小写 hex），无 CA 文件或不可解析时回 None。"""
+    ca_path = os.environ.get("OVPN_PANEL_CA_CERT_PATH",
+                             "/etc/openvpn-sk5-panel/panel-ca.crt")
+    try:
+        out = subprocess.run(
+            ["openssl", "x509", "-in", ca_path, "-noout",
+             "-fingerprint", "-sha256"],
+            capture_output=True, text=True, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"Fingerprint=([0-9A-Fa-f:]+)", out.stdout)
+    if not m:
+        return None
+    return m.group(1).replace(":", "").lower()
+
+
+def _record_panel_ca_rotation_if_changed():
+    """面板启动时记录 CA 轮换（若本次启动首次提供新 CA）。
+
+    只在 __main__ 里调一次，import 时不跑，Flask 测试客户端与探针
+    不受影响。面板把上次提供过的 CA 指纹记在 CA 证书旁的
+    panel-ca-last-served 文件里：
+
+    - 首次启动（无 state、无日志）：只写 state，不记——全新 CA 不是轮换。
+    - 指纹变了：本次启动即轮换生效时刻，追加 <now> <新指纹>。
+    - 无 state 但日志末行已是当前 CA（旧版安装器在生成时写的时间戳，
+      早于真正提供服务的重启）：把该行时间戳改写为 now——生成与重启
+      之间成功的心跳不得清除 stale 判定。
+    - 指纹不变：什么都不做。
+
+    只做记账：任何异常只打 stderr，绝不阻塞面板启动。
+    """
+    try:
+        current_fp = _panel_ca_fingerprint()
+        if not current_fp:
+            return
+        ca_path = os.environ.get("OVPN_PANEL_CA_CERT_PATH",
+                                 "/etc/openvpn-sk5-panel/panel-ca.crt")
+        ca_dir = os.path.dirname(ca_path)
+        state_path = os.path.join(ca_dir, "panel-ca-last-served")
+        log_path = os.environ.get(
+            "OVPN_PANEL_CA_ROTATIONS_PATH",
+            "/etc/openvpn-sk5-panel/panel-ca-rotations.log")
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                last_served = f.read().strip()
+        except OSError:
+            last_served = None
+        if last_served == current_fp:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        lines = []
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+        except OSError:
+            lines = []
+        if lines and lines[-1].split()[-1] == current_fp:
+            # 旧版安装器写下的本 CA 记录：把生成时刻改写为生效时刻。
+            lines[-1] = "%s %s" % (now, current_fp)
+        elif not lines and last_served is None:
+            # 首次启动：全新 CA，不是轮换。
+            pass
+        else:
+            lines.append("%s %s" % (now, current_fp))
+        if lines:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        with open(state_path, "w", encoding="utf-8") as f:
+            f.write(current_fp + "\n")
+    except Exception as exc:  # noqa: BLE001 - 记账失败绝不阻塞启动
+        print("panel CA rotation bookkeeping failed: %s" % exc,
+              file=sys.stderr)
+
+
+def _cert_pin_stale(last_seen, rotated_at):
+    """某节点 last_seen 是否早于最近一次面板 CA 轮换。
+    R46 Fix-AH：CA 轮换后，钉着旧 CA 的 agent 每次 poll 都
+    CERTIFICATE_VERIFY_FAILED，last_seen 就此冻结；last_seen 早于轮换
+    时间即判定 pin 已过期（True），晚于则正常（False），无轮换记录或
+    从未上报时未知（None，绝不谎报）。"""
+    if not rotated_at or not last_seen:
+        return None
+    try:
+        rot = datetime.fromisoformat(str(rotated_at).replace("Z", "+00:00"))
+        seen = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if rot.tzinfo is None:
+        rot = rot.replace(tzinfo=timezone.utc)
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return seen < rot
+
+
+@app.route("/api/agent/panel-ca", methods=["GET"])
+def agent_panel_ca():
+    """面板 CA 证书（PEM 明文公开下发）。
+    R46 Fix-AH：agent 钉的是面板 CA 而非叶证书（见 install-agent.sh），
+    装机时先取本端点再试握手；CA 证书是公开的密钥材料（叶证书本来就
+    对任何连接者公开），无鉴权下发与 /api/agent/bundle 同理。CA 文件
+    不存在时（CA 之前的面板、或用户自带证书）回 404，安装器回退到钉
+    叶证书的老行为。路径可用 OVPN_PANEL_CA_CERT_PATH 覆盖（测试用），
+    默认 /etc/openvpn-sk5-panel/panel-ca.crt。"""
+    ca_path = os.environ.get("OVPN_PANEL_CA_CERT_PATH",
+                             "/etc/openvpn-sk5-panel/panel-ca.crt")
+    try:
+        with open(ca_path, "rb") as f:
+            pem = f.read()
+    except OSError:
+        return jsonify({"ok": False,
+                        "error": "panel CA certificate not available "
+                                 "(pre-CA panel or user-supplied certificate)"}), 404
+    if b"-----BEGIN CERTIFICATE-----" not in pem:
+        return jsonify({"ok": False,
+                        "error": "panel CA certificate is not a PEM certificate"}), 404
+    return pem, 200, {"Content-Type": "application/x-pem-file"}
+
+
 def _current_bundle_sha256():
     """当前 agent 安装包的 SHA-256（每次调用都重新算：面板进程可能在
     代码升级后继续运行——install.sh 只在代码变化时才重启，而一次
@@ -3274,4 +3423,5 @@ def install_agent_script_sha256():
 
 if __name__ == "__main__":
     _ensure_admin_password()
+    _record_panel_ca_rotation_if_changed()
     app.run(host="0.0.0.0", port=8443)

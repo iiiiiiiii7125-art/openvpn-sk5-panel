@@ -682,6 +682,23 @@ PANEL_KEY="$CONFIG_DIR/panel-key.pem"
 # auto-regenerated: a cert that does not verify against itself (e.g. a
 # user-supplied CA-issued cert) is left alone, and an unparseable cert
 # is treated as stale (regenerated, backup first) rather than kept.
+# R46 Fix-AH (LIVE-R45-3): the panel TLS certificate is no longer a
+# bare self-signed leaf that the agent pins byte-for-byte. It is a
+# leaf issued by a panel CA kept in $CONFIG_DIR (panel-ca.crt/key),
+# and the agent pins the CA, not the leaf -- so a leaf rotation (stale
+# SANs, missing files) no longer bricks deployed agents: any leaf the
+# CA signs verifies against the pin they already hold. Migration: an
+# existing self-signed panel cert IS already a CA certificate
+# (openssl req -x509 emits CA:TRUE), so it is adopted as the panel CA
+# verbatim -- the old pin stays valid, no agent is bricked by the
+# upgrade itself. Only a fresh CA (fresh install, or the CA key lost)
+# breaks old pins; that event is recorded in panel-ca-rotations.log by
+# the panel itself at the first start that serves the new CA (see
+# _record_panel_ca_rotation_if_changed in panel/app.py) -- the
+# timestamp must be the go-live instant, not the generation time, or
+# heartbeats recorded between generation and restart would clear the
+# stale verdict. The Caddy copy still carries the leaf (unchanged)
+# and the dual-trust bundle still applies to leaf rotations.
 _PANEL_CERT_STALE=0
 # R42-F2-1: whether this run actually ISSUED a new panel cert. The
 # generation block below fires for a stale cert AND for missing
@@ -690,6 +707,77 @@ _PANEL_CERT_STALE=0
 # 502, narrower trigger). _restart_panel_if_needed keys on this flag.
 _PANEL_CERT_REGEN=0
 _PANEL_CERT_KEEP_NOTE=""
+# CA paths are derived from the leaf's directory (never CONFIG_DIR
+# directly) so this whole block stays runnable from the probe
+# harnesses, which define only PANEL_CERT/PANEL_KEY/SERVER_IP.
+PANEL_CA_CERT="${PANEL_CERT%/*}/panel-ca.crt"
+PANEL_CA_KEY="${PANEL_CERT%/*}/panel-ca.key"
+_issue_panel_leaf() { # _issue_panel_leaf <ca-cert> <ca-key> <leaf-cert> <leaf-key> <server-ip>
+    local _ca_crt="$1" _ca_key="$2" _crt="$3" _key="$4" _ip="$5"
+    local _csr _ext
+    _csr="$(mktemp)"
+    _ext="$(mktemp)"
+    printf 'subjectAltName=IP:%s,IP:127.0.0.1,DNS:localhost\n' "$_ip" > "$_ext"
+    if ! openssl req -new -newkey rsa:2048 -keyout "$_key" -out "$_csr" \
+            -nodes -subj "/CN=$_ip" 2>/dev/null; then
+        rm -f "$_csr" "$_ext"
+        return 1
+    fi
+    if ! openssl x509 -req -in "$_csr" -CA "$_ca_crt" -CAkey "$_ca_key" \
+            -CAcreateserial -out "$_crt" -days 3650 \
+            -extfile "$_ext" 2>/dev/null; then
+        rm -f "$_csr" "$_ext"
+        return 1
+    fi
+    rm -f "$_csr" "$_ext"
+    chmod 600 "$_key"; chmod 644 "$_crt"
+    return 0
+}
+_ensure_panel_ca() {
+    # Establish the panel CA. Order matters: a valid CA wins; else an
+    # existing self-signed leaf is adopted as the CA (its key signs the
+    # new leaf, so agents pinned to it keep verifying); a user-supplied
+    # CA-issued leaf is left alone with no CA at all (today's behavior:
+    # it is never regenerated); otherwise a fresh CA is generated and,
+    # when a previous leaf existed, the break is recorded so the panel
+    # can flag nodes pinned to the old CA.
+    if [ -f "$PANEL_CA_CERT" ] && [ -f "$PANEL_CA_KEY" ] \
+            && openssl x509 -in "$PANEL_CA_CERT" -noout -subject >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ -f "$PANEL_CERT" ] && [ -f "$PANEL_KEY" ] \
+            && openssl x509 -in "$PANEL_CERT" -noout -text >/dev/null 2>&1 \
+            && openssl verify -CAfile "$PANEL_CERT" "$PANEL_CERT" >/dev/null 2>&1; then
+        cp "$PANEL_CERT" "$PANEL_CA_CERT" 2>/dev/null \
+            || die "failed to adopt panel cert as panel CA"
+        cp "$PANEL_KEY" "$PANEL_CA_KEY" 2>/dev/null \
+            || die "failed to adopt panel key as panel CA key"
+        chmod 644 "$PANEL_CA_CERT"; chmod 600 "$PANEL_CA_KEY"
+        log "adopted existing panel certificate as the panel CA (leaf rotations will no longer break agent pins)"
+        return 0
+    fi
+    if [ -f "$PANEL_CERT" ] \
+            && openssl x509 -in "$PANEL_CERT" -noout -text >/dev/null 2>&1 \
+            && ! openssl verify -CAfile "$PANEL_CERT" "$PANEL_CERT" >/dev/null 2>&1; then
+        return 0
+    fi
+    log "generating panel CA certificate (CN=OpenVPN-SK5 Panel CA, 10y)..."
+    if ! openssl req -x509 -newkey rsa:2048 -keyout "$PANEL_CA_KEY" \
+            -out "$PANEL_CA_CERT" -days 3650 -nodes \
+            -subj "/CN=OpenVPN-SK5 Panel CA" 2>/dev/null; then
+        die "failed to generate panel CA certificate"
+    fi
+    chmod 600 "$PANEL_CA_KEY"; chmod 644 "$PANEL_CA_CERT"
+    if [ -f "$PANEL_CERT" ]; then
+        # The rotation is recorded by the panel itself at the first
+        # start serving this CA (panel/app.py
+        # _record_panel_ca_rotation_if_changed), not here: the record
+        # timestamp must be the go-live instant, and the panel may
+        # still serve the old leaf until it restarts.
+        log "panel CA rotated -- agents pinned to the previous CA must re-run install-agent.sh --force to re-pin"
+    fi
+    return 0
+}
 if [ -f "$PANEL_CERT" ] && [ -f "$PANEL_KEY" ]; then
     if ! _PANEL_CERT_TEXT="$(openssl x509 -in "$PANEL_CERT" -noout -text 2>/dev/null)"; then
         _PANEL_CERT_STALE=1
@@ -701,6 +789,7 @@ if [ -f "$PANEL_CERT" ] && [ -f "$PANEL_KEY" ]; then
         fi
     fi
 fi
+_ensure_panel_ca
 if [ ! -f "$PANEL_CERT" ] || [ ! -f "$PANEL_KEY" ] || [ "$_PANEL_CERT_STALE" -eq 1 ]; then
     # R42-F2-1: record the regen here, at the top of the generation
     # branch -- it fires for missing files as well as stale certs.
@@ -710,12 +799,12 @@ if [ ! -f "$PANEL_CERT" ] || [ ! -f "$PANEL_KEY" ] || [ "$_PANEL_CERT_STALE" -eq
         cp "$PANEL_CERT" "$PANEL_CERT.bak" 2>/dev/null || true
         cp "$PANEL_KEY" "$PANEL_KEY.bak" 2>/dev/null || true
     fi
-    log "generating self-signed panel TLS cert (CN=$SERVER_IP, 10y)..."
-    openssl req -x509 -newkey rsa:2048 -keyout "$PANEL_KEY" -out "$PANEL_CERT" \
-        -days 3650 -nodes -subj "/CN=$SERVER_IP" \
-        -addext "subjectAltName=IP:$SERVER_IP,IP:127.0.0.1,DNS:localhost" 2>/dev/null \
-        || die "failed to generate panel TLS cert"
-    chmod 600 "$PANEL_KEY"; chmod 644 "$PANEL_CERT"
+    if [ ! -f "$PANEL_CA_CERT" ] || [ ! -f "$PANEL_CA_KEY" ]; then
+        die "panel TLS key is missing and the certificate is user-supplied (no panel CA exists) -- restore $PANEL_KEY, or delete $PANEL_CERT to issue a fresh panel CA + certificate"
+    fi
+    log "issuing panel TLS cert from the panel CA (CN=$SERVER_IP, 10y)..."
+    _issue_panel_leaf "$PANEL_CA_CERT" "$PANEL_CA_KEY" "$PANEL_CERT" "$PANEL_KEY" "$SERVER_IP" \
+        || die "failed to issue panel TLS cert from the panel CA"
 else
     log "keeping existing panel TLS cert${_PANEL_CERT_KEEP_NOTE}"
 fi
@@ -816,6 +905,14 @@ if __name__ == "__main__":
     _ensure = getattr(panel_app, "_ensure_admin_password", None)
     if callable(_ensure):
         _ensure()
+    # R46 Fix-AH: record a panel-CA rotation at the moment this start
+    # first serves the new CA (the panel's own log, not the installer's
+    # generation time -- see panel/app.py). Defensive getattr, same as
+    # _ensure above: an older app.py without the hook must not break
+    # the launcher.
+    _record = getattr(panel_app, "_record_panel_ca_rotation_if_changed", None)
+    if callable(_record):
+        _record()
     panel_app.app.run(host="0.0.0.0", port=$PANEL_PORT, ssl_context=(CERT, KEY))
 EOF
 chmod 755 "$INSTALL_ROOT/run-panel-tls.py"
