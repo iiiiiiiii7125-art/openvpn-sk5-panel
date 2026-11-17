@@ -68,6 +68,7 @@ STUB_PY="$WORKDIR/stub.py"
 STUB_LOG="$WORKDIR/stub.log"
 STUB_PID=""
 TEST_USER="verify-$(date +%s)"
+USER_CREATED=0
 SK5_TOGGLED=0
 SK5_TOGGLE_RAN=0
 SK5_JSON_BACKED_UP=0
@@ -103,6 +104,19 @@ cleanup() {
         curl -ks --max-time 10 -b "$COOKIE_JAR" -o /dev/null \
             -X POST "$PANEL_URL/api/sk5" -H 'Content-Type: application/json' \
             -d "{\"host\": \"127.0.0.1\", \"port\": $STUB_PORT, \"username\": \"\", \"password\": \"\", \"enabled\": false}" 2>/dev/null || true
+    fi
+    # R45-L4-2: revoke the test user whenever section 7 created it and
+    # we are logged in -- independent of SK5_TOGGLED. The old gate kept
+    # the DELETE inside the SK5-restore branch, so the user was left
+    # behind when the toggle test was SKIPPED (real merchant SK5
+    # enabled, the common production case) or when section 11 disabled
+    # the chain and section 12 did not re-enable it. One orphan
+    # verify-* user per run, each a valid VPN credential.
+    # ${USER_CREATED:-1}: the script itself always initializes
+    # USER_CREATED=0 up top, so the default never fires in production;
+    # it only covers harnesses that source cleanup() without setting
+    # the flag, which model a run where section 7 created the user.
+    if [ "${USER_CREATED:-1}" -eq 1 ] && [ "$LOGGED_IN" -eq 1 ]; then
         # Revoke the test user (best effort).
         curl -ks --max-time 10 -b "$COOKIE_JAR" -o /dev/null \
             -X DELETE "$PANEL_URL/api/openvpn/users/$TEST_USER" 2>/dev/null || true
@@ -511,6 +525,7 @@ if [ "$LOGGED_IN" -eq 1 ]; then
         -w '%{http_code}' -X POST "$PANEL_URL/api/openvpn/users" \
         -H 'Content-Type: application/json' -d "{\"name\": \"$TEST_USER\"}" 2>/dev/null || true)"
     if [ "$CREATE_CODE" = "200" ] && [ "$(json_get "$WORKDIR/create.json" ok)" = "true" ]; then
+        USER_CREATED=1  # R45-L4-2: the user exists on the panel from here on; cleanup must revoke it even if the .ovpn download below fails
         OVPN_CODE="$(curl -ks --max-time 15 -b "$COOKIE_JAR" -o "$WORKDIR/test.ovpn" \
             -w '%{http_code}' "$PANEL_URL/api/openvpn/users/$TEST_USER/ovpn" 2>/dev/null || true)"
         if [ "$OVPN_CODE" = "200" ] \
