@@ -1633,14 +1633,62 @@ def _parse_status_log(log_path: Path) -> list[dict]:
     return clients
 
 
+def _pid_is_openvpn(pid: int) -> bool:
+    """Does this pid belong to an openvpn process? (R44-L5-F3)
+
+    A stale PID file pointing at an innocent pid reuser must never be
+    mistaken for our daemon: the old code trusted the number alone
+    (``os.kill(pid, 0)``), so server_status() reported a dead daemon
+    alive and stop_server() SIGTERMed whatever reused the pid. An
+    unreadable cmdline (process gone, zombie, foreign user) means
+    "not ours".
+
+    Identity is the EXECUTABLE, not a substring of the cmdline --
+    the same discipline as egress ``_pid_is_singbox`` (R41-L4-P2-4,
+    R42-F3-3). Two evidence forms count, and a bare argv[0] string
+    is neither:
+      * /proc/<pid>/exe resolves to a binary named openvpn (a
+        " (deleted)" suffix -- binary replaced while running -- is
+        stripped first); or
+      * some argv element is a PATH naming the openvpn binary
+        (basename "openvpn", with a "/"). This is the script case:
+        an openvpn launched as a script has exe == its interpreter
+        (/bin/sh), and the kernel passes the script path as an argv
+        element.
+    A bare "openvpn" argv[0] with no slash is just a claim any
+    process can make (execve lets the caller pick argv[0]); it
+    proves nothing and never counts on its own."""
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        exe = ""
+    exe_name = os.path.basename(exe)
+    if exe_name.endswith(" (deleted)"):
+        exe_name = exe_name[: -len(" (deleted)")]
+    if exe_name == "openvpn":
+        return True
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read()
+    except OSError:
+        return False
+    for part in cmdline.split(b"\0"):
+        if not part or b"/" not in part:
+            continue
+        if os.path.basename(part.decode("utf-8", "replace")) == "openvpn":
+            return True
+    return False
+
+
 def server_status(server_dir: str | Path | None = None) -> dict:
     """Report the server daemon state.
 
     Returns ``{running, unit_active, pid, clients, status_log}``.
     ``running`` is True when ``systemctl is-active`` succeeds, or -- when
-    systemd is unavailable -- when the PID file points at a live process.
-    Never raises for a stopped/missing daemon; the ``error`` key carries
-    the reason instead.
+    systemd is unavailable -- when the PID file points at a live
+    openvpn process (identity-checked, R44-L5-F3: a reused pid is
+    not our daemon). Never raises for a stopped/missing daemon; the
+    ``error`` key carries the reason instead.
     """
     server_dir = _resolve_server_dir(server_dir)
     result: dict = {
@@ -1669,8 +1717,13 @@ def server_status(server_dir: str | Path | None = None) -> dict:
     if _exists(PID_FILE):
         try:
             pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-            os.kill(pid, 0)  # raises ProcessLookupError if dead
-            result["pid"] = pid
+            # R44-L5-F3: the pid number alone proves nothing -- a
+            # stale file pointing at an innocent pid reuser used to
+            # report running=True. Identity-check first.
+            if _pid_is_openvpn(pid):
+                result["pid"] = pid
+            else:
+                pid = None
         except (ValueError, OSError):
             pid = None
     if pid is None and result["unit_active"]:
@@ -1761,7 +1814,12 @@ def stop_server(server_dir: str | Path | None = None) -> dict:
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-            os.kill(pid, 15)
+            # R44-L5-F3: only SIGTERM a pid we have identified as
+            # our daemon -- a stale file pointing at an innocent
+            # pid reuser must never be killed. The stale file is
+            # still unlinked below.
+            if _pid_is_openvpn(pid):
+                os.kill(pid, 15)
         except (ValueError, ProcessLookupError, OSError):
             pass
         try:
