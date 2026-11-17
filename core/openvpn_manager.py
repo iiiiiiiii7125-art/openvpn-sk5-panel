@@ -200,6 +200,12 @@ def init_pki(ca_dir: str | Path | None = None, force: bool = False) -> Path:
     a dir (a partial/foreign PKI, a custom cnf, a CA key without its
     cert) were destroyed without warning. ``easyrsa.sh init`` does
     the same move as a direct-call safety net.
+
+    R43-J7-4: the same move-aside covers a FILE (or symlink) sitting
+    at the pki path -- the F1-5 guard was dir-only, so easy-rsa
+    ``init-pki``'s ``rm -rf`` of the path silently destroyed the
+    file. The backup name is the same ``.pki-backup-<ts>-<pid>``
+    sibling; for a file it is a file, not a dir.
     """
     ca_dir = _resolve_ca_dir(ca_dir)
     pki = _pki_dir(ca_dir)
@@ -208,20 +214,28 @@ def init_pki(ca_dir: str | Path | None = None, force: bool = False) -> Path:
         raise OpenVPNError(
             "CA already exists at %s (pass force=True to wipe it)" % ca_crt
         )
-    if not force and pki.is_dir():
-        try:
-            leftover = any(pki.iterdir())
-        except OSError:
-            leftover = False
-        if leftover:
+    if not force and (pki.exists() or pki.is_symlink()):
+        def _move_aside(path: Path) -> None:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
             backup = ca_dir / (".pki-backup-%s-%d" % (stamp, os.getpid()))
             try:
-                os.rename(pki, backup)
+                os.rename(path, backup)
             except OSError as exc:
                 raise OpenVPNError(
-                    "cannot move aside non-empty pki dir %s: %s" % (pki, exc)
+                    "cannot move aside pki path %s: %s" % (path, exc)
                 ) from exc
+
+        if pki.is_dir():
+            try:
+                leftover = any(pki.iterdir())
+            except OSError:
+                leftover = False
+            if leftover:
+                _move_aside(pki)
+        else:
+            # R43-J7-4: file/symlink at the pki path -- move aside,
+            # never let init-pki rm -rf it.
+            _move_aside(pki)
     args = ["init", str(ca_dir)]
     if force:
         args.append("--force")
