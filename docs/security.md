@@ -48,8 +48,9 @@
 ```bash
 # 1. 编译
 python3 -m py_compile panel/app.py agent/agent.py
-# 2. 默认口令字面量零命中
-grep -rn "admin123\|changeme\|123456\|password123" panel/app.py agent/agent.py
+# 2. 默认口令字面量零命中（带 -w：agent/agent.py 的 hex 字符集
+#    "0123456789abcdef" 含 123456 子串，不带词界会误报，见上表）
+grep -rnw "admin123\|changeme\|123456\|password123" panel/app.py agent/agent.py
 # 3. Flask test-client 全流程（见 /tmp/sec-test/run_tests.py）：
 #    未登录 /api/status -> 401；错口令 5 次后第 6 次 -> 429；
 #    正确登录 -> 200 且 Set-Cookie 含 HttpOnly + SameSite=Lax；

@@ -23,6 +23,10 @@
 # The sed range-deletes in R3/R5 are the mechanical rendering of the
 # docs' hand-edit ("删 ... 段" / "删 ... 三行"); the docs give no
 # command for those edits. Exit code = number of FAILs.
+# Fragment C (R42-Fix-M): the Fix-G restart function
+# _restart_panel_if_needed + the _PANEL_WAS_ACTIVE/_PANEL_RESTARTED
+# capture, extracted from install.sh so R1/R2 assert the real restart
+# behavior instead of failing on "command not found" (O-R42-F2-2).
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -115,6 +119,14 @@ sed -n '/panel domain + reverse proxy (Caddy)/,/sing-box config/p' "$ROOT/instal
 grep -q '^_PANEL_DOMAIN=' "$TMP/fragment-b.sh"; cell "fragment B extracted (domain section)" "$?"
 sed -n '/^# R35-HELPERS-BEGIN/,/^# R35-HELPERS-END/p' "$ROOT/install.sh" > "$TMP/helpers.sh"
 [ -s "$TMP/helpers.sh" ]; cell "helper block extracted" "$?"
+# Fragment C (R42-Fix-M, O-R42-F2-2): Fix-G moved the panel restart into
+# _restart_panel_if_needed (install.sh:699), defined outside fragments A
+# and B together with the _PANEL_WAS_ACTIVE/_PANEL_RESTARTED capture
+# (install.sh:695-697). Without it the restart call in fragment B fails
+# with "command not found" (R1 FAILs, R2 passes vacuously). Extract the
+# capture + the function definition as one fragment.
+sed -n '/^_PANEL_WAS_ACTIVE=0/,/^}$/p' "$ROOT/install.sh" > "$TMP/fragment-c.sh"
+grep -q '^_restart_panel_if_needed() {' "$TMP/fragment-c.sh" && grep -q '^_PANEL_WAS_ACTIVE=0' "$TMP/fragment-c.sh"; cell "fragment C extracted (Fix-G restart fn + was-active capture)" "$?"
 
 # --- shared harness env -----------------------------------------------------
 CONFIG_DIR="$TMP/config0"; mkdir -p "$CONFIG_DIR"
@@ -129,12 +141,23 @@ log()  { echo "LOG: $*" >&2; }
 warn() { echo "WARN: $*" >&2; }
 die()  { echo "DIE: $*" >&2; exit 1; }
 # shellcheck disable=SC1090
+# Fix-G (R42-Fix-M): _restart_panel_if_needed reads $_PANEL_CERT_STALE,
+# but the cert-generation block that sets it is not extracted by this
+# probe. The runbook scenarios never regenerate the cert (dummy certs
+# stand in), so the cert reason is pinned off here; the cert-regen
+# restart path is covered by tests/r41_fix_g.py (22/22). Only the
+# domain-change reason is exercised by R1/R2.
+_PANEL_CERT_STALE=0
 source "$TMP/helpers.sh"
 run_fragments() { # run_fragments <stdin-file> -- runs A+B with given stdin
     # PANEL_CERT/PANEL_KEY are derived from the CURRENT CONFIG_DIR:
     # sections re-point CONFIG_DIR per scenario, so re-derive here.
     PANEL_CERT="$CONFIG_DIR/panel-cert.pem"; PANEL_KEY="$CONFIG_DIR/panel-key.pem"
     : > "$SYS_CALLS"
+    # Fragment C first: it (re)captures _PANEL_WAS_ACTIVE/_PANEL_RESTARTED
+    # and (re)defines _restart_panel_if_needed, once per installer run --
+    # mirroring install.sh, where the capture runs once per run.
+    source "$TMP/fragment-c.sh"
     source "$TMP/fragment-a.sh"
     source "$TMP/fragment-b.sh"
 }
