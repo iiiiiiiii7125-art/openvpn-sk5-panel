@@ -12,7 +12,7 @@
 
 ### 1.1 目标机
 
-全新 Debian 12 / Ubuntu 22.04 / 24.04，root，amd64 或 arm64。目标机须能出网（安装器下载 sing-box 1.11.15 与 tun2socks 2.7.0，均带 sha256 校验，失败即停）。
+全新 Debian 12 / Ubuntu 22.04 / 24.04，root，amd64 或 arm64。目标机须能出网（安装器下载 sing-box 1.11.15 与 tun2socks 2.7.0，均带 sha256 校验，失败即停）。**支持系统门**：不在这个清单上的系统，安装器直接报错退出（`unsupported OS`）；加 `ALLOW_UNSUPPORTED_OS=1` 可强行继续，但只警告、不保证能装——Ubuntu 20.04 不在支持之列，用该变量强行安装可能在旧版 OpenVPN/easy-rsa 上失败。
 
 ### 1.2 步骤（字段级）
 
@@ -56,11 +56,11 @@ cd /root && curl -L -o ovpn-release-1.0.2.tar.gz https://raw.githubusercontent.c
 
 可选环境变量：`OVPN_PROTO`（udp|tcp）、`OVPN_PORT`、`OVPN_SUBNET`（固定 `10.8.0.0/24`，设为其他值安装器直接拒绝）、`OVPN_DNS`（默认 `1.1.1.1`，写入 server.conf 的 `push "dhcp-option DNS …"`）。
 
-`install.sh` 会做的事（幂等，可重跑）：断言安装目标不是现存部署目录（命中 `/root/flmx-panel` 即退出，已装 FLMX 的机器不会被碰）；apt 装 openvpn、easy-rsa 等；`iptables-persistent` 只在未装 ufw 的机器上装（与 ufw 冲突，装了会卸载 ufw；ufw 机上端口走 ufw 放行、NAT/FORWARD 规则仅 live 生效，见 §6）；装 sing-box 1.11.15 与 tun2socks 2.7.0；复制 `core/`、`egress/`、`panel/`、`agent/`、`systemd/`、`verify-integration.sh` 到 `/opt/openvpn-sk5-panel/`；初始化 PKI（`/etc/openvpn/server/easy-rsa`）+ 建服务端证书 + 渲染 server.conf；写直连模式 sing-box 初始配置（`sing-box check` 通过才继续）；生成面板自签 TLS 证书；装 systemd 单元并启动 `openvpn-server@server`、`openvpn-sk5-singbox`、`openvpn-sk5-panel`；健康门禁：面板 `https://127.0.0.1:8443/api/me` 200、用初始密码登录成功、`GET /api/status` 200 才算装完，否则报错退出。
+`install.sh` 会做的事（幂等，可重跑）：断言安装目标不是现存部署目录（命中 `/root/flmx-panel` 即退出，已装 FLMX 的机器不会被碰）；apt 装 openvpn、easy-rsa 等；`iptables-persistent` 只在未装 ufw 的机器上装（与 ufw 冲突，装了会卸载 ufw；ufw 机上端口走 ufw 放行、NAT/FORWARD 规则仅 live 生效，见 §6）；装 sing-box 1.11.15 与 tun2socks 2.7.0；复制 `core/`、`egress/`、`panel/`、`agent/`、`scripts/`、`systemd/`、`verify-integration.sh` 到 `/opt/openvpn-sk5-panel/`；初始化 PKI（`/etc/openvpn/server/easy-rsa`）+ 建服务端证书 + 渲染 server.conf；写直连模式 sing-box 初始配置（`sing-box check` 通过才继续）；生成面板自签 TLS 证书；装 systemd 单元并启动 `openvpn-server@server`、`openvpn-sk5-singbox`、`openvpn-sk5-panel`；健康门禁：面板 `https://127.0.0.1:8443/api/me` 200、用初始密码登录成功、`GET /api/status` 200 才算装完，否则报错退出。
 
 ### 1.3 登录与改密（装完第一件事）
 
-- 面板地址：`https://<服务器 IP>:8443`。初始管理员密码**仅在安装完成时打印一次**，也写在 `/etc/openvpn-sk5-panel/admin.pass`（0600，root 可读）。重装不会轮换密码、CA 与服务端证书。
+- 面板地址：`https://<服务器 IP>:8443`。初始管理员密码**仅在安装完成时打印一次**，也写在 `/etc/openvpn-sk5-panel/admin.pass`（0600，root 可读）。重装不会轮换密码、CA 与服务端证书。**首次打开浏览器会提示“不安全 / 证书不受信任”，属预期**（面板证书是自签的）：点「高级」→「继续前往」即可；安装时填域名（Caddy + Let's Encrypt）可彻底消除该提示。
 - **登录后立即改密**：面板右上角「修改密码」按钮（调 `POST /api/change-password`；成功后全部旧会话作废，须重新登录）。注意：首次登录**不强制**改密（P0-3，按设计未实现），改密全靠人工第一步，不要跳过。
 - 自检：目标机上跑 `bash /opt/openvpn-sk5-panel/verify.sh`（24 项检查，逐项 PASS/FAIL/SKIP）。已在面板里填了真实 SK5 也不怕：SK5 已启用时切换测试（sk5-toggle / sk5-egress-ip / sk5-disable）自动 SKIP，什么都不改；只有显式设 `VERIFY_ALLOW_OVERWRITE_SK5=1` 才会强制跑切换测试，跑之前脚本先备份 `sk5.json` 与 `sing-box.json`、退出时原样恢复，无须事后重填 SK5。失败路径例外：清理失败时文件故意不恢复（大声 FAIL，链路诚实保持禁用，备份留在工作目录供人工恢复）。verify.sh 还会留下 `verify-*` 测试用户（脚本只建不删），属测试残留，面板行为本身正常。
 
@@ -159,7 +159,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 
 ## 7. 升级与备份
 
-- **升级**：把新版发布包传到服务器、解包、默认重跑 `bash install.sh`（无任何 flag）。重跑不销毁线上 `panel.db`（R8-BUG-1 已修，并经 live-9 至 live-21 共十三轮毒树默认重跑行级终验：admin/nodes/queue 行级一致，audit 仅增合法登录行）。重装不会轮换密码、CA 与服务端证书。
+- **升级**：把新版发布包传到服务器、解包、默认重跑 `bash install.sh`（无任何 flag）。重跑不销毁线上 `panel.db`（R8-BUG-1 已修，并经 live-9 至 live-21 共十三轮毒树默认重跑行级终验：admin/nodes/queue 行级一致，audit 仅增合法登录行）。重装不会轮换密码、CA、面板会话密钥与服务端证书。
 - **升级前备份**（必做）：`cp -a /opt/openvpn-sk5-panel/panel/data /root/panel-data-backup-$(date +%Y%m%d)`。`panel/data/` 内含 `panel.db`（管理员、节点、审计）与 `agent_queue.json`（命令队列，内含 SK5 明文密码与 .ovpn 私钥回执）——备份文件本身须按凭据保管，不要外发。
 - **回滚**：升级出问题时停面板服务，把备份的 `panel/data/` 拷回 `/opt/openvpn-sk5-panel/panel/data/`，重起 `openvpn-sk5-panel` 服务。
 
@@ -180,7 +180,8 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 
 发布包：`releases/ovpn-release-1.0.2.tar.gz`（顶层目录 `openvpn-sk5-panel/`）。包内清单（97 个文件；不含 `tests/`、`__pycache__`、`*.pyc`、`.gitignore`、`cloudflare/.wrangler`、`panel/data/` 内一切运行时文件）：
 
-- 顶层：`install.sh`、`verify.sh`、`verify-integration.sh`（29 格门禁，见下）、`README.md`
+- 顶层：`install.sh`、`verify.sh`、`verify-integration.sh`（30 格门禁，见下；R41 起新增 0 号凭据扫描格）、`README.md`
+- `scripts/`（R41 新增，下个发布包起）：`check-no-secrets.sh`、`git-hooks/pre-push`（凭据扫描，见 §9 末）
 - `panel/`：`app.py`、`requirements.txt`、`README.md`、`templates/index.html`、`static/contrast-check.py`
 - `core/`：`openvpn_manager.py`、`easyrsa.sh`、`server.conf.template`、`client.ovpn.template`、`README.md`、`tests/test_status_log.py`
 - `agent/`：`agent.py`、`install-agent.sh`、`ovpn-agent.service`、`README.md`
@@ -203,7 +204,9 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 | verify-integration.sh | `2d110ff4ffec` |
 | verify.sh | `e36fc2003503` |
 
-核对方法（本机）：`sha256sum -c releases/ovpn-release-1.0.2.tar.gz.sha256`；解包后 `tar tzf releases/ovpn-release-1.0.2.tar.gz | wc -l` 应为 97 个文件 + 目录条目。门禁：`bash verify-integration.sh` 应为 `PASS=29 FAIL=0 SKIP=0`（29 格，含 §7 哈希钉死两层；脚本用固定 `/tmp/ovpn-int-test`＋8443 端口，须串行跑）。
+核对方法（本机）：`sha256sum -c releases/ovpn-release-1.0.2.tar.gz.sha256`；解包后 `tar tzf releases/ovpn-release-1.0.2.tar.gz | wc -l` 应为 97 个文件 + 目录条目。门禁：`bash verify-integration.sh` 应为 `PASS=30 FAIL=0 SKIP=0`（30 格，含 §7 哈希钉死两层；脚本用固定 `/tmp/ovpn-int-test`＋8443 端口，须串行跑）。§9 的关键文件哈希表是 1.0.2 发布快照（与 live-21 的树一致），改动文件的哈希在打包时按 R34 §6 惯例刷新，不随每次修复提交改。
+
+**凭据扫描（R41-L7-P2-3，强制门禁）**：`scripts/check-no-secrets.sh` 检查已追踪文件是否含凭据——敏感文件名（`secret.key` / `admin.pass` / `panel.db` / `sk5.json` / `agent_queue.json`）、`panel/data/` 内文件、已发货密钥的 SHA-256（`panel/app.py` 的 tripwire 值，定义处除外）、私钥 PEM 块（`tests/r17_core.py` 的 FAKE 夹具除外）、发布包内凭据条目；只报文件路径，不打印匹配内容。两个执行点：① `verify-integration.sh` 的 0 号格（计入 30 格，跑在 venv 之前）；② pre-push hook（每 clone 装一次：`cp scripts/git-hooks/pre-push .git/hooks/pre-push`，或 `git config core.hooksPath scripts/git-hooks`）。
 
 ## 10. 审计与真机证据索引
 
