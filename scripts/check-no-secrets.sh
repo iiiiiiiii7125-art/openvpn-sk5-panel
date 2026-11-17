@@ -11,6 +11,12 @@
 #   1. sensitive filenames: secret.key, admin.pass, panel.db, sk5.json,
 #      agent_queue.json, ta.key (in any directory), or anything under
 #      panel/data/;
+#
+# NOTE (R46-L6-2): git mode reads the INDEX (git ls-files /
+# git grep --cached) -- an untracked file is invisible to this scan.
+# The gate counts only post-commit: commit first, then run the gate.
+# (Fix-F / Fix-X lesson: a pre-commit gate run cannot see the file
+# under test, so a passing pre-commit scan proves nothing.)
 #   2. the shipped secret's SHA-256 (the panel/app.py tripwire value)
 #      appearing anywhere except the tripwire definition itself and this
 #      script's own detector value below (both are detectors, not secrets);

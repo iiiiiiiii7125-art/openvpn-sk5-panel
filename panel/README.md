@@ -32,13 +32,13 @@ python3 app.py
 | POST `/api/logout` | — | `ok` |
 | GET `/api/me` | — | `ok, admin: bool` |
 | GET `/api/status` | — | `openvpn{running, online_users, port, proto, subnet: "10.8.0.0/24", dns: "1.1.1.1", unit_active, pid, error?, detail}, sk5{enabled, host, port, error?}, egress{ip, latency_ms, via_sk5, error?}, modules_missing[]` |
-| POST `/api/openvpn/server` | `port: int(1-65535)（可省，UDP 默认 1194 / TCP 默认 443）, proto: "udp"\|"tcp"` | `server{proto, port, conf_path, subnet, dns, note}`；子网/DNS 由 core 固定，改配置后需重启服务生效 |
+| POST `/api/openvpn/server` | `port: int(1-65535)（可省，UDP 默认 1194 / TCP 默认 443）, proto: "udp"\|"tcp", server_ip?: string（.ovpn 的 remote，留空=自动探测公网 IP；填了须为 IP 或主机名，否则 400）` | `server{proto, port, conf_path, subnet, dns, server_ip, remote_warning, note}`；server_ip 为生效值（已存值或自动探测）；子网/DNS 由 core 固定，改配置后需重启服务生效 |
 | POST `/api/openvpn/start` | — | `result`（`server_status()` 返回值原样） |
 | POST `/api/openvpn/stop` | — | `result` |
 | POST `/api/openvpn/restart` | — | `result` |
 | GET `/api/openvpn/users` | — | `users: [{name, status: valid\|revoked\|expired, revoked: bool, online: bool, expires, serial, legacy}]`（`legacy: true` = 旧版 CN=OpenVPN-CA 存量证书，见下节迁移说明） |
 | POST `/api/openvpn/users` | `name: string（core 规则 `[a-zA-Z0-9_-]{1,32}`）` | `user{name, status: "valid"}, ovpn_url`（建完前端自动打开该地址下载 `.ovpn`） |
-| DELETE `/api/openvpn/users/<name>` | — | `result{name, status, crl}, needs_restart: false, restarted: true`（面板在吊销成功后自动重启 OpenVPN 服务一次，CRL 立即生效，无须手动重启；重启失败时返回 500 + `needs_restart: true`） |
+| DELETE `/api/openvpn/users/<name>` | — | `result{name, status, crl}, needs_restart: false, restarted: true`（服务正在运行时，面板在吊销成功后自动重启 OpenVPN 服务一次，CRL 立即生效；服务停着时不重启，返回 `restarted: false`，吊销在服务下次启动时生效；重启失败时返回 500 + `needs_restart: true`） |
 | GET `/api/openvpn/users/<name>/ovpn` | — | `.ovpn` 文件下载（`Content-Disposition: attachment`），证书文件缺失返回 404 JSON |
 | GET `/api/sk5` | — | `sk5{host, port, username, has_password, enabled, fail_open, udp_over_tcp, singbox_running, policy_routing_active, vpn_net, egress_ip}`（不回显密码） |
 | POST `/api/sk5` | `host: string, port: int(1-65535), username: string, password: string, enabled: bool, fail_open?: bool, udp_over_tcp?: bool, clear_password?: bool` | `sk5`（`get_status()` 原样）；`enabled=true` 时立即应用（起 sing-box + 策略路由）。密码语义：`password` 缺失/空串 = 保留已有密码，只有非空才覆盖；清密码须同时传 `clear_password: true` |
@@ -100,7 +100,7 @@ SK5 启用时复用 `get_status()` 已探到的 `egress_ip`，直连探针与
 - 生产部署建议在反代后加 HTTPS，面板本身只监听 8443 明文端口。
 - 改密入口：顶栏「修改密码」按钮（`POST /api/change-password`），
   前端先校验新密码强度（≥12 字符、含字母和数字、UTF-8 不超过 72 字节、与旧密码不同、
-  两次输入一致），改后全部旧会话作废、页面回到登录页。（仅服务器 Flask 模式；Cloudflare 模式下该按钮调接口回 501 并明示线下改密方法，见 README:284。）
+  两次输入一致），改后全部旧会话作废、页面回到登录页。（仅服务器 Flask 模式；Cloudflare 模式下该按钮调接口回 501 并明示线下改密方法，见 README:293。）
 - 旧证书迁移（R2-P1-3）：修复前签发的用户证书 CN 都是 `OpenVPN-CA`
   （BUG-7），面板按序列号识别用户（见 core/README.md）：用户列表
   正常显示，带「旧证书」标记；吊销按用户名正常工作；重建同名用户
