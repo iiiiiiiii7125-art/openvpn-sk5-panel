@@ -93,11 +93,16 @@ TA_KEY = (b"-----BEGIN " + b"OpenVPN Static key V1-----\n"
           + b"0123456789abcdef" * 4 + b"\n"
           + b"-----END " + b"OpenVPN Static key V1-----\n")
 
-# S1/S2/S4: check-3 coverage matrix (control S4 must pass).
+# S1/S2/S2b/S4: check-3 coverage matrix (control S4 must pass).
+# R45-L3-3: S2 plants the static-key block in a benign-named file so
+# it isolates check 3; S2b plants benign content in ta.key so it
+# isolates check 1's filename entry.
 check("S1 scan flags ENCRYPTED PRIVATE KEY (F6-1)",
       plant_and_scan("enc.pem", enc_pem) == 1)
-check("S2 scan flags OpenVPN static key ta.key (F6-1)",
-      plant_and_scan("ta.key", TA_KEY) == 1)
+check("S2 scan flags OpenVPN static key in benign-named file (F6-1, check 3)",
+      plant_and_scan("notes.txt", TA_KEY) == 1)
+check("S2b scan flags ta.key by filename alone (check 1)",
+      plant_and_scan("ta.key", b"nothing secret here\n") == 1)
 check("S4 scan flags plain RSA private key (control)",
       plant_and_scan("id_rsa.pem", plain_pem) == 1)
 

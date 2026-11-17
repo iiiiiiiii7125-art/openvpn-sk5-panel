@@ -6,10 +6,17 @@ logic), negative-controlled against baseline 88b5891 (every defect
 cell FAILs there, every guard cell passes there):
 
   S1  scan flags ENCRYPTED PRIVATE KEY (F6-1; via tests/r42_f6_security.py)
-  S2  scan flags OpenVPN static key ta.key (F6-1; same)
+  S2  scan flags OpenVPN static key in a benign-named file (F6-1,
+      check 3 -- R45-L3-3: planted in notes.txt so ONLY check 3 can
+      flag it; the old ta.key name let check 1 flag it by filename)
+  S2b scan flags ta.key by filename alone (check 1 -- keeps the
+      filename half now that S2 no longer plants that name)
   S3  scan passes a clean non-git tree in disk mode (F6-2; same)
   S4  scan flags plain RSA private key (control; same)
-  S5  scan flags a release tarball listing ta.key (F6-1, check 4)
+  S5  scan flags a release tarball listing ta.key (F6-1, check 4 --
+      R45-L3-4: tarball source lives OUTSIDE the scan target, so only
+      the tarball entry can trigger; the old in-target pkg/ta.key let
+      check 1 flag the loose file instead)
   S6  scan passes a release tarball with only benign entries (control)
   P1  _pid_is_singbox rejects a sleep with argv[0]="sing-box"
       (F3-3; via tests/r42_f3_pid.py -- that probe exits 0 iff the
@@ -128,8 +135,17 @@ def scan_cells():
               + b"-----END " + b"OpenVPN Static key V1-----\n")
     check("S1 scan flags ENCRYPTED PRIVATE KEY (F6-1)",
           plant_and_scan("enc.pem", enc_pem) == 1)
-    check("S2 scan flags OpenVPN static key ta.key (F6-1)",
-          plant_and_scan("ta.key", ta_key) == 1)
+    # R45-L3-3: S2 must isolate check 3's static-key pattern -- the
+    # block is planted in a benign-named file, so ONLY check 3 can
+    # flag it (the old ta.key name let check 1 flag it by filename
+    # alone, and the cell stayed green with check 3 removed).
+    check("S2 scan flags OpenVPN static key in benign-named file (F6-1, check 3)",
+          plant_and_scan("notes.txt", ta_key) == 1)
+    # S2b keeps the check-1 half: a ta.key file with benign content
+    # is flagged by filename alone -- this is what guards check 1's
+    # ta.key entry now that S2 no longer plants that name.
+    check("S2b scan flags ta.key by filename alone (check 1)",
+          plant_and_scan("ta.key", b"nothing secret here\n") == 1)
     check("S4 scan flags plain RSA private key (control)",
           plant_and_scan("id_rsa.pem", plain_pem) == 1)
     # S3: disk-mode parity -- a plain copy (no .git at all) must scan
@@ -143,6 +159,10 @@ def scan_cells():
           r.returncode == 0,
           r.stderr.strip().splitlines()[-1] if r.stderr else "")
     # S5/S6: check 4 -- release tarballs listing a sensitive entry.
+    # R45-L3-4: the tarball source dir lives OUTSIDE the scan target,
+    # so only the tarball entry itself can trigger check 4 (the old
+    # layout kept the loose pkg/ta.key inside the target, and check 1
+    # flagged it -- S5 stayed green with check 4 removed).
     for name, entries, want_rc, label in (
             ("S5 scan flags tarball listing ta.key (F6-1, check 4)",
              {"ta.key": ta_key, "README.md": b"docs\n"}, 1, "ta.key"),
@@ -152,13 +172,13 @@ def scan_cells():
         t = tempfile.mkdtemp(prefix="r42fixl-tar-")
         rel = os.path.join(t, "releases")
         os.makedirs(rel)
-        src = os.path.join(t, "pkg")
-        os.makedirs(src)
+        src = tempfile.mkdtemp(prefix="r42fixl-tarsrc-")
         for fn, content in entries.items():
             with open(os.path.join(src, fn), "wb") as f:
                 f.write(content)
         tar = os.path.join(rel, "ovpn-release-test.tar.gz")
         run(["tar", "czf", tar, "-C", src, "."] , check=True)
+        shutil.rmtree(src, ignore_errors=True)
         r = run(["bash", SCAN, t])
         check(name, r.returncode == want_rc,
               "rc=%s (%s)" % (r.returncode, label))
