@@ -148,6 +148,24 @@ _SHIPPED_SECRET_SHA256 = (
     "484fec07e813e9b9e57548d1992ce6767326fd8a82cfddd6fe0c595f93d7d5a5")
 
 
+def _atomic_write_secret(key):
+    """Write the panel secret atomically: a kill / power loss
+    between open() and write() must never leave a 0-byte
+    secret.key behind (R45-L6-1: a 0-byte file locks the admin out
+    with a bare 500 and nothing naming the file)."""
+    tmp = SECRET_PATH + ".tmp.%d" % os.getpid()
+    with open(tmp, "wb") as f:
+        f.write(key)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SECRET_PATH)
+
+
+# Panel-generated keys are exactly 32 bytes (secrets.token_bytes(32)).
+# Anything shorter is corrupt or hand-made and below the panel's own
+# contract -- never silently accepted (R45-L6-1).
+_MIN_SECRET_LEN = 32
+
+
 def _load_or_create_secret():
     parent = os.path.dirname(SECRET_PATH)
     try:
@@ -157,12 +175,26 @@ def _load_or_create_secret():
     if os.path.exists(SECRET_PATH):
         with open(SECRET_PATH, "rb") as f:
             key = f.read()
+        if len(key) < _MIN_SECRET_LEN:
+            # R45-L6-1: an empty file (interrupted install/re-run
+            # left a 0-byte key) 500s every login with nothing naming
+            # the file, and a short key is used as-is below contract.
+            # Regenerate LOUDLY: no session can exist under an empty
+            # key (Flask refuses to open any session without one), so
+            # regeneration loses nothing there; under a short key it
+            # logs every session out once -- the same consequence as
+            # the shipped-key rotation below, and the only safe
+            # answer for a weak key.
+            key = secrets.token_bytes(32)
+            _atomic_write_secret(key)
+            print("WARNING: secret.key %s 为空或不足 %d 字节，已重新生成；"
+                  "所有已登录会话已失效，请重新登录"
+                  % (SECRET_PATH, _MIN_SECRET_LEN), flush=True)
+            return key
         if (len(key) == 32 and hashlib.sha256(key).hexdigest()
                 == _SHIPPED_SECRET_SHA256):
             key = secrets.token_bytes(32)
-            with open(SECRET_PATH, "wb") as f:
-                f.write(key)
-            os.chmod(SECRET_PATH, 0o600)
+            _atomic_write_secret(key)
             print("WARNING: 检测到发货自带的 secret.key（已公开），"
                   "已强制轮换，旧值作废", flush=True)
             return key
@@ -172,9 +204,7 @@ def _load_or_create_secret():
             pass
         return key
     key = secrets.token_bytes(32)
-    with open(SECRET_PATH, "wb") as f:
-        f.write(key)
-    os.chmod(SECRET_PATH, 0o600)
+    _atomic_write_secret(key)
     return key
 
 

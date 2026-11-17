@@ -261,42 +261,55 @@ def _validate(host: str, port: int) -> None:
         raise ValueError("port must be an integer 1-65535")
 
 
-def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+def _run(cmd: list[str], timeout: int = 30, errors: str = "strict") -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          timeout=timeout, errors=errors)
 
 
 # ---------------------------------------------------------------- sing-box
 
-def _render_singbox_config(cfg: dict) -> Path:
-    """Render the template with the stored SK5 credential.
-
-    Placeholders __SK5_HOST__ / __SK5_PORT__ / __SK5_USER__ /
-    __SK5_PASS__ are replaced; the udp_over_tcp line is set from the
-    stored switch. Empty username/password keys are dropped entirely
-    (some merchants run auth-free SOCKS5; sing-box rejects empty
-    strings there). Lines starting with '#' in the template are
-    comments and are stripped before writing.
-    """
+def _load_template() -> dict:
+    """Parse the sing-box template to a dict, substituting INERT
+    values for the credential placeholders so it parses. The real
+    credential values are then set STRUCTURALLY on the parsed dict
+    by the render functions -- never string-substituted into JSON
+    text (R45-L6-2: a quote or backslash in a merchant credential
+    broke rendering, and a crafted host silently flipped the
+    bought-sk5 outbound to direct via duplicate-key last-wins)."""
     if not TEMPLATE.exists():
         raise RuntimeError(f"template not found: {TEMPLATE}")
     text = TEMPLATE.read_text(encoding="utf-8")
     lines = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
     text = "\n".join(lines) + "\n"
-    text = text.replace("__SK5_HOST__", cfg["host"])
-    text = text.replace("__SK5_PORT__", str(int(cfg["port"])))
-    text = text.replace("__SK5_USER__", cfg.get("username", ""))
-    text = text.replace("__SK5_PASS__", cfg.get("password", ""))
-    text = text.replace(
-        '"udp_over_tcp": false',
-        '"udp_over_tcp": %s' % ("true" if cfg.get("udp_over_tcp") else "false"),
-    )
-    rendered = json.loads(text)  # fail fast on bad JSON, before check
-    # Drop empty auth keys so auth-free merchants validate cleanly.
+    text = text.replace("__SK5_HOST__", "127.0.0.1")
+    text = text.replace("__SK5_PORT__", "1")
+    text = text.replace("__SK5_USER__", "")
+    text = text.replace("__SK5_PASS__", "")
+    return json.loads(text)
+
+
+def _render_singbox_config(cfg: dict) -> Path:
+    """Render the template with the stored SK5 credential.
+
+    Credential values are set on the parsed template dict, so any
+    string is safe: json.dumps escapes quotes/backslashes, and no
+    crafted value can add, rename, or flip a key. Empty
+    username/password keys are dropped entirely (some merchants run
+    auth-free SOCKS5; sing-box rejects empty strings there).
+    """
+    rendered = _load_template()
     for outbound in rendered.get("outbounds", []):
         if outbound.get("tag") == "bought-sk5":
-            if not cfg.get("username"):
+            outbound["server"] = cfg["host"]
+            outbound["server_port"] = int(cfg["port"])
+            outbound["udp_over_tcp"] = bool(cfg.get("udp_over_tcp"))
+            if cfg.get("username"):
+                outbound["username"] = cfg["username"]
+            else:
                 outbound.pop("username", None)
-            if not cfg.get("password"):
+            if cfg.get("password"):
+                outbound["password"] = cfg["password"]
+            else:
                 outbound.pop("password", None)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(RENDERED_CONFIG, json.dumps(rendered, indent=2) + "\n")
@@ -315,18 +328,7 @@ def _render_direct_config() -> Path:
     a disable that only stops it leaves direct mode with no tun1
     and no panel path to bring sing-box back.
     """
-    if not TEMPLATE.exists():
-        raise RuntimeError(f"template not found: {TEMPLATE}")
-    text = TEMPLATE.read_text(encoding="utf-8")
-    lines = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
-    text = "\n".join(lines) + "\n"
-    # Placeholders are never used in direct mode (the outbound is
-    # dropped below); substitute inert values so json.loads works.
-    text = text.replace("__SK5_HOST__", "127.0.0.1")
-    text = text.replace("__SK5_PORT__", "1")
-    text = text.replace("__SK5_USER__", "")
-    text = text.replace("__SK5_PASS__", "")
-    rendered = json.loads(text)  # fail fast on bad JSON, before check
+    rendered = _load_template()
     rendered["outbounds"] = [
         o for o in rendered.get("outbounds", []) if o.get("tag") != "bought-sk5"
     ]
@@ -534,7 +536,16 @@ def _remove_policy() -> None:
 # ---------------------------------------------------------------- probes
 
 def _curl_via_sk5(cfg: dict, url: str, timeout: int = TIMEOUT) -> tuple[bool, str | None, float]:
-    """TCP probe: real HTTP GET through the SOCKS5. Returns (ok, ip, ms)."""
+    """TCP probe: real HTTP GET through the SOCKS5. Returns (ok, ip, ms).
+
+    Decodes defensively (errors="replace", R45-L6-4): a proxy
+    returning a non-UTF-8 200 body (e.g. a GBK error page) used to
+    raise UnicodeDecodeError out of test_sk5() / get_status() /
+    check_health(). A probe must return a verdict, never raise on
+    undecodable output -- the body here is only ever read as the
+    first line (the egress IP), and a non-IP body was already
+    returned verbatim before this change.
+    """
     cmd = [
         "curl", "-sS", "--max-time", str(timeout),
         "--socks5-hostname", f"{cfg['host']}:{int(cfg['port'])}",
@@ -543,7 +554,7 @@ def _curl_via_sk5(cfg: dict, url: str, timeout: int = TIMEOUT) -> tuple[bool, st
         cmd += ["--proxy-user", f"{cfg.get('username')}:{cfg.get('password', '')}"]
     cmd += [url]
     start = time.monotonic()
-    proc = _run(cmd, timeout=timeout + 5)
+    proc = _run(cmd, timeout=timeout + 5, errors="replace")
     elapsed_ms = (time.monotonic() - start) * 1000.0
     if proc.returncode != 0:
         return False, None, elapsed_ms
