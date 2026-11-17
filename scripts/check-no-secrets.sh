@@ -9,11 +9,13 @@
 #
 # What it checks (tracked files = what would be pushed):
 #   1. sensitive filenames: secret.key, admin.pass, panel.db, sk5.json,
-#      agent_queue.json (in any directory), or anything under panel/data/;
+#      agent_queue.json, ta.key (in any directory), or anything under
+#      panel/data/;
 #   2. the shipped secret's SHA-256 (the panel/app.py tripwire value)
 #      appearing anywhere except the tripwire definition itself and this
 #      script's own detector value below (both are detectors, not secrets);
-#   3. PEM private-key blocks, except the documented fake fixture in
+#   3. PEM private-key blocks -- including ENCRYPTED PRIVATE KEY blocks
+#      and OpenVPN static keys -- except the documented fake fixture in
 #      tests/r17_core.py (a PEM header line plus a single "FAKE" body
 #      line, not a real key);
 #   4. release tarballs listing a sensitive entry (a shipped package must
@@ -42,7 +44,13 @@ if git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
     _grep() { git -C "$TARGET" grep -l --cached -e "$1" -- . 2>/dev/null || true; }
 else
     _FILES="$(cd "$TARGET" && find . -path ./.git -prune -o -type f -print | sed 's|^\./||')"
-    _grep() { (cd "$TARGET" && grep -rIl -e "$1" --exclude-dir=.git . 2>/dev/null || true); }
+    # R42-F6-2: grep prints "./"-prefixed paths for the "." target,
+    # but the check-2/check-3 exemptions below match bare paths
+    # (panel/app.py, tests/r17_core.py) -- the same values git mode
+    # yields. Strip the prefix here so both modes speak the same
+    # language; without it a clean non-git tree false-positives on
+    # this script and the fake fixture.
+    _grep() { (cd "$TARGET" && grep -rIl -e "$1" --exclude-dir=.git . 2>/dev/null | sed 's|^\./||' || true); }
 fi
 
 # --- 1. sensitive filenames -------------------------------------------
@@ -50,7 +58,7 @@ while IFS= read -r _f; do
     [ -n "$_f" ] || continue
     _base="${_f##*/}"
     case "$_base" in
-        secret.key|admin.pass|panel.db|sk5.json|agent_queue.json)
+        secret.key|admin.pass|panel.db|sk5.json|agent_queue.json|ta.key)
             fail "sensitive filename tracked: $_f" ;;
     esac
     case "$_f" in
@@ -77,6 +85,12 @@ EOF
 # Exempted: tests/r17_core.py (a PEM header line plus a single "FAKE"
 # body line, not a real key). NOTE: do not quote a PEM header literally
 # in a comment in this script -- check 3 would match this file itself.
+# R42-F6-1: ENCRYPTED PRIVATE KEY blocks (openssl pkcs8 -topk8) and
+# OpenVPN static keys are private-key material too, and were missed.
+# The static-key header is built by concatenation below so this script
+# never contains the literal header (check 3 would flag this file
+# itself -- Fix-F2 lesson).
+_TA_BEGIN='-----BEGIN '"OpenVPN Static key V1-----"
 while IFS= read -r _f; do
     [ -n "$_f" ] || continue
     case "$_f" in
@@ -84,7 +98,7 @@ while IFS= read -r _f; do
     esac
     fail "private-key PEM block: $_f"
 done <<EOF
-$(_grep '-----BEGIN \(RSA \|EC \|OPENSSH \|DSA \)\?PRIVATE KEY-----')
+$(_grep '-----BEGIN \(RSA \|EC \|OPENSSH \|DSA \|ENCRYPTED \)\?PRIVATE KEY-----'; _grep "$_TA_BEGIN")
 EOF
 
 # --- 4. release tarballs must not list a sensitive entry --------------
@@ -94,7 +108,7 @@ for _t in "$TARGET"/releases/*.tar.gz; do
         case "$_e" in */) continue ;; esac  # bare dir entry (e.g. an empty panel/data/) carries no secret
         _b="${_e##*/}"
         case "$_b" in
-            secret.key|admin.pass|panel.db|sk5.json|agent_queue.json) echo "$_e" ;;
+            secret.key|admin.pass|panel.db|sk5.json|agent_queue.json|ta.key) echo "$_e" ;;
         esac
         case "$_e" in
             */panel/data/*|panel/data/*) echo "$_e" ;;

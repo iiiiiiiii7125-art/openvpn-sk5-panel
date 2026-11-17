@@ -651,6 +651,12 @@ PANEL_KEY="$CONFIG_DIR/panel-key.pem"
 # user-supplied CA-issued cert) is left alone, and an unparseable cert
 # is treated as stale (regenerated, backup first) rather than kept.
 _PANEL_CERT_STALE=0
+# R42-F2-1: whether this run actually ISSUED a new panel cert. The
+# generation block below fires for a stale cert AND for missing
+# cert/key files, but only the stale paths set _PANEL_CERT_STALE --
+# a missing-file regen left the panel unrestarted (same LIVE-R41-1
+# 502, narrower trigger). _restart_panel_if_needed keys on this flag.
+_PANEL_CERT_REGEN=0
 _PANEL_CERT_KEEP_NOTE=""
 if [ -f "$PANEL_CERT" ] && [ -f "$PANEL_KEY" ]; then
     if ! _PANEL_CERT_TEXT="$(openssl x509 -in "$PANEL_CERT" -noout -text 2>/dev/null)"; then
@@ -664,6 +670,9 @@ if [ -f "$PANEL_CERT" ] && [ -f "$PANEL_KEY" ]; then
     fi
 fi
 if [ ! -f "$PANEL_CERT" ] || [ ! -f "$PANEL_KEY" ] || [ "$_PANEL_CERT_STALE" -eq 1 ]; then
+    # R42-F2-1: record the regen here, at the top of the generation
+    # branch -- it fires for missing files as well as stale certs.
+    _PANEL_CERT_REGEN=1
     if [ "$_PANEL_CERT_STALE" -eq 1 ]; then
         log "existing panel TLS cert lacks IP:127.0.0.1 in SANs -- regenerating (old pair kept as .bak)"
         cp "$PANEL_CERT" "$PANEL_CERT.bak" 2>/dev/null || true
@@ -688,19 +697,31 @@ fi
 # whether the panel is already running now, before this run touches
 # any service; the restart itself happens via _restart_panel_if_needed
 # below, only when the cert was actually regenerated
-# (_PANEL_CERT_STALE) or the proxy env vars changed. A fresh install
-# never regenerates (_PANEL_CERT_STALE stays 0) and an inactive panel
-# is started fresh with the new cert by `enable --now` below, so
-# neither case restarts.
+# (_PANEL_CERT_REGEN: stale-SAN/unparseable certs AND missing
+# cert/key files -- R42-F2-1: the missing-file path regenerates with
+# _PANEL_CERT_STALE still 0) or the proxy env vars changed. A fresh
+# install regenerates too, but the panel was never running so there
+# is nothing to restart (it is started fresh with the new cert by
+# `enable --now` below); an inactive panel likewise.
+# R42-F1-7: the reload below is safe against the regen only because
+# the Caddy copy is a dual-trust bundle (old+new) until the panel
+# restarts -- see the copy step in the domain section and the prune
+# after the restart call. A plain reorder (restart before reload)
+# would NOT remove the window: it would only move it, because Caddy
+# still trusts only the OLD cert in memory until it reloads.
 _PANEL_WAS_ACTIVE=0
 systemctl is-active --quiet openvpn-sk5-panel 2>/dev/null && _PANEL_WAS_ACTIVE=1
 _PANEL_RESTARTED=0
 
 _restart_panel_if_needed() { # _restart_panel_if_needed <domain-changed-0/1>
     # Restart the panel when it must pick up new state: its TLS cert
-    # was regenerated (_PANEL_CERT_STALE), or the proxy env vars
-    # changed ($1). The panel reads panel.env and its TLS cert at
-    # start only. No-op when nothing changed, when the panel was not
+    # was regenerated (_PANEL_CERT_REGEN, or _PANEL_CERT_STALE --
+    # stale always implies a regen in the real script, and the
+    # Fix-G probe harness drives this function with STALE alone, so
+    # both trigger; ${...:-0} keeps this safe under `set -u` for
+    # harnesses that never set REGEN), or the proxy env vars changed
+    # ($1). The panel reads panel.env and its TLS cert at start
+    # only. No-op when nothing changed, when the panel was not
     # running before this run (it is started fresh below with the new
     # state), when it is not running now, or when this run already
     # restarted it (idempotent: one restart per run at most, so the
@@ -712,7 +733,7 @@ _restart_panel_if_needed() { # _restart_panel_if_needed <domain-changed-0/1>
     if [ "$_domain_changed" -eq 1 ]; then
         _reason="proxy env vars changed"
     fi
-    if [ "$_PANEL_CERT_STALE" -eq 1 ]; then
+    if [ "$_PANEL_CERT_STALE" -eq 1 ] || [ "${_PANEL_CERT_REGEN:-0}" -eq 1 ]; then
         _reason="${_reason:+$_reason; }panel TLS cert regenerated"
     fi
     [ -n "$_reason" ] || return 0
@@ -1069,12 +1090,37 @@ if [ -n "$_PANEL_DOMAIN" ]; then
         # files). Best-effort here like the cert copy below: if the
         # chmod fails, validate-as-caddy still catches it loudly.
         chmod 755 /etc/caddy 2>/dev/null || true
+        # R42-F1-7: dual-trust through a cert rotation. Caddy loads
+        # its trusted CA pool at reload; if this run regenerated the
+        # panel cert, a reload trusting only the NEW cert 502s every
+        # domain request until the panel restarts (it still serves
+        # the OLD cert from memory). Restarting first does NOT fix
+        # it -- it only moves the window, because Caddy still trusts
+        # only the OLD cert in memory until it reloads. So when a
+        # regen happened, keep the previous copy alongside the new
+        # one: Caddy trusts old+new through the transition, and the
+        # bundle is pruned to new-only right after the restart call
+        # below. No regen -> the copy is a single cert as before
+        # (which also collapses any bundle a previous run left
+        # behind unpruned).
+        _CADDY_BUNDLE=0
         if [ -f "$PANEL_CERT" ]; then
+            _OLD_COPY_TMP=""
+            if [ "${_PANEL_CERT_REGEN:-0}" -eq 1 ] && [ -f "$_CADDY_PANEL_CERT" ]; then
+                _OLD_COPY_TMP="$(mktemp)"
+                cp "$_CADDY_PANEL_CERT" "$_OLD_COPY_TMP" 2>/dev/null || _OLD_COPY_TMP=""
+            fi
             if install -m 0644 "$PANEL_CERT" "$_CADDY_PANEL_CERT" 2>/dev/null; then
                 log "copied panel cert for Caddy: $_CADDY_PANEL_CERT"
+                if [ -n "$_OLD_COPY_TMP" ] && ! cmp -s "$_OLD_COPY_TMP" "$_CADDY_PANEL_CERT"; then
+                    cat "$_OLD_COPY_TMP" >> "$_CADDY_PANEL_CERT"
+                    _CADDY_BUNDLE=1
+                    log "Caddy trusts old+new panel certs until the panel restarts (dual-trust rotation)"
+                fi
             else
                 warn "failed to copy $PANEL_CERT to $_CADDY_PANEL_CERT -- Caddy may fail to start (cannot read the panel CA cert)"
             fi
+            [ -n "$_OLD_COPY_TMP" ] && rm -f "$_OLD_COPY_TMP"
         else
             warn "panel cert $PANEL_CERT not found -- cannot copy it for Caddy; the reverse proxy will likely fail to start"
         fi
@@ -1162,6 +1208,26 @@ if [ -n "$_PANEL_DOMAIN" ]; then
         _DOMAIN_CHANGED=0
         [ "$_PANEL_DOMAIN" != "${_PREV_PANEL_DOMAIN:-}" ] && _DOMAIN_CHANGED=1
         _restart_panel_if_needed "$_DOMAIN_CHANGED"
+        # R42-F1-7: prune the dual-trust bundle built by the copy step
+        # above. Only when the panel is confirmed on the NEW cert:
+        # it was restarted this run (_PANEL_RESTARTED), or it was
+        # never running and will start fresh with the new cert below
+        # (_PANEL_WAS_ACTIVE=0). If the restart failed, the bundle
+        # stays -- the panel still serves the OLD cert, and collapsing
+        # Caddy's trust to new-only would 502 it until the fallback
+        # restart (or a manual one) lands; the next run collapses the
+        # bundle via the normal copy above. The prune reload itself
+        # cannot open a window: Caddy trusted old+new until now, and
+        # the panel already serves new.
+        if [ "${_CADDY_BUNDLE:-0}" -eq 1 ] && { [ "$_PANEL_RESTARTED" -eq 1 ] || [ "$_PANEL_WAS_ACTIVE" -eq 0 ]; }; then
+            if install -m 0644 "$PANEL_CERT" "$_CADDY_PANEL_CERT" 2>/dev/null; then
+                systemctl reload caddy 2>/dev/null \
+                    || warn "caddy reload after cert prune failed -- Caddy still trusts the old+new bundle; re-run install.sh to prune"
+            else
+                warn "failed to prune the Caddy cert bundle -- Caddy still trusts the old+new bundle; re-run install.sh to prune"
+            fi
+            _CADDY_BUNDLE=0
+        fi
         log "reverse proxy configured: https://$_PANEL_DOMAIN -> https://localhost:8443"
     else
         warn "caddy is not running after start -- skipping the reverse proxy; the panel stays reachable at https://$SERVER_IP:$PANEL_PORT (see: journalctl -u caddy)"

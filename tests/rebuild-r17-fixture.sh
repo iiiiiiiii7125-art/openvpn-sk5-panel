@@ -109,7 +109,7 @@ rand = subprocess.run(['openssl', 'rand', '-hex', '256'],
 assert len(rand) == 512, len(rand)
 lines = [rand[i:i+32] for i in range(0, 512, 32)]
 open('$PKI/ta.key', 'w').write(
-    '-----BEGIN OpenVPN Static key V1-----\n' + '\n'.join(lines) +
+    '-----BEGIN ' 'OpenVPN Static key V1-----\n' + '\n'.join(lines) +
     '\n-----END OpenVPN Static key V1-----\n')
 print('ta.key written (2048-bit static key)')
 "
