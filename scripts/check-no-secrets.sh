@@ -53,14 +53,31 @@ else
     _grep() { (cd "$TARGET" && grep -rIl -e "$1" --exclude-dir=.git . 2>/dev/null | sed 's|^\./||' || true); }
 fi
 
+# --- sensitive-filename match (R43-J7-5) -------------------------------
+# Exact-match only let "secret.key.bak", "SECRET.KEY" and "admin.pass␣"
+# (trailing space) through the gate. Normalize before matching: trim
+# surrounding whitespace, fold case, and treat "<name>.<suffix>" as
+# the same file. A bare stem is NOT a match ("mysecret.key",
+# "admin.password" and "secret.keystore" stay clean).
+_sensitive_name() {
+    _n="$1"
+    _n="${_n#"${_n%%[![:space:]]*}"}"
+    _n="${_n%"${_n##*[![:space:]]}"}"
+    _n="${_n,,}"
+    case "$_n" in
+        secret.key|admin.pass|panel.db|sk5.json|agent_queue.json|ta.key) return 0 ;;
+        secret.key.*|admin.pass.*|panel.db.*|sk5.json.*|agent_queue.json.*|ta.key.*) return 0 ;;
+    esac
+    return 1
+}
+
 # --- 1. sensitive filenames -------------------------------------------
 while IFS= read -r _f; do
     [ -n "$_f" ] || continue
     _base="${_f##*/}"
-    case "$_base" in
-        secret.key|admin.pass|panel.db|sk5.json|agent_queue.json|ta.key)
-            fail "sensitive filename tracked: $_f" ;;
-    esac
+    if _sensitive_name "$_base"; then
+        fail "sensitive filename tracked: $_f"
+    fi
     case "$_f" in
         panel/data/*) fail "file under panel/data/ tracked: $_f" ;;
     esac
@@ -107,9 +124,7 @@ for _t in "$TARGET"/releases/*.tar.gz; do
     _bad="$(tar tzf "$_t" 2>/dev/null | while IFS= read -r _e; do
         case "$_e" in */) continue ;; esac  # bare dir entry (e.g. an empty panel/data/) carries no secret
         _b="${_e##*/}"
-        case "$_b" in
-            secret.key|admin.pass|panel.db|sk5.json|agent_queue.json|ta.key) echo "$_e" ;;
-        esac
+        if _sensitive_name "$_b"; then echo "$_e"; fi
         case "$_e" in
             */panel/data/*|panel/data/*) echo "$_e" ;;
         esac

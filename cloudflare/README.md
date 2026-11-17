@@ -250,14 +250,14 @@ SQLite `nodes` 表，与 KV 键一一对应），服务器模式可直接接远�
 
 ## 未解决的风险
 
-- 本路只在沙箱里做了 `node --check` 与带 mock KV 的全路由测试（246 格，
-  17 个探针文件：bh_worker_poll_guard 20、bi_worker_malformed 18、
+- 本路只在沙箱里做了 `node --check` 与带 mock KV 的全路由测试（292 格，
+  19 个探针文件：bh_worker_poll_guard 20、bi_worker_malformed 18、
   bi_worker_queue_race 15、r17_worker 35、r18_worker_malformed 13、
   r18_worker_queue_race 9、r19_worker_nonlist_container 12、
   r19_worker_ovpn_download 8、r22_time_bounds 12、r23_persist_shapes 9、
   r27_worker_dangling_queue 5、r29_worker_toggle_bool 15、r31_ctype 7、
   r31_edge 22、r41_l6_worker_parity 19、r41_l5_worker 16、
-  br_loginfail_array 11；其中 8 格是钉死缺陷行为的预期红格：r17
+  br_loginfail_array 11、r42_f4_age 21、r43_j4_journey 25；其中 8 格是钉死缺陷行为的预期红格：r17
   W5-05/W5-06a、r18_malformed 4 格、r18_queue_race 2 格），
   覆盖登录限流、节点轮换/吊销、快照归一化、sent 超时重发/标失败、
   bundle 代理验签、UDP 保存守卫、畸形容器归一化（queue/sent 非数组按空

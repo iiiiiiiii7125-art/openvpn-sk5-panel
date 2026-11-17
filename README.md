@@ -157,7 +157,7 @@ UI 与 agent 日志都会告警）。重装换 panel-url/token 后安装器会�
 
 1. 浏览器打开 `https://<服务器 IP>:8443`，用初始密码登录（admin）。
 2. **建服务**：确认协议/端口（UDP 1194 或 TCP 443），**对外地址**默认自动探测公网 IP（也可手动填公网 IP/域名，留空恢复自动探测）；若状态页提示 remote 为内网地址，站外客户端连不上，须改填公网地址。点启动。服务状态、在线用户在状态页看。
-3. **加用户**：填用户名（`[a-zA-Z0-9_-]{1,32}`，`server` 与 `OpenVPN-CA` 为保留名、与服务端/CA 证书冲突而禁用），点创建，下载 `.ovpn`（CA/证书/私钥已内嵌，每个用户的证书 CN 就是用户名）。吊销用户后须重启 OpenVPN 服务才对新连接生效（CRL 只在启动时读）。
+3. **加用户**：填用户名（`[a-zA-Z0-9_-]{1,32}`，`server` 与 `OpenVPN-CA` 为保留名、与服务端/CA 证书冲突而禁用），点创建，下载 `.ovpn`（CA/证书/私钥已内嵌，每个用户的证书 CN 就是用户名）。吊销用户后 OpenVPN 服务自动重启一次（DELETE 返回 `needs_restart: false, restarted: true`），新连接立即按吊销后的 CRL 拒绝，无须手动重启。
 4. **填 SK5**：填商家给的 host、端口、用户名、密码；`fail_open` 默认关（断网保护，见下）；`udp_over_tcp` 默认关。**端口待确认：默认填 1001；若商家给的是 9000 请填 9000 并回报**（1001/9000 哪个是 SOCKS5 口尚未确认，面板字段旁同样标了这句）。
 5. **一键启用**：勾选「启用 SK5 作为出口」保存。面板立即渲染 sing-box 配置、重启 sing-box、挂上 table 100 策略路由。
 6. **验出口 IP**：状态页「当前出口 IP」应变成 SK5 的 IP；或在服务器上跑 `bash /opt/openvpn-sk5-panel/egress/test-egress.sh`（按源地址验 table/网关/出口 IP 三件套）。
@@ -299,6 +299,10 @@ systemctl disable --now caddy
 # Caddy 反代配置：删 /etc/caddy/Caddyfile 里的 # BEGIN openvpn-sk5-panel … # END openvpn-sk5-panel 段；若 Caddyfile 只有这一段，直接删文件：rm -f /etc/caddy/Caddyfile
 rm -rf /opt/openvpn-sk5-panel /etc/openvpn-sk5-panel
 rm -rf /etc/openvpn/server          # 含 CA 与全部用户证书，删前确认
+rm -f /usr/local/bin/sing-box /usr/local/bin/tun2socks
+rm -rf /usr/local/share/easy-rsa   # 安装器在发行版 easy-rsa < 3.1.0 时装的 3.1.7
+rm -f /etc/caddy/panel-cert.pem    # Caddy 用的面板证书公开副本（非私钥）
+rm -f /etc/sysctl.d/99-openvpn-sk5.conf   # net.ipv4.ip_forward=1；删文件后重启恢复默认，需立即恢复则另跑 sysctl -w net.ipv4.ip_forward=0（先确认没有别的服务需要转发）
 rm -f /etc/systemd/system/openvpn-sk5-panel.service /etc/systemd/system/openvpn-sk5-singbox.service
 rm -f /etc/systemd/system/openvpn-sk5-policy.service /etc/systemd/system/openvpn-sk5-healthcheck.service /etc/systemd/system/openvpn-sk5-healthcheck.timer
 systemctl daemon-reload
