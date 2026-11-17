@@ -1397,7 +1397,7 @@ async function handleCompatStatus(request, env) {
   return json(await cachedStatus(env, node.name));
 }
 
-async function handleCompatEnqueue(request, env, action, paramsOf, needsBody = false) {
+async function handleCompatEnqueue(request, env, action, paramsOf, needsBody = false, validate = null) {
   const body = await readJson(request);
   // R31-P2-1: body-reading actions (create_server/create_user) refuse
   // a malformed / non-object / wrong-content-type body with 400, like
@@ -1409,6 +1409,16 @@ async function handleCompatEnqueue(request, env, action, paramsOf, needsBody = f
   const b = body || {};
   const { node, error } = await resolveNode(request, env, b);
   if (error) return error;
+  // R44-L4-F1/F2: the compat-enqueue layer used to validate only
+  // node/action/params-shape and never the action's own field
+  // semantics, so a bad proto/port/name got a misleading 202 and
+  // only failed at the agent. Validate before enqueueing, with
+  // Flask's messages and the same acceptance (Flask _valid_port
+  // takes true ints only; proto is case-insensitive on both faces).
+  if (validate) {
+    const verr = validate(b);
+    if (verr) return err(verr, 400);
+  }
   const params = paramsOf ? paramsOf(b) : {};
   const cmd = await enqueueCommand(env, node.name, action, params);
   return json(
@@ -1421,6 +1431,40 @@ async function handleCompatEnqueue(request, env, action, paramsOf, needsBody = f
 // /api/openvpn/init-pki 同款顺序）：缺 force/confirm 一律 400，
 // 不走到节点判定；入队 init_pki {force:true, confirm:true}。
 // 登录保护与鉴权同其他 compat 路由（路由表在 requireAdmin 之后）。
+// R44-L4-F1/F2: pre-enqueue field validation for the compat routes
+// (see handleCompatEnqueue). Type names mirror Flask's
+// _strict_str message (type(value).__name__): a JSON 123 is "int",
+// true is "bool", null is "NoneType".
+function pyTypeName(v) {
+  if (v === null) return "NoneType";
+  if (Array.isArray(v)) return "list";
+  if (typeof v === "number") return Number.isInteger(v) ? "int" : "float";
+  if (typeof v === "boolean") return "bool";
+  if (typeof v === "string") return "str";
+  return "dict";
+}
+
+function validateCreateServer(b) {
+  if (b.proto !== undefined && b.proto !== null) {
+    if (typeof b.proto !== "string" || !["udp", "tcp"].includes(b.proto.toLowerCase())) {
+      return "proto 只能为 udp 或 tcp";
+    }
+  }
+  if (b.port !== undefined && b.port !== null) {
+    if (!Number.isInteger(b.port) || b.port < 1 || b.port > 65535) {
+      return "port 须为 1-65535 的整数";
+    }
+  }
+  return null;
+}
+
+function validateCreateUser(b) {
+  if (b.name !== undefined && b.name !== null && typeof b.name !== "string") {
+    return `用户名须为字符串，收到 ${pyTypeName(b.name)}`;
+  }
+  return null;
+}
+
 async function handleCompatInitPki(request, env) {
   const body = await readJson(request);
   if (!body) return err("请求体须为 JSON", 400);
@@ -1803,7 +1847,7 @@ async function handleFetch(request, env, ctx) {
       return handleCompatEnqueue(request, env, "create_server", (b) => ({
         port: b.port,
         proto: b.proto,
-      }), true);
+      }), true, validateCreateServer);
     }
     if (method === "POST" && path === "/api/openvpn/start") {
       return handleCompatEnqueue(request, env, "start_openvpn", () => ({}));
@@ -1819,7 +1863,7 @@ async function handleFetch(request, env, ctx) {
     }
     if (method === "GET" && path === "/api/openvpn/users") return handleCompatUsers(request, env);
     if (method === "POST" && path === "/api/openvpn/users") {
-      return handleCompatEnqueue(request, env, "create_user", (b) => ({ name: b.name }), true);
+      return handleCompatEnqueue(request, env, "create_user", (b) => ({ name: b.name }), true, validateCreateUser);
     }
     const revokeMatch = path.match(/^\/api\/openvpn\/users\/([^/]+)$/);
     if (method === "DELETE" && revokeMatch) {

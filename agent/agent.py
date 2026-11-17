@@ -646,9 +646,18 @@ def action_create_server(params: dict) -> dict:
     # create_server to change DNS -- or with allow_port_change to move
     # the entry port -- no longer dies in Easy-RSA.
     installed = openvpn_manager.build_server_cert()
+    # R44-L7-1: dns 须为真字符串或缺省——str([8]) 是 "[8]"，会骗过
+    # core 的 _validate_dns 形状检查而原样写进 server.conf（与
+    # R43-J7-1 的名字同族）。假值（"" / 0 / False / []）沿旧语义
+    # 视为缺省；真值非字符串一律干净拒绝。
+    dns = params.get("dns") or None
+    if dns is not None and not isinstance(dns, str):
+        raise ValueError(
+            "invalid DNS server: must be a string, got %s"
+            % type(dns).__name__)
     conf = openvpn_manager.render_server_conf(
         proto=proto, port=port,
-        dns=(str(params["dns"]) if params.get("dns") else None),
+        dns=dns,
         allow_port_change=_as_bool(
             params.get("allow_port_change"), "allow_port_change", False),
     )
@@ -727,6 +736,21 @@ def action_set_sk5(params: dict) -> dict:
     password = params.get("password")
     if password and not isinstance(password, str):
         raise ValueError("invalid SK5 password: must be a string")
+    # R44-L4-F3: fail-open / udp-over-tcp 单字段翻转在无存量 host 时
+    # 是无意义的写——set_sk5 的部分合并会把开关存进一个无 host 的
+    # 残配置。Worker 面与面板本机开关分支同款 400；agent 是远程
+    # 路径（面板 ?node= 入队、Worker 入队）的唯一 enforcement 点，
+    # 在此拦。带 host 的全量保存不受影响。
+    if (params.get("fail_open") is not None
+            or params.get("udp_over_tcp") is not None) \
+            and params.get("host") is None:
+        try:
+            stored = sk5_manager.get_status(probe_egress=False)
+        except Exception:  # noqa: BLE001
+            stored = {}
+        if not (stored or {}).get("host"):
+            raise ValueError(
+                "先在 SK5 配置页保存完整 SK5 配置（host/port），再改这个开关")
     return sk5_manager.set_sk5(
         host,
         port,
