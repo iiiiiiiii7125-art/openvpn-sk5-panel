@@ -50,10 +50,15 @@ else
 fi
 
 echo "=== 2. table 100 ==="
-if ip route show table 100 2>/dev/null | grep -q "default via 10.9.0.1 dev tun1"; then
-    ok "table 100: $(ip route show table 100 | grep default)"
+# R41-L4-P2-2 (R24-P2-1): a route via a dead tun1 installs as
+# linkdown -- it carries nothing while shadowing the blackhole.
+# The check must reject it, exactly like _policy_active() does.
+# (grep WITHOUT -q: a -q that exits early can SIGPIPE its writer
+# under pipefail -- see rule_exists in policy-routing.sh.)
+if ip route show table 100 2>/dev/null | grep "default via 10.9.0.1 dev tun1" | grep -v "linkdown" >/dev/null; then
+    ok "table 100: $(ip route show table 100 | grep default | grep -v linkdown)"
 else
-    bad "table 100 has no 'default via 10.9.0.1 dev tun1'"
+    bad "table 100 has no live 'default via 10.9.0.1 dev tun1' (absent or linkdown)"
     ip route show table 100 2>&1 || true
 fi
 
@@ -63,9 +68,18 @@ echo "$ROUTE_VPN"
 # R4-BUG-4: assert "dev tun1" + "table 100", NOT "via 10.9.0.1
 # dev tun1" -- the kernel prints no "via" for a point-to-point tun
 # route-get, so the old string could never match (live-verify-R4 §13).
+# R41-L4-P2-2 (R24-P2-1): the kernel RETURNS a linkdown route in
+# route-get, and the output carries no "linkdown" token -- so the
+# route-get match alone green-lights a dead chain. The route must
+# also be live in table 100 (same check as §2, same rejection as
+# _policy_active()).
 if echo "$ROUTE_VPN" | grep -q "table 100" && \
-   echo "$ROUTE_VPN" | grep -q "dev tun1"; then
+   echo "$ROUTE_VPN" | grep -q "dev tun1" && \
+   ip route show table 100 2>/dev/null | grep "default via 10.9.0.1 dev tun1" | grep -v "linkdown" >/dev/null; then
     ok "VPN source takes table 100 via dev tun1"
+elif echo "$ROUTE_VPN" | grep -q "table 100" && \
+     echo "$ROUTE_VPN" | grep -q "dev tun1"; then
+    bad "VPN source takes table 100 via dev tun1 but the route is linkdown (dead tun1 -- carries nothing)"
 else
     bad "VPN source does NOT take table 100 via dev tun1"
 fi
@@ -136,8 +150,15 @@ if [ -f "$CFG" ]; then
                     ok "egress via SK5 ($SK5_IP) differs from direct ($DIRECT_IP)"
                 elif [ -n "$SK5_IP" ] && [ "$SK5_IP" = "$DIRECT_IP" ]; then
                     bad "SK5 egress IP equals direct IP ($SK5_IP) -- chain is not in effect"
-                else
+                elif [ -n "$SK5_IP" ] && [ -z "$DIRECT_IP" ]; then
+                    # R41-L4-P2-3: the SK5 leg answered -- it is the
+                    # DIRECT leg that is dead. Blaming SK5 sends the
+                    # operator after the working leg.
+                    bad "could not fetch DIRECT egress IP (direct leg unreachable); SK5 leg is alive ($SK5_IP via $SK5_HOST:$SK5_PORT)"
+                elif [ -z "$SK5_IP" ] && [ -n "$DIRECT_IP" ]; then
                     bad "could not fetch egress IP via SK5 ($SK5_HOST:$SK5_PORT)"
+                else
+                    bad "could not fetch egress IP via SK5 ($SK5_HOST:$SK5_PORT) nor directly (both legs unreachable)"
                 fi
                 ;;
         esac
