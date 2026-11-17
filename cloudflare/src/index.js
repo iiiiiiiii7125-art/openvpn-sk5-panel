@@ -373,16 +373,44 @@ async function requireAdmin(request, env) {
   return sess;
 }
 
-async function authenticateNode(request, env) {
+async function authenticateNode(request, env, bodyToken = null) {
+  // R41-L5-P2-2: Flask _agent_auth 同款——接受 Authorization: Bearer
+  // <token> 或 body.node_token；两者都在且不一致 -> 401（防 token
+  // 混用冒领）。bodyToken 由调用方从已读出的 body 里取（body 流只能
+  // 读一次，authenticateNode 自己不读）。
   const auth = request.headers.get("Authorization") || "";
   const m = auth.match(/^Bearer\s+(.+)$/);
-  if (!m) return null;
-  const tokenHash = await sha256Hex(m[1].trim());
+  const headerToken = m ? m[1].trim() || null : null;
+  const bodyTok =
+    bodyToken != null && String(bodyToken) !== "" ? String(bodyToken) : null;
+  if (headerToken && bodyTok && headerToken !== bodyTok) return null;
+  const token = headerToken || bodyTok;
+  if (!token) return null;
+  const tokenHash = await sha256Hex(token);
   const nodes = await listNodes(env);
   for (const node of nodes) {
     if (node.token_hash && node.token_hash === tokenHash) return node;
   }
   return null;
+}
+
+// R41-L5-P2-1: FLMX 认领守卫（Flask _check_panel_claim 同款）：节点
+// 注册时绑定的 panel_url 与 agent 配置里的 panel_url 必须逐字相等
+// （仅去尾斜杠），否则拒绝认领——防别的面板拿一个有效 token 就把
+// 节点接管走。agent 未上报 panel_url（旧版 agent）时放行，但 poll
+// 响应里带 panel_url_unverified 提示升级 agent。
+function checkPanelClaim(node, body) {
+  const stored = (node.panel_url || "").replace(/\/+$/, "");
+  const claimed =
+    body && body.panel_url != null ? String(body.panel_url).replace(/\/+$/, "") : "";
+  if (stored && claimed && claimed !== stored) {
+    return {
+      ok: false,
+      error: `panel_url 不匹配：节点注册于 ${stored}，agent 配置为 ${claimed}，拒绝认领`,
+    };
+  }
+  if (stored && !claimed) return { ok: true, status: "unverified" };
+  return { ok: true, status: "ok" };
 }
 
 // 节点解析（兼容层用）：body.node > ?node= > X-Node 指定（R12-P2-5：
@@ -494,6 +522,30 @@ async function mergeServerCfg(env, nodeName, openvpn) {
     ovpn.dns = cfg.dns || FIXED_DNS;
   }
   return ovpn;
+}
+
+// R41-L5-P2-3: 从快照派生 openvpn/sk5 段（Flask _remote_status_payload
+// 同款）：全量对象优先；心跳形快照只有扁平键（openvpn_running /
+// sk5_enabled，见 handleAgentPoll 的心跳合并）时从扁平键派生；
+// 都没有时回 null。sk5Full 标记 sk5 是否来自全量对象——心跳形时
+// policy_routing_active 未测，via_sk5 须保持 null、不编造。
+function deriveSnapshotSections(snap) {
+  const s = snap && typeof snap === "object" && !Array.isArray(snap) ? snap : {};
+  const ovpn =
+    s.openvpn && typeof s.openvpn === "object"
+      ? s.openvpn
+      : typeof s.openvpn_running === "boolean"
+        ? { running: s.openvpn_running }
+        : null;
+  const sk5Obj = s.sk5 && typeof s.sk5 === "object" ? s.sk5 : null;
+  const sk5Full = !!sk5Obj && Object.keys(sk5Obj).length > 0;
+  const sk5 = sk5Full
+    ? sk5Obj
+    : typeof s.sk5_enabled === "boolean"
+      ? { enabled: s.sk5_enabled }
+      : {};
+  const sk5Enabled = "enabled" in sk5 ? !!sk5.enabled : null;
+  return { ovpn, sk5, sk5Full, sk5Enabled };
 }
 
 // ---------- 控制面：登录 / 节点注册 ----------
@@ -619,9 +671,9 @@ async function handleListNodes(request, env) {
   const out = [];
   for (const n of nodes) {
     const snap = await kvGetJson(env, `status:${n.name}`);
-    const ovpn = snap && snap.openvpn
-      ? await mergeServerCfg(env, n.name, snap.openvpn)
-      : null;
+    // R41-L5-P2-3：心跳形快照的扁平键也参与派生（全量对象优先）。
+    const { ovpn: ovpnRaw, sk5Enabled } = deriveSnapshotSections(snap);
+    const ovpn = ovpnRaw ? await mergeServerCfg(env, n.name, ovpnRaw) : null;
     out.push({
       name: n.name,
       panel_url: n.panel_url || null,
@@ -630,7 +682,7 @@ async function handleListNodes(request, env) {
       openvpn: ovpn,
       online_users: ovpn ? ovpn.online_users || 0 : null,
       egress_ip: snap && snap.egress ? snap.egress.ip || null : null,
-      sk5_enabled: snap && snap.sk5 ? !!snap.sk5.enabled : null,
+      sk5_enabled: sk5Enabled,
       status_age_s:
         snap && snap.at ? Math.floor((nowMs() - snap.at) / 1000) : null,
     });
@@ -787,12 +839,36 @@ async function _failMalformedCmd(env, id, orig, reason) {
   );
 }
 
+// R41-L6-P2-2: sent_at 须为可用时间戳（数值或数字串，且 > 0）。
+// 缺失／null／非数值／布尔／<= 0 一律不可解析——Flask R13-P2-1
+// 把这类 sent 命令直接标 failed，不走超时重投。
+function usableSentAt(value) {
+  if (typeof value === "number") return Number.isFinite(value) && value > 0;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0;
+  }
+  return false;
+}
+
 // sent 态超时处理（poll 的超时循环与 sweep 共用）：返回 "requeued"／
 // "failed"／null（未超时）。调用方负责：requeued → 把 id 推回 queue；
 // failed → 不再跟踪。sentAtOverride 为 sent 副本里的 sent_at（poll 循环
 // 用它；sweep 无副本时传空，用记录自身的 sent_at）。
 async function _handleSentTimeout(env, cmd, now, sentAtOverride) {
-  const sentAt = toMs(sentAtOverride ?? cmd.sent_at);
+  // R41-L6-P2-2 (Flask R13-P2-1)：sent_at 缺失／不可解析的 sent 命令
+  // 直接标 failed，绝不重发——不分动作是否幂等。旧行为把非数值经
+  // toMs() 映射为 0（已超时方向），安全动作会被重投并重新下发，最多
+  // 3 次无意义重执行。
+  const rawSentAt = sentAtOverride ?? cmd.sent_at;
+  if (!usableSentAt(rawSentAt)) {
+    cmd.status = "failed";
+    cmd.error = "sent_at 缺失／不可解析，命令已隔离标失败，不再下发（R13-P2-1）";
+    cmd.finished_at = now;
+    await kvPutJson(env, `cmd:${cmd.id}`, cmd, { expirationTtl: CMD_TTL_S });
+    return "failed";
+  }
+  const sentAt = Number(rawSentAt);
   if (now - sentAt <= SENT_TIMEOUT_MS) return null;
   if (SAFE_RETRY_ACTIONS.has(cmd.action)) {
     const retries = (typeof cmd.retries === "number" ? cmd.retries : 0) + 1;
@@ -922,20 +998,39 @@ async function _sweepWorkerCmds(env, nodeName, queue, sent) {
 }
 
 async function handleAgentPoll(request, env) {
-  const node = await authenticateNode(request, env);
-  if (!node) return err("节点 token 无效（Authorization: Bearer <node_token>）", 401);
+  // Body 只读一次，后面鉴权（body token）、认领守卫、node_name
+  // 校验、心跳落快照共用——body 流只能消费一次。空 body／非 JSON
+  // 按 {} 处理（旧版 agent 无 body 时按旧行为放行到鉴权）。
+  let body = {};
+  try {
+    const parsed = await request.json();
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed;
+  } catch {
+    // 空 body / 非 JSON：无认领、无 token、无心跳，按旧行为放行。
+  }
+  const node = await authenticateNode(request, env, body.node_token ?? null);
+  if (!node) return err("节点 token 无效（须传 Authorization: Bearer <node_token> 或 body.node_token）", 401);
   // R3-P2-12：与 Flask _agent_auth 同口径——body 认领的 node_name 与
   // token 归属不符即 401（配错 --node-name 要 loud 失败，不许静默按
   // token 归属下发）。无 node_name 字段的旧版 agent 按旧行为放行。
-  let claimedName = "";
-  try {
-    const body = await request.json();
-    if (body && typeof body.node_name === "string") claimedName = body.node_name;
-  } catch {
-    // 空 body / 非 JSON：无认领，放行。
-  }
+  const claimedName = typeof body.node_name === "string" ? body.node_name : "";
   if (claimedName && claimedName !== node.name) {
     return err("token 与节点名不匹配", 401);
+  }
+  // R41-L5-P2-1：panel_url 认领守卫（Flask _check_panel_claim 同款）。
+  const claim = checkPanelClaim(node, body);
+  if (!claim.ok) return err(claim.error, 403);
+  // R41-L5-P2-3：poll 心跳状态落快照（Flask agent_poll/_touch_node
+  // 同款）：心跳键合并写，绝不覆盖全量 openvpn/sk5/egress/users
+  // 对象；at 按 Worker 快照惯例随写落戳。
+  if (body.status && typeof body.status === "object" && !Array.isArray(body.status)) {
+    const prev = (await kvGetJson(env, `status:${node.name}`)) || {};
+    const hb = {};
+    if (typeof body.status.version === "string") hb.version = body.status.version;
+    if (typeof body.status.hostname === "string") hb.hostname = body.status.hostname;
+    if (typeof body.status.openvpn_running === "boolean") hb.openvpn_running = body.status.openvpn_running;
+    if (typeof body.status.sk5_enabled === "boolean") hb.sk5_enabled = body.status.sk5_enabled;
+    await kvPutJson(env, `status:${node.name}`, { ...prev, ...hb, at: nowMs() });
   }
   const now = nowMs();
   let queue = kvArray(await kvGetJson(env, `queue:${node.name}`), `queue:${node.name}`);
@@ -1026,14 +1121,24 @@ async function handleAgentPoll(request, env) {
     rec.last_seen = nowMs();
     await kvPutJson(env, `node:${node.name}`, rec);
   }
-  return json({ ok: true, node: node.name, commands, poll_interval_s: POLL_INTERVAL_S });
+  const out = { ok: true, node: node.name, commands, poll_interval_s: POLL_INTERVAL_S };
+  // R41-L5-P2-1：旧版 agent 未上报 panel_url 时放行，但提示升级
+  //（Flask agent_poll 同款 panel_url_unverified）。
+  if (claim.status === "unverified") out.panel_url_unverified = true;
+  return json(out);
 }
 
 async function handleAgentReport(request, env) {
-  const node = await authenticateNode(request, env);
-  if (!node) return err("节点 token 无效（Authorization: Bearer <node_token>）", 401);
+  // R41-L5-P2-2：body 先读出再鉴权（Flask _agent_auth 同款：body
+  // token 也是有效凭证）。readJson 对非 JSON 体回 null，鉴权随后
+  // 只认 header——与旧行为一致（header 有效＋坏 body 仍走下面的 400）。
   const body = await readJson(request);
+  const node = await authenticateNode(request, env, body ? body.node_token ?? null : null);
+  if (!node) return err("节点 token 无效（须传 Authorization: Bearer <node_token> 或 body.node_token）", 401);
   if (!body) return err("请求体须为 JSON", 400);
+  // R41-L5-P2-1：panel_url 认领守卫（Flask agent_report 同款）。
+  const claim = checkPanelClaim(node, body);
+  if (!claim.ok) return err(claim.error, 403);
 
   // agent 发 id，Flask 面板侧用 cmd_id：两个都接受（任一有值即按命令
   // 回执处理；都没有才是纯心跳）。只认 cmd_id 时 agent 的回执会被
@@ -1196,25 +1301,36 @@ async function handleGetCmd(request, env, id) {
 async function cachedStatus(env, nodeName) {
   const snap = (await kvGetJson(env, `status:${nodeName}`)) || null;
   const ageS = snap && snap.at ? Math.floor((nowMs() - snap.at) / 1000) : null;
-  const ovpn = await mergeServerCfg(env, nodeName, snap && snap.openvpn);
+  // R41-L5-P2-3：心跳形快照的扁平键也参与派生（全量对象优先）。
+  const { ovpn: ovpnRaw, sk5, sk5Full } = deriveSnapshotSections(snap);
+  const ovpn = await mergeServerCfg(env, nodeName, ovpnRaw);
   const egress = (snap && snap.egress) || {};
   // R7-P1-1: via_sk5 的唯一判据是实测的 policy_routing_active，与 Flask
   // status() 同款。agent 的 get_status() 在 enabled 时恒写 egress_ip
   // 探针值，只看 sk5.enabled 会在策略路由缺失时谎称流量经 SK5
   //（R6-P1-1 同款谎言换控制面）。快照里缺该字段时按缺失处理（不撒谎）。
-  const sk5 = (snap && snap.sk5) || {};
-  if (sk5.enabled && sk5.policy_routing_active) {
+  if (sk5Full && sk5.enabled && sk5.policy_routing_active) {
     // 策略在位：复用探针 IP；探针取不到时 ip=null 但 via_sk5 仍为 true
     //（流量进链后黑洞，kill-switch 工作态，case D）。
     egress.via_sk5 = true;
     egress.ip = egress.ip || null;
-  } else if (sk5.enabled) {
+  } else if (sk5Full && sk5.enabled) {
     // 策略缺失：流量根本不走链，绝不复用探针 IP。
     egress.via_sk5 = false;
     egress.ip = null;
     egress.error = "SK5 已启用但策略路由未生效，出口未经过 SK5";
-  } else {
+  } else if (sk5Full) {
     // SK5 未启用：快照里的 ip 即直连探针 IP，via_sk5 恒为 false。
+    egress.via_sk5 = false;
+    egress.ip = egress.ip || null;
+  } else if (snap && (typeof snap.sk5_enabled === "boolean" || typeof snap.openvpn_running === "boolean")) {
+    // R41-L5-P2-3：心跳形快照——policy 状态未测，via_sk5 保持 null、
+    // 不编造（Flask _remote_status_payload 同款；sk5Full 为假时上面
+    // 三支都不应落，全量缺失即未知）。
+    egress.via_sk5 = null;
+    egress.ip = egress.ip || null;
+  } else {
+    // 无快照／无 sk5 信息：沿旧行为，via_sk5 为 false。
     egress.via_sk5 = false;
     egress.ip = egress.ip || null;
   }
@@ -1223,7 +1339,7 @@ async function cachedStatus(env, nodeName) {
     node: nodeName,
     openvpn: ovpn,
     egress,
-    sk5: (snap && snap.sk5) || {},
+    sk5,
     users: (snap && snap.users) || [],
     stale: ageS === null || ageS > 60,
     age_s: ageS,
@@ -1232,6 +1348,30 @@ async function cachedStatus(env, nodeName) {
         ? "节点尚未上报状态：agent 首次 poll 后执行一次 get_status 即可"
         : undefined,
   };
+}
+
+// R41-L6-P2-1: GET /api/openvpn/public-ip（Flask ovpn_public_ip 同款）。
+// 指名节点时读该节点的已存快照出口 IP（快照无出口 IP 时诚实 502，
+// 绝不拿本机 IP 冒充）；未指名时按 resolveNode 的单节点回落。Worker
+// 无法探测中转机本机的出口 IP（边缘节点的出口不是中转机的出口），
+// 所以没有“本机探测”分支——Flask 的 docstring 同款结论（“Cloudflare
+// 模式无此端点”指的是本机探测，不是整条路由）。
+async function handlePublicIp(request, env) {
+  const { node, error } = await resolveNode(request, env);
+  if (error) return error;
+  const snap = (await kvGetJson(env, `status:${node.name}`)) || {};
+  const egress = snap.egress && typeof snap.egress === "object" ? snap.egress : {};
+  const ip =
+    (typeof egress.ip === "string" && egress.ip) ||
+    (typeof snap.egress_ip === "string" && snap.egress_ip) ||
+    null;
+  if (!ip) {
+    return json(
+      { ok: false, error: "节点尚未上报出口 IP：先让 agent 上报一次 get_status" },
+      502,
+    );
+  }
+  return json({ ok: true, ip });
 }
 
 async function handleCompatStatus(request, env) {
@@ -1641,6 +1781,7 @@ async function handleFetch(request, env, ctx) {
 
     // 兼容层：单节点 UI 的旧接口（见文件头说明）。
     if (method === "GET" && path === "/api/status") return handleCompatStatus(request, env);
+    if (method === "GET" && path === "/api/openvpn/public-ip") return handlePublicIp(request, env);
     if (method === "POST" && path === "/api/openvpn/server") {
       return handleCompatEnqueue(request, env, "create_server", (b) => ({
         port: b.port,
