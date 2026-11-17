@@ -266,7 +266,18 @@ def _make_ssl_context(cfg: dict) -> ssl.SSLContext:
                 "ca_cert %s does not exist -- re-run install-agent.sh "
                 "to re-fetch the panel certificate" % path
             )
-        ctx = ssl.create_default_context(cafile=str(path))
+        try:
+            ctx = ssl.create_default_context(cafile=str(path))
+        except ssl.SSLError as exc:
+            # R45-L5-6: a corrupt ca_cert file used to raise the raw
+            # SSLError out of startup (unhandled traceback, agent
+            # never starts). Fail cleanly like the missing-file case
+            # above, naming the file and the recovery.
+            raise RuntimeError(
+                "ca_cert %s is not a valid PEM certificate (%s) -- "
+                "re-run install-agent.sh to re-fetch the panel "
+                "certificate" % (path, exc)
+            ) from exc
         log.info("trusting panel certificate from %s", path)
         return ctx
     return ssl.create_default_context()
@@ -351,8 +362,8 @@ def heartbeat_status() -> dict:
 # param validation (whitelist -- anything else is rejected, never run)
 # ---------------------------------------------------------------------------
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
-_HOST_RE = re.compile(r"^[A-Za-z0-9._:-]{1,253}$")
+_NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,32}\Z")
+_HOST_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,253}\Z")
 
 
 def _need_params(params: dict, *keys: str) -> None:
@@ -634,6 +645,21 @@ def action_init_pki(params: dict) -> dict:
 def action_create_server(params: dict) -> dict:
     proto = _as_proto(params.get("proto", "udp"))
     port = _as_int(params.get("port", 1194 if proto == "udp" else 443), "port")
+    # R44-L7-1: dns 须为真字符串或缺省——str([8]) 是 "[8]"，会骗过
+    # core 的 _validate_dns 形状检查而原样写进 server.conf（与
+    # R43-J7-1 的名字同族）。假值（"" / 0 / False / []）沿旧语义
+    # 视为缺省；真值非字符串一律干净拒绝。
+    # R45-L5-5: this validation used to run AFTER init_pki() +
+    # build_server_cert() -- a bad dns raised, but the failed command
+    # had already created a CA + server cert on a fresh host. Validate
+    # (type AND value, via core _validate_dns) BEFORE any side effect.
+    dns = params.get("dns") or None
+    if dns is not None:
+        if not isinstance(dns, str):
+            raise ValueError(
+                "invalid DNS server: must be a string, got %s"
+                % type(dns).__name__)
+        openvpn_manager._validate_dns(dns)
     ca_crt = Path(
         os.environ.get(
             "OPENVPN_CA_DIR", "/etc/openvpn/server/easy-rsa"
@@ -646,15 +672,6 @@ def action_create_server(params: dict) -> dict:
     # create_server to change DNS -- or with allow_port_change to move
     # the entry port -- no longer dies in Easy-RSA.
     installed = openvpn_manager.build_server_cert()
-    # R44-L7-1: dns 须为真字符串或缺省——str([8]) 是 "[8]"，会骗过
-    # core 的 _validate_dns 形状检查而原样写进 server.conf（与
-    # R43-J7-1 的名字同族）。假值（"" / 0 / False / []）沿旧语义
-    # 视为缺省；真值非字符串一律干净拒绝。
-    dns = params.get("dns") or None
-    if dns is not None and not isinstance(dns, str):
-        raise ValueError(
-            "invalid DNS server: must be a string, got %s"
-            % type(dns).__name__)
     conf = openvpn_manager.render_server_conf(
         proto=proto, port=port,
         dns=dns,
@@ -686,9 +703,17 @@ def action_create_user(params: dict) -> dict:
         raise ValueError("invalid username: must be a string")
     if not _NAME_RE.match(name):
         raise ValueError("invalid username: must match [A-Za-z0-9_-]{1,32}")
+    # R45-L5-3: server_ip is validated here, before create_user --
+    # core's _server_endpoint would catch it too, but the agent is
+    # the Worker face's only enforcement point and the value must
+    # never be forwarded raw (a non-string or newline-injected value
+    # would land verbatim in the .ovpn remote line).
+    server_ip = params.get("server_ip") or None
+    if server_ip is not None:
+        openvpn_manager._validate_server_ip(server_ip)
     ovpn = openvpn_manager.create_user(
         name,
-        server_ip=params.get("server_ip") or None,
+        server_ip=server_ip,
         proto=_as_proto(params["proto"]) if params.get("proto") else None,
         port=_as_int(params["port"], "port") if params.get("port") else None,
     )

@@ -68,7 +68,7 @@ STATUS_LOG_CANDIDATES = (
 # the index.txt filter below (defence in depth for pre-existing PKIs).
 RESERVED_NAMES = frozenset({"server", "openvpn-ca", "ca"})
 
-USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+USERNAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,32}\Z")
 DEFAULT_PROTO = os.environ.get("OPENVPN_PROTO", "udp")
 DEFAULT_PORT = int(os.environ.get("OPENVPN_PORT", "1194"))
 DEFAULT_DNS = os.environ.get("OVPN_DNS", "1.1.1.1")
@@ -161,8 +161,21 @@ def _pki_dir(ca_dir: str | Path | None) -> Path:
 
 
 def _read_if_exists(path: Path) -> str | None:
+    """Read *path* as UTF-8, or None when it does not exist.
+
+    R45-L5-4: a file that exists but is not valid UTF-8 used to let
+    the raw ``UnicodeDecodeError`` escape (it is a ``ValueError``,
+    not an ``OSError``), wedging list/render/status callers with an
+    unhandled traceback. Decode failure is now a clean
+    :class:`OpenVPNError` naming the file -- callers that treat a
+    missing file as "not there" still get None for that case.
+    """
     try:
         return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise OpenVPNError(
+            "cannot read %s: not valid UTF-8 (%s)" % (path, exc)
+        ) from exc
     except OSError:
         return None
 
@@ -548,7 +561,9 @@ def _read_tombstones(pki: Path) -> dict:
     """
     try:
         raw = (pki / _TOMBSTONE_FILE).read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # R45-L5-4: a non-UTF-8 tombstone file is corrupt input, same
+        # as an unparseable one -- treated as empty (see docstring).
         return {}
     try:
         data = json.loads(raw)
@@ -805,6 +820,36 @@ def server_endpoint_info(
             "ip_source": source, "is_private": ip_is_private(ip)}
 
 
+_SERVER_IP_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,253}\Z")
+
+
+def _validate_server_ip(server_ip) -> str:
+    """Validate the ``remote`` address of a client config (R45-L5-3).
+
+    Same rule as the panel's ``_valid_server_ip``: an IP literal or a
+    hostname -- no whitespace, no control characters, no shell
+    metacharacters. A non-string (``123``/``True``) or a value with an
+    embedded newline used to be substituted verbatim into the .ovpn,
+    so ``remote 123 1194`` or an injected ``proto tcp`` line was
+    rendered. Returns the stripped value unchanged otherwise.
+    """
+    if not isinstance(server_ip, str):
+        raise OpenVPNError(
+            "invalid server IP/hostname %r: must be a string" % (server_ip,)
+        )
+    value = server_ip.strip()
+    if not value or any(c in value for c in " \t\r\n\"';&|<>$`\\"):
+        raise OpenVPNError("invalid server IP/hostname %r" % (server_ip,))
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        pass
+    if not _SERVER_IP_RE.match(value) or ".." in value:
+        raise OpenVPNError("invalid server IP/hostname %r" % (server_ip,))
+    return value
+
+
 def _server_endpoint(
     server_dir: str | Path | None,
     server_ip: str | None,
@@ -857,7 +902,15 @@ def _server_endpoint(
     if type(port) is not int or not 1 <= port <= 65535:
         raise OpenVPNError("port must be an integer 1-65535, got %r" % (port,))
 
-    ip = server_ip or os.environ.get("OPENVPN_SERVER_IP")
+    ip = None
+    if server_ip is not None:
+        # R45-L5-3: an explicit server_ip is validated -- a non-string
+        # or an injected newline used to land verbatim in the .ovpn
+        # remote line. None still means "unset" and falls through to
+        # env / detect / LAN below.
+        ip = _validate_server_ip(server_ip)
+    if not ip:
+        ip = os.environ.get("OPENVPN_SERVER_IP")
     if not ip:
         ip = detect_public_ip()
     if not ip:
@@ -888,6 +941,11 @@ def build_client_config(
     so it is unit-testable with fixture PEM blocks.
     """
     validate_username(name)
+    # R45-L5-3: the remote address is substituted verbatim into the
+    # template -- validate it here too (build_client_config is also
+    # called directly by the panel's .ovpn rebuild path, not only
+    # through _server_endpoint).
+    server_ip = _validate_server_ip(server_ip)
     if proto not in ("udp", "tcp"):
         raise OpenVPNError("proto must be 'udp' or 'tcp', got %r" % proto)
     # R12-P1-2: ``port`` lands verbatim in the ``.ovpn`` template -- a
@@ -1024,6 +1082,13 @@ def _sweep_orphan_index_entries(pki: Path) -> int:
         raw = index.read_text(encoding="utf-8")
     except OSError:
         return 0
+    except UnicodeDecodeError as exc:
+        # R45-L5-4: a non-UTF-8 index.txt is corrupt input, not an
+        # empty PKI -- fail loudly instead of wedging the caller
+        # with a raw traceback (same rule as _read_if_exists).
+        raise OpenVPNError(
+            "cannot read %s: not valid UTF-8 (%s)" % (index, exc)
+        ) from exc
     lines = raw.splitlines()
     serial_map = _serial_to_name(pki)
     # group V entries by resolved user name
@@ -1181,6 +1246,36 @@ def _revoke_cert(
     return {"name": name, "status": "revoked", "crl": str(dest)}
 
 
+def _repair_revoked_crl(
+    name: str,
+    ca_dir: str | Path,
+    server_dir: str | Path,
+) -> dict:
+    """Regenerate + sync the CRL for a revoke that never finished.
+
+    R45-L5-8: when ``easyrsa.sh revoke`` fails at its gen-crl step,
+    the revoke has already landed in index.txt but no CRL was ever
+    generated or synced -- and the retry then 409s
+    (``UserAlreadyRevokedError``), so the revoked certificate keeps
+    working for new connections with no in-product repair path.
+    This regenerates the CRL from the (already revoked) index, syncs
+    it to the server dir, records the tombstone, and returns the same
+    shape as :func:`_revoke_cert` plus ``"repaired": True``.
+    """
+    pki = _pki_dir(ca_dir)
+    entry = _user_entry(name, ca_dir)
+    _run_easyrsa("gen-crl", str(ca_dir))
+    crl_src = pki / "crl.pem"
+    if not crl_src.exists():
+        raise OpenVPNError("gen-crl did not produce %s" % crl_src)
+    dest = Path(server_dir) / "crl.pem"
+    dest.write_bytes(crl_src.read_bytes())
+    dest.chmod(0o644)
+    _record_tombstone(pki, name, entry)
+    return {"name": name, "status": "revoked", "crl": str(dest),
+            "repaired": True}
+
+
 def revoke_user(
     name: str,
     ca_dir: str | Path | None = None,
@@ -1217,7 +1312,19 @@ def revoke_user(
         if status is None:
             raise UserNotFoundError("user %r does not exist" % name)
         if status == "revoked":
-            raise UserAlreadyRevokedError("user %r is already revoked" % name)
+            # R45-L5-8: a completed revoke always records a tombstone
+            # (see _revoke_cert, after the CRL sync). Its absence
+            # here means the earlier revoke died at gen-crl -- the
+            # index says revoked but no CRL was ever generated or
+            # synced. Repair instead of 409ing: regenerate the CRL
+            # and sync it. A tombstoned (fully revoked) user still
+            # 409s as before. Note this also repairs legacy revokes
+            # made before tombstones existed (their CRL is re-synced
+            # idempotently) -- the 409-to-200 change there is the
+            # repair, not a regression.
+            if _read_tombstones(pki).get(name) is not None:
+                raise UserAlreadyRevokedError("user %r is already revoked" % name)
+            return _repair_revoked_crl(name, ca_dir, server_dir)
         return _revoke_cert(name, ca_dir, server_dir)
 
 
@@ -1232,11 +1339,16 @@ def _validate_dns(dns: str | None) -> str:
     R12-P1-2 (core side): a non-string value must not be silently
     coerced -- ``str(True)`` would push the literal hostname ``True``.
     Only real strings (or None for "use the default") are accepted.
+
+    R45-L5-2: newline/CR are control characters, not whitespace to
+    strip -- ``1.1.1.1\\ninjected`` passed the old check and split the
+    ``push "dhcp-option DNS ...`` directive across two lines in the
+    rendered server.conf. They are rejected outright.
     """
     if dns is not None and not isinstance(dns, str):
         raise OpenVPNError("invalid DNS server %r" % (dns,))
     dns = str(dns or "").strip()
-    if not dns or any(c in dns for c in " \t\"';&|<>$`\\"):
+    if not dns or any(c in dns for c in " \t\r\n\"';&|<>$`\\"):
         raise OpenVPNError("invalid DNS server %r" % dns)
     return dns
 
@@ -1264,7 +1376,12 @@ def _port_occupant(proto: str, port: int) -> str | None:
                 ["ss", flag], capture_output=True, text=True, timeout=10
             )
             for line in (proc.stdout or "").splitlines():
-                if (":%d" % port) in line:
+                # R45-L5-7: match the port EXACTLY -- the old substring
+                # check (":1194" in line) also matched ":11940", so a
+                # 11940 holder was blamed for a 1194 conflict and the
+                # operator was sent after the wrong service. The port
+                # must be followed by whitespace or end-of-line.
+                if re.search(r":%d(?=\s|$)" % port, line):
                     holder = line.strip()
                     break
         except (OSError, subprocess.TimeoutExpired):
