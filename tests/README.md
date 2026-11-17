@@ -13,8 +13,12 @@
 | `r17_agent.py` | agent 探针（纯 stdlib）：`_as_int`/`_as_bool`、`_pinned_sha256`、`execute_command` 白名单、`load_config` | 33 格 |
 | `r17_worker.mjs` | Worker 探针（mock KV）：登录/限流、节点、命令、改密 501、poll 下发守卫、sent 超时、bundle 503 | 35 格 |
 
-R17 四套探针合计 203 格：202 绿＋1 红（W5-01，即 R17-P1-1 的 Worker 面；
-F4-02b/F4-13/F4-15/F4-16/W5-05/W5-06b 是“观测到违规行为”的钉死格，故显示 PASS）。
+R17 四套探针合计 203 格：198 绿＋5 红（2026-11-17 在集成树上重跑：
+flask 86/89、core 46/46、agent 33/33、worker 33/35；红格是钉死格：
+F4-02b/F4-13/F4-15 是 Flask R17-P1-1 的 OBSERVED 格——缺陷已在代码修好
+（`panel/app.py` 下发列表只收 queued 命令），钉死的违规行为不再复现；
+W5-05/W5-06a 是 Worker 的 OBSERVED 格。W5-01 现已通过；六个钉死格中仅
+F4-16 与 W5-06b 仍显示 PASS）。
 
 ## 运行前准备（一次性）
 
@@ -34,7 +38,11 @@ mkdir -p /tmp/r17/fixture-ca/pki/issued /tmp/r17/fixture-ca/pki/private /tmp/r17
 # index.txt：alice V（301113000000Z）、bob R、erin V 但过期（201113000000Z）、carol E、dave V
 # 每行：<状态>\t<expiry>\t<serial>\tunknown\t<CN>（TAB 分隔）
 # issued/<name>.crt 与 private/<name>.key 为 dummy PEM（BEGIN/END 行齐全即可）
+# pki/ca.crt 为 dummy PEM（_rebuild_user_ovpn 重建 .ovpn 时必需；缺失则 F5-01 404。
+# 探针以 nobody 跑，须保证 nobody 可读：建完补 chmod 644，别依赖 umask）
+printf -- '-----BEGIN CERTIFICATE-----\nZHVtbXk=\n-----END CERTIFICATE-----\n' > /tmp/r17/fixture-ca/pki/ca.crt && chmod 644 /tmp/r17/fixture-ca/pki/ca.crt
 # fixture-server/ta.key 为 dummy OpenVPN 静态密钥
+# 或直接跑 tests/rebuild-r17-fixture.sh 一键重建（含 ca.crt 与 ta.key）
 # 4. 桩 sing-box（PATH 首位；check 过、run 立即退出 0，不建 TUN）
 mkdir -p /tmp/r17/stubbin
 printf '#!/bin/sh\nif [ "$1" = "run" ]; then exit 0; fi\nexit 0\n' > /tmp/r17/stubbin/sing-box
