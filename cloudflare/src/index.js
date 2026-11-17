@@ -514,6 +514,104 @@ function snapshotFromResult(result) {
   return snap;
 }
 
+// R45-L7-1: Flask _remote_status_payload 同款的 remote 判定
+// （core ip_is_private: is_private / loopback / link-local / reserved /
+// multicast 任一即真；不可解析即真——调用方报警告）。Worker 没有
+// Python ipaddress，用手工范围表镜像它；100.64/10 在本版 Python
+// (3.12) 的 is_private 里是 False，这里同样不算内网。
+function parseIpv6(s) {
+  if (typeof s !== "string" || !s.includes(":")) return null;
+  // 带点的尾段（::ffff:1.2.3.4）只许出现在地址末尾。
+  if (s.includes(".") && !/:[^:]*\.[^:]*$/.test(s)) return null;
+  const dbl = s.split("::");
+  if (dbl.length > 2) return null;
+  const parsePart = (part) => {
+    if (!part) return [];
+    const out = [];
+    for (const g of part.split(":")) {
+      if (g.includes(".")) {
+        const m = g.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+        if (!m) return null;
+        const o = m.slice(1).map(Number);
+        if (o.some((n) => n > 255)) return null;
+        out.push((o[0] << 8) | o[1], (o[2] << 8) | o[3]);
+      } else {
+        if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+        out.push(parseInt(g, 16));
+      }
+    }
+    return out;
+  };
+  if (dbl.length === 1) {
+    const groups = parsePart(dbl[0]);
+    return groups && groups.length === 8 ? groups : null;
+  }
+  const left = parsePart(dbl[0]);
+  const right = parsePart(dbl[1]);
+  if (!left || !right || left.length + right.length > 7) return null;
+  return [...left, ...new Array(8 - left.length - right.length).fill(0), ...right];
+}
+
+function isPrivateIp(ip) {
+  if (typeof ip !== "string" || !ip.trim()) return true;
+  const s = ip.trim();
+  const v4 = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const o = v4.slice(1).map(Number);
+    if (o.some((n) => n > 255)) return true;
+    const [a, b, c] = o;
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true; // link-local
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 0) return true; // 192.0.0.0/24 IETF assignments
+    if (a === 192 && b === 2) return true; // TEST-NET-1
+    if (a === 192 && b === 168) return true;
+    if (a === 198 && (b === 18 || b === 19)) return true; // 198.18/15 benchmarking
+    if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2
+    if (a === 203 && b === 0 && c === 113) return true; // TEST-NET-3
+    if (a >= 224 && a <= 239) return true; // multicast
+    if (a >= 240) return true; // reserved incl. 255.255.255.255
+    return false;
+  }
+  if (!s.includes(":")) return true; // 不是 IP 字面量：Flask 同款报警告
+  const g = parseIpv6(s);
+  if (!g) return true;
+  // IPv4-mapped ::ffff:a.b.c.d：Python 3.12 按内层 v4 判定。
+  if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) {
+    return isPrivateIp(`${(g[6] >> 8) & 0xff}.${g[6] & 0xff}.${(g[7] >> 8) & 0xff}.${g[7] & 0xff}`);
+  }
+  if (g.every((x) => x === 0)) return true; // ::
+  if (g[0] === 1 && g.slice(1).every((x) => x === 0)) return true; // ::1
+  if ((g[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((g[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
+  if ((g[0] & 0xff00) === 0xff00) return true; // ff00::/8 multicast
+  if (g[0] === 0x2001 && g[1] === 0x0db8) return true; // 2001:db8::/32 documentation
+  if (g[0] === 0x0100 && g[1] === 0 && g[2] === 0 && g[3] === 0) return true; // 100::/64
+  return false;
+}
+
+// Flask _remote_warning 同款文案（panel/app.py:1248）：内网地址即警告，
+// 公网地址回 null（键仍在，与 Flask 形状一致）。
+function remoteWarning(ip) {
+  if (typeof ip !== "string" || !ip) return null;
+  if (!isPrivateIp(ip)) return null;
+  return `当前 .ovpn 的 remote 为内网地址 ${ip}，站外客户端连不上：请在上方填公网 IP/域名，或点“自动探测公网 IP”`;
+}
+
+function isIpLiteral(value) {
+  const v4 = value.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4 && v4.slice(1).every((n) => Number(n) <= 255)) return true;
+  if (value.includes(":") && parseIpv6(value)) return true;
+  return false;
+}
+
+// Flask _valid_server_ip 同款：IP 字面量或主机名，不含空白与 shell 元字符。
+function isValidServerIp(value) {
+  if (/[\s"';&|<>$`\\]/.test(value)) return false;
+  if (isIpLiteral(value)) return true;
+  return /^[A-Za-z0-9._:-]{1,253}$/.test(value) && !value.includes("..");
+}
+
 // 读快照时把建服务配置合并进 openvpn 段（Flask 是现算这四个字段的）。
 async function mergeServerCfg(env, nodeName, openvpn) {
   const cfg = await kvGetJson(env, `servercfg:${nodeName}`);
@@ -1213,13 +1311,21 @@ async function handleAgentReport(request, env) {
     }
   }
   // 建服务成功：记下 proto/port，供快照补 proto/port/subnet/dns（P1-5）。
+  // R45-L7-2：同时记下对外地址，供建用户时补发给 agent（server_ip 键
+  // 在场即设定/清空，缺键即保持旧值；非字符串一律不存——/api/cmd 直发
+  // 的命令不经 validateCreateServer，脏值绝不能进 servercfg）。
   if (cmd.action === "create_server" && cmd.status === "done") {
     const params = cmd.params || {};
+    const prev = (await kvGetJson(env, `servercfg:${node.name}`)) || {};
     await kvPutJson(env, `servercfg:${node.name}`, {
       proto: params.proto || "udp",
       port: params.port !== undefined ? params.port : 1194,
       subnet: FIXED_SUBNET,
       dns: FIXED_DNS,
+      server_ip:
+        typeof params.server_ip === "string"
+          ? params.server_ip || null
+          : prev.server_ip || null,
     });
   }
   // SK5 测试成功：记下原始结果，供 1-25 保存守卫用（同地址 UDP 失败即硬拒）。
@@ -1321,6 +1427,18 @@ async function cachedStatus(env, nodeName) {
   // R41-L5-P2-3：心跳形快照的扁平键也参与派生（全量对象优先）。
   const { ovpn: ovpnRaw, sk5, sk5Full } = deriveSnapshotSections(snap);
   const ovpn = await mergeServerCfg(env, nodeName, ovpnRaw);
+  // R45-L7-1: remote_ip / remote_warning 取快照原始出口 IP（Flask
+  // _remote_status_payload 同款）——下面的 via_sk5 分支会把 egress.ip
+  // 置 null（策略缺失时），所以先取原始值；快照无出口 IP 时两键缺席。
+  const rawEgressIp =
+    (snap && snap.egress && typeof snap.egress.ip === "string" && snap.egress.ip) ||
+    (snap && typeof snap.egress_ip === "string" && snap.egress_ip) ||
+    null;
+  if (rawEgressIp) {
+    ovpn.remote_ip = rawEgressIp;
+    ovpn.remote_is_private = isPrivateIp(rawEgressIp);
+    ovpn.remote_warning = remoteWarning(rawEgressIp);
+  }
   const egress = (snap && snap.egress) || {};
   // R7-P1-1: via_sk5 的唯一判据是实测的 policy_routing_active，与 Flask
   // status() 同款。agent 的 get_status() 在 enabled 时恒写 egress_ip
@@ -1419,7 +1537,7 @@ async function handleCompatEnqueue(request, env, action, paramsOf, needsBody = f
     const verr = validate(b);
     if (verr) return err(verr, 400);
   }
-  const params = paramsOf ? paramsOf(b) : {};
+  const params = paramsOf ? await paramsOf(b, node) : {};
   const cmd = await enqueueCommand(env, node.name, action, params);
   return json(
     { ok: true, cmd_id: cmd.id, node: node.name, action, status: "queued", queued: true },
@@ -1453,6 +1571,16 @@ function validateCreateServer(b) {
   if (b.port !== undefined && b.port !== null) {
     if (!Number.isInteger(b.port) || b.port < 1 || b.port > 65535) {
       return "port 须为 1-65535 的整数";
+    }
+  }
+  // R45-L7-2: server_ip 随命令转发，入队前先验（Flask _strict_str +
+  // _valid_server_ip 同款：缺键即保持旧值，空串即清除，非空须合法）。
+  if (b.server_ip !== undefined && b.server_ip !== null) {
+    if (typeof b.server_ip !== "string") {
+      return `server_ip 须为字符串，收到 ${pyTypeName(b.server_ip)}`;
+    }
+    if (b.server_ip.trim() && !isValidServerIp(b.server_ip.trim())) {
+      return "server_ip 不合法：须为 IP 或主机名";
     }
   }
   return null;
@@ -1844,10 +1972,16 @@ async function handleFetch(request, env, ctx) {
     if (method === "GET" && path === "/api/status") return handleCompatStatus(request, env);
     if (method === "GET" && path === "/api/openvpn/public-ip") return handlePublicIp(request, env);
     if (method === "POST" && path === "/api/openvpn/server") {
-      return handleCompatEnqueue(request, env, "create_server", (b) => ({
-        port: b.port,
-        proto: b.proto,
-      }), true, validateCreateServer);
+      return handleCompatEnqueue(request, env, "create_server", (b) => {
+        const p = {
+          port: b.port,
+          proto: b.proto,
+        };
+        // R45-L7-2: 对外地址随命令发给 agent（README 观察-1 的补发方案）；
+        // 键在场即设定/清空（空串=清除已存值），缺键即保持旧值。
+        if (typeof b.server_ip === "string") p.server_ip = b.server_ip.trim();
+        return p;
+      }, true, validateCreateServer);
     }
     if (method === "POST" && path === "/api/openvpn/start") {
       return handleCompatEnqueue(request, env, "start_openvpn", () => ({}));
@@ -1863,7 +1997,17 @@ async function handleFetch(request, env, ctx) {
     }
     if (method === "GET" && path === "/api/openvpn/users") return handleCompatUsers(request, env);
     if (method === "POST" && path === "/api/openvpn/users") {
-      return handleCompatEnqueue(request, env, "create_user", (b) => ({ name: b.name }), true, validateCreateUser);
+      return handleCompatEnqueue(request, env, "create_user", async (b, node) => {
+        const p = { name: b.name };
+        // R45-L7-2：建服务时存下的对外地址随建用户命令补发给 agent，
+        // agent 的 action_create_user 原样把它写进 .ovpn remote（core
+        // create_user 的 server_ip 参数）；未存过即不传，agent 自行探测。
+        const cfg = await kvGetJson(env, `servercfg:${node.name}`);
+        if (cfg && typeof cfg.server_ip === "string" && cfg.server_ip) {
+          p.server_ip = cfg.server_ip;
+        }
+        return p;
+      }, true, validateCreateUser);
     }
     const revokeMatch = path.match(/^\/api\/openvpn\/users\/([^/]+)$/);
     if (method === "DELETE" && revokeMatch) {
