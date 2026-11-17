@@ -1906,6 +1906,12 @@ def start_server(server_dir: str | Path | None = None) -> dict:
     # Direct fallback (containers / no systemd): daemonise openvpn itself.
     log = Path("/var/log/openvpn/openvpn.log")
     log.parent.mkdir(parents=True, exist_ok=True)
+    # LIVE-R45-1: the fallback used to mkdir only the log parent. The
+    # real binary refuses to start when the --writepid parent is missing
+    # ("--writepid fails with '/run/openvpn-server/server.pid': No such
+    # file or directory", rc=1), so a host without /run/openvpn-server
+    # could never start the daemon outside systemd. Create it too.
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     _run(
         [
             "openvpn",
