@@ -1144,7 +1144,14 @@ async function handleAgentPoll(request, env) {
     if (typeof body.status.sk5_enabled === "boolean") hb.sk5_enabled = body.status.sk5_enabled;
     // R45-LIVE-2: agent 上报的安装包哈希随心跳进快照（panel 比对
     // 当前包后给出 agent_code_outdated；未上报即未知，不谎报）。
-    if (typeof body.status.bundle_sha256 === "string") hb.bundle_sha256 = body.status.bundle_sha256;
+    // R46-L7-1: 心跳带了 bundle_sha256 键但不是字符串时写 null 进
+    // 快照（Flask _touch_node 合并语义同款）——旧哈希不许残留，
+    // 否则过期标记永远冻结在旧结论上；键不存在时不碰快照。
+    if (typeof body.status.bundle_sha256 === "string") {
+      hb.bundle_sha256 = body.status.bundle_sha256;
+    } else if ("bundle_sha256" in body.status) {
+      hb.bundle_sha256 = null;
+    }
     await kvPutJson(env, `status:${node.name}`, { ...prev, ...hb });
   }
   const now = nowMs();
@@ -1901,18 +1908,21 @@ async function handleAgentBundle(request, env) {
   });
 }
 
-// R45-LIVE-2: 源站当前 bundle 哈希（KV 缓存 1 小时，供
-// agent_code_outdated 比对）。源站未配置或取不到时回 null——
-// outdated 即未知，绝不谎报过期。安装包下发仍走 handleAgentBundle
-// 的逐次校验，不复用此缓存。
+// R45-LIVE-2: 源站当前 bundle 哈希（供 agent_code_outdated 比对）。
+// R46-L5-1: 源站能连通时每次都重新取；KV 缓存（1 小时）只是源站
+// 取不到时的回退，不许用缓存的新鲜度代替源站的现值——否则升级后
+// 一小时内新 agent 判过期、旧 agent 判新鲜。源站未配置或取不到时
+// 回 null——outdated 即未知，绝不谎报过期。安装包下发仍走
+// handleAgentBundle 的逐次校验，不复用此缓存。
 async function originBundleSha256(env) {
   const cached = await kvGetJson(env, "origin_bundle_sha256");
-  if (cached && typeof cached.hash === "string" && typeof cached.at === "number"
-      && nowMs() - cached.at < 3600 * 1000) return cached.hash;
+  const cachedFresh =
+    cached && typeof cached.hash === "string" && typeof cached.at === "number"
+    && nowMs() - cached.at < 3600 * 1000 ? cached.hash : null;
   const origin = bundleOrigin(env);
-  if (!origin) return null;
+  if (!origin) return cachedFresh;
   const got = await fetchFromOrigin(origin, "/api/agent/bundle.sha256");
-  if (!got.ok) return null;
+  if (!got.ok) return cachedFresh;
   const text = (await got.res.text()).trim();
   const hash = text.split(/\s+/)[0] || "";
   if (!/^[0-9a-f]{64}$/.test(hash)) return null;
