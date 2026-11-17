@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import shutil
 import socket
 import struct
@@ -339,6 +340,23 @@ def _singbox_check() -> None:
         )
 
 
+def _pid_is_singbox(pid: int) -> bool:
+    """Does this pid belong to a sing-box process? (R41-L4-P2-4)
+    Reads /proc/<pid>/cmdline and looks for the sing-box binary
+    name. A stale PID file pointing at an innocent pid reuser must
+    never be mistaken for our daemon: the old code trusted the
+    number alone, so _stop_singbox_direct() SIGTERMed whatever
+    reused the pid and _singbox_running() reported a dead daemon
+    alive. An unreadable cmdline (process gone, zombie, foreign
+    user) means "not ours"."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read()
+    except OSError:
+        return False
+    return b"sing-box" in cmdline
+
+
 def _singbox_running() -> bool:
     # Either control path counts: systemd unit OR the direct PID file.
     # (A stale PID file must not mask a running systemd unit.)
@@ -351,8 +369,12 @@ def _singbox_running() -> bool:
     if _exists(PID_FILE):
         try:
             pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 0)
-            return True
+            # R41-L4-P2-4: a bare kill(pid, 0) trusts the number
+            # alone -- a reused pid makes a dead daemon look alive
+            # (and blocks dead-placeholder cleanup, which requires
+            # "not running"). Only count a pid that is still our
+            # sing-box.
+            return _pid_is_singbox(pid) and os.kill(pid, 0) is None
         except (ValueError, OSError):
             return False
     return False
@@ -397,6 +419,13 @@ def _start_singbox() -> None:
     PID_FILE.write_text(str(proc.pid) + "\n", encoding="utf-8")
     time.sleep(1)
     if proc.poll() is not None:
+        # R41-L4-P2-4: the daemon died on start -- remove the PID
+        # file we just wrote. Leaving it behind lets a later stop
+        # SIGTERM whatever innocent process reuses that pid number.
+        try:
+            PID_FILE.unlink()
+        except OSError:
+            pass
         raise RuntimeError(
             f"sing-box exited immediately (rc={proc.returncode}); see {LOG_FILE}"
         )
@@ -406,15 +435,20 @@ def _stop_singbox_direct() -> None:
     if _exists(PID_FILE):
         try:
             pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 15)
-            for _ in range(20):
-                time.sleep(0.25)
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    break
-            else:
-                os.kill(pid, 9)
+            # R41-L4-P2-4: only signal the pid if it is still our
+            # sing-box. A stale file (daemon died, pid reused) must
+            # not kill an innocent process. Identity is re-checked
+            # while waiting out the SIGTERM, so a pid reused
+            # mid-wait is never escalated to SIGKILL either.
+            if _pid_is_singbox(pid):
+                os.kill(pid, 15)
+                for _ in range(20):
+                    time.sleep(0.25)
+                    if not _pid_is_singbox(pid):
+                        break
+                else:
+                    if _pid_is_singbox(pid):
+                        os.kill(pid, 9)
         except (ValueError, OSError):
             pass
         try:
@@ -943,8 +977,19 @@ def _rule_present() -> bool:
         proc = _run(["ip", "rule", "show"], timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return (VPN_NET in (proc.stdout or "")
-            and "lookup 100" in (proc.stdout or ""))
+    # R41-L4-P2-1: match ONE line, not substrings across lines.
+    # The old check (`VPN_NET in stdout and "lookup 100" in
+    # stdout`) matched the two halves on DIFFERENT rules -- e.g.
+    # `from 10.8.0.0/24 lookup 200` plus `from 192.168.0.0/24
+    # lookup 100` -- and reported the rule present while VPN
+    # traffic went direct. Same shape as rule_exists() in
+    # policy-routing.sh (RULE_PRIO=100): priority 100, our
+    # selector, table 100 -- on a single line.
+    pattern = re.compile(
+        r"^100:\s+from\s+" + re.escape(VPN_NET) + r"\s+lookup\s+100(?:\s|$)",
+        re.MULTILINE,
+    )
+    return bool(pattern.search(proc.stdout or ""))
 
 
 def _blackhole_active() -> bool:
