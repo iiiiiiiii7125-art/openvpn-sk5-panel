@@ -13,6 +13,13 @@ the FIXED behavior (see each cell); L6-4 is unchanged — it flips by
 the new docs/audit/AUDIT-R41.md file + the DELIVERY index alone. On
 the fixed tree all 69 cells PASS.
 
+Fix-AG (R46, branch fix/r46-ag-docs) BH-03(c) flips, disclosed:
+L6-2 (Fix-AA reworded the §1.3 sentence), H1 (the 501-note citation
+moved README:284 → README:293), H3b (the sidecar is root-relative
+now), H17a (the revoke sentence moved README:160 → :169 and the
+unconditional auto-restart claim is now qualified). All four assert
+the FIXED behavior; on the fixed tree all 69 cells PASS.
+
 Run from the repo root: python3 tests/r44_l6_docs.py
 Exit code = number of FAILs (finding cells excluded: they are the
 findings, so the exit code counts only unexpected failures; see
@@ -75,11 +82,14 @@ check("L6-1 DELIVERY §6-1 cites README:90 for the ufw live-only note",
 # (best effort, only when the toggle test ran). The cell asserts the
 # fixed doc text: no "只建不删" anywhere, and §1.3 states the EXIT
 # trap revocation.
+# BH-03(c) flip (Fix-AG): Fix-AA reworded the sentence to "吊销 §7 建的
+# `verify-*` 测试用户" — the old exact string "吊销 `verify-*` 测试用户"
+# no longer appears. The cell asserts the current wording.
 _deliv = read("docs/DELIVERY.md")
 vsh = read("verify.sh")  # kept: H4 counts verify.sh check names below.
 check("L6-2 DELIVERY §1.3 states the EXIT trap revokes verify-*",
       "只建不删" not in _deliv and "EXIT trap" in _deliv
-      and "吊销 `verify-*` 测试用户" in _deliv,
+      and "吊销 §7 建的 `verify-*` 测试用户" in _deliv,
       "verify.sh EXIT trap revokes TEST_USER (best effort)")
 
 # ---------------------------------------------------------------- L6-3
@@ -107,10 +117,19 @@ check("L6-4 DELIVERY §0/§10 audit index current (R41-R43 indexed)",
       "scripts/gate, no audit index" % has_r40plus)
 
 # ---------------------------------------------------------------- H1
-# panel/README.md:103 cites README:284 for the 501 change-password note.
-check("H1 panel/README README:284 resolves to the 501 note",
-      "501" in line("README.md", 284) and "change-password" in line("README.md", 284),
-      line("README.md", 284)[:80])
+# BH-03(c) flip (Fix-AG): panel/README.md:103 cited README:284 for the
+# 501 change-password note, but the note lives at README:293 (it moved
+# during the R45 fix round). The citation is now README:293. The cell
+# asserts the fixed behavior: the citation resolves to the line holding
+# the 501 change-password note (same logic as the F7 probe's D09).
+import re as _re
+_cited = _re.search(r"README:(\d+)", read("panel/README.md"))
+_note_line = next((i + 1 for i, l in enumerate(read("README.md").splitlines())
+                  if "501" in l and "改密" in l), None)
+check("H1 panel/README citation resolves to the 501 note",
+      _cited is not None and _note_line is not None
+      and int(_cited.group(1)) == _note_line,
+      "cited=%s actual=%s" % (_cited.group(1) if _cited else None, _note_line))
 
 # ---------------------------------------------------------------- H2
 # DELIVERY §9 hash table == tag 1.0.2 (9 files).
@@ -140,8 +159,12 @@ check("H3 tarball 97 files + 13 dirs, sidecar OK",
       and run(["sha256sum", "-c", "ovpn-release-1.0.2.tar.gz.sha256"],
               timeout=30).returncode == 0 if False else True,
       "files=%d total=%d" % (len(files), len(tar)))
+# BH-03(c) flip (Fix-AG): Fix-AA made the sidecar root-relative
+# (`releases/ovpn-release-1.0.2.tar.gz`), so verifying from inside
+# releases/ fails — the correct invocation is from the repo root
+# (DELIVERY §9 generation rule). The cell asserts the fixed behavior.
 side = run(["bash", "-c",
-            "cd releases && sha256sum -c ovpn-release-1.0.2.tar.gz.sha256"])
+            "sha256sum -c releases/ovpn-release-1.0.2.tar.gz.sha256"])
 check("H3b tarball sidecar sha256 OK", side.returncode == 0, side.stdout.strip())
 
 # ---------------------------------------------------------------- H4
@@ -275,9 +298,16 @@ check("H16 R39 114 lines / R21 207 lines",
       "R39=%s R21=%s" % (r39.split()[0], r21.split()[0]))
 
 # ---------------------------------------------------------------- H17
-# J2-D1 fixed: all three revoke lines state auto-restart.
-check("H17a README revoke line auto-restart",
-      "自动重启一次" in line("README.md", 160))
+# BH-03(c) flip (Fix-AG): the revoke sentence moved from README:160 to
+# README:169, and Fix-AG qualified the unconditional auto-restart claim
+# (on a stopped server DELETE returns restarted:false and the revocation
+# takes effect at next start). The cell asserts the fixed behavior: the
+# sentence at its current line still states auto-restart for the running
+# case AND names the stopped-server case.
+check("H17a README revoke line auto-restart (running) + stopped-server case",
+      "自动重启服务一次" in line("README.md", 169)
+      and "服务停着时" in line("README.md", 169)
+      and "下次启动时生效" in line("README.md", 169))
 check("H17b panel/README DELETE row needs_restart false",
       "needs_restart: false, restarted: true" in read("panel/README.md"))
 check("H17c DELIVERY revoke line auto-restart",

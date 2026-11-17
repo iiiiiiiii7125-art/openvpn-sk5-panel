@@ -159,18 +159,29 @@ cell("D09 panel/README line citation points at the real note",
 # R43-J4-1: r42_f4_age.mjs and r43_j4_journey.mjs joined the corpus
 # after the R42 fix; the list below is the corpus -- extend it in the
 # same commit whenever a Worker probe file is added, or D10 and the
-# README will silently go stale again.)
+# README will silently go stale again.
+# R46-L4-2 / Fix-AG: five more files joined tests/ without updating the
+# list (r41_fix_e_dom, r42_f5_frontend, r45_fix_ad_frontend,
+# r45_fix_ad_worker, r45_l7_worker); the corpus is now all 23 tests/
+# .mjs files, 359 cells. docs/audit/l5-probes/r41_l5_worker.mjs is NOT
+# in the list: it lives with the R41 audit report, not in tests/.
+# The parser also handles the three output shapes in the corpus:
+# "TOTAL N cells", "N/N PASS", "checks=N failures=M", and "ALL PASS"
+# (count the ^PASS lines).)
 worker_files = [
     "tests/bh_worker_poll_guard.mjs", "tests/bi_worker_malformed.mjs",
-    "tests/bi_worker_queue_race.mjs", "tests/r17_worker.mjs",
+    "tests/bi_worker_queue_race.mjs", "tests/br_loginfail_array.mjs",
+    "tests/r17_worker.mjs",
     "tests/r18_worker_malformed.mjs", "tests/r18_worker_queue_race.mjs",
     "tests/r19_worker_nonlist_container.mjs", "tests/r19_worker_ovpn_download.mjs",
     "tests/r22_time_bounds.mjs", "tests/r23_persist_shapes.mjs",
     "tests/r27_worker_dangling_queue.mjs", "tests/r29_worker_toggle_bool.mjs",
     "tests/r31_ctype.mjs", "tests/r31_edge.mjs",
-    "tests/r41_l6_worker_parity.mjs", "docs/audit/l5-probes/r41_l5_worker.mjs",
-    "tests/br_loginfail_array.mjs",
-    "tests/r42_f4_age.mjs", "tests/r43_j4_journey.mjs",
+    "tests/r41_fix_e_dom.mjs", "tests/r41_l6_worker_parity.mjs",
+    "tests/r42_f4_age.mjs", "tests/r42_f5_frontend.mjs",
+    "tests/r43_j4_journey.mjs",
+    "tests/r45_fix_ad_frontend.mjs", "tests/r45_fix_ad_worker.mjs",
+    "tests/r45_l7_worker.mjs",
 ]
 total, per = 0, {}
 for f in worker_files:
@@ -180,10 +191,16 @@ for f in worker_files:
     if m:
         n = int(m.group(1))
     else:
-        m = re.search(r"(\d+)/(\d+)(?: (?:passed|PASS|fixed-behavior cells pass)|$)",
-                      out, re.M)
+        m = re.search(r"checks=(\d+) failures=", out)
         if m:
-            n = int(m.group(2))
+            n = int(m.group(1))
+        else:
+            m = re.search(r"(\d+)/(\d+)(?: (?:passed|PASS|fixed-behavior cells pass)|$)",
+                          out, re.M)
+            if m:
+                n = int(m.group(2))
+            elif "ALL PASS" in out:
+                n = len(re.findall(r"^PASS ", out, re.M))
     per[f] = n
     total += n or 0
 _crm = read("cloudflare/README.md")

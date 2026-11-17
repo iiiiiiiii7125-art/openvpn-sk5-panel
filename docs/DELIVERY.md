@@ -2,7 +2,7 @@
 
 > 发布包：`releases/ovpn-release-1.0.2.tar.gz`（包内清单与校验值见 §9；包自身的 sha256 全值见同目录伴生文件 `ovpn-release-1.0.2.tar.gz.sha256`）。
 > 交付日期：2026-11-13。AUDIT-R39 已判**可交付（差集 ∅）**，live-21 真机轮**全部通过、零新 bug**。历史台账 185 条：已修 174、部分 2（按设计）、未验 1（P0-1，Cloudflare 真实部署）、新 0、复发 0。
-> 以上是 1.0.2 发布时的快照（基线 tag 1.0.2）。1.0.2 之后又跑了 AUDIT-R41（30 条：P0 1/P1 9/P2 20，Fix-A～G 全修）、AUDIT-R42（24 条＋1 瞬态残留：P1 3/P2 21，Fix-H～M＋Fix-N 全修）、AUDIT-R43（7 条，Fix-O～R 全修），索引见 `docs/audit/AUDIT-R41.md`、`docs/audit/AUDIT-R42.md`、`docs/audit/AUDIT-R43.md`；历史台账现为 246 条（185＋61），三轮差集均已清空。
+> 以上是 1.0.2 发布时的快照（基线 tag 1.0.2）。1.0.2 之后又跑了 AUDIT-R41（30 条：P0 1/P1 9/P2 20，Fix-A～G 全修）、AUDIT-R42（24 条＋1 瞬态残留：P1 3/P2 21，Fix-H～M＋Fix-N 全修）、AUDIT-R43（7 条，Fix-O～R 全修）、AUDIT-R44（14 条：P2 14，Fix-S～W 全修）、AUDIT-R45（22 条：P1 候选 1/P2 21，Fix-X～AB＋X2 全修）与 R45 真机轮（2 条：LIVE-R45-1 P2、LIVE-R45-2 P1 候选，Fix-AC/AD 全修），索引见 `docs/audit/AUDIT-R41.md`、`docs/audit/AUDIT-R42.md`、`docs/audit/AUDIT-R43.md`、`docs/audit/AUDIT-R44.md`、`docs/audit/AUDIT-R45.md`；历史台账现为 284 条（185＋99），各轮差集均已清空。R45 后的真机复验轮（候选 e7f18ff）又发现 2 条（LIVE-R45-3 P1 候选：证书轮换砖 agent 的 TOFU pin；LIVE-R45-4 P2：纯代码升级不重启面板），随 R46 修法轮处理。
 > **未验清单（交付后仍未验，不冒充）**：Cloudflare Worker 真实部署（P0-1，见 §2）；arm64 安装校验（本机 x86_64，无 arm64 机）；SK5 端口 1001 vs 9000 仍待确认（面板默认 1001，见 §5）。
 
 ## 0. 这是什么
@@ -135,7 +135,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 
 1. **建服务**：服务卡片里建 OpenVPN 服务。默认 UDP 1194；要 TCP 443 模式在建服务时选 proto=tcp、port=443（建服务后改协议须重建服务；`allow_port_change` 为 false 时端口冻结，见 P01 口径）。
 2. **设对外地址**：服务卡片「对外地址（.ovpn 的 remote，留空=自动探测公网 IP）」字段。留空自动探测公网 IP；多 IP / 内网穿透场景手动填公网地址；「自动探测公网 IP」按钮可一键探测。`.ovpn` 的 remote 即取该值。
-3. **加用户**：用户卡片「新建用户名」字段填名 → 点「新建用户」→ 签发证书 → 在用户列表点「下载 .ovpn」导入客户端即可连接。吊销后 OpenVPN 服务自动重启一次，新连接立即按吊销后的 CRL 拒绝，无须手动重启。**不要点「重建 CA」**：重建 CA 会销毁现有 CA，全部已签发用户证书立即失效、旧 .ovpn 全部作废，重建后须逐个重建用户并重新下载 .ovpn（按钮有两次确认，仍请勿误点）。
+3. **加用户**：用户卡片「新建用户名」字段填名 → 点「新建用户」→ 签发证书 → 在用户列表点「下载 .ovpn」导入客户端即可连接。吊销后，若服务正在运行，OpenVPN 服务自动重启一次，新连接立即按吊销后的 CRL 拒绝；服务停着时不重启，吊销在服务下次启动时生效，无须手动重启。**不要点「重建 CA」**：重建 CA 会销毁现有 CA，全部已签发用户证书立即失效、旧 .ovpn 全部作废，重建后须逐个重建用户并重新下载 .ovpn（按钮有两次确认，仍请勿误点）。
 4. **填 SK5**：左侧导航「SK5 出口」卡片，字段：`SK5 地址（host）`（例如 `proxy.iproyal.net`）、`端口`（默认 1001，见 §5）、`用户名`、`密码`。填完勾选「启用 SK5 作为出口」。
 5. **一键启用**：点「一键启用」按钮。成功后卡片徽标变「已启用」，顶栏「当前出口 IP」与「出口 IP」字段显示 SK5 的出口 IP（后缀「经 SK5 出口」）。
 6. **验出口 IP**：客户端连上 VPN 后访问 `ifconfig.me`，出口 IP 应为 SK5 的 IP；面板「当前出口 IP」字段应一致。若显示「直连出口」或 IP 为中转机本机 IP，说明链路未走 SK5，按 §8 排查。
@@ -209,11 +209,12 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 
 核对方法（本机）：`sha256sum -c releases/ovpn-release-1.0.2.tar.gz.sha256`；解包后 `tar tzf releases/ovpn-release-1.0.2.tar.gz | wc -l` 应为 97 个文件 + 目录条目。伴生校验文件须从仓库根目录生成（`sha256sum releases/ovpn-release-<版本>.tar.gz > releases/ovpn-release-<版本>.tar.gz.sha256`，不得先 `cd releases` 再生成，否则文件里只有裸文件名、根目录下核对失败——1.0.2 发布时即因此错过前缀，R45-L4-1；树内文件已纠正，已发布的 1.0.2 tag 上的伴生文件仍为裸文件名，核对该 tag 的包时须进 `releases/` 再跑 `sha256sum -c`）。门禁：`bash verify-integration.sh` 应为 `PASS=30 FAIL=0 SKIP=0`（30 格，含 §7 哈希钉死两层；脚本用固定 `/tmp/ovpn-int-test`＋8443 端口，须串行跑）。§9 的关键文件哈希表是 1.0.2 发布快照（与 live-21 的树一致），改动文件的哈希在打包时按 R34 §6 惯例刷新，不随每次修复提交改。
 
-**凭据扫描（R41-L7-P2-3，强制门禁）**：`scripts/check-no-secrets.sh` 检查已追踪文件是否含凭据——敏感文件名（`secret.key` / `admin.pass` / `panel.db` / `sk5.json` / `agent_queue.json`）、`panel/data/` 内文件、已发货密钥的 SHA-256（`panel/app.py` 的 tripwire 值，定义处除外）、私钥 PEM 块（`tests/r17_core.py` 的 FAKE 夹具除外）、发布包内凭据条目；只报文件路径，不打印匹配内容。两个执行点：① `verify-integration.sh` 的 0 号格（计入 30 格，跑在 venv 之前）；② pre-push hook（每 clone 装一次：`cp scripts/git-hooks/pre-push .git/hooks/pre-push`，或 `git config core.hooksPath scripts/git-hooks`）。
+**凭据扫描（R41-L7-P2-3，强制门禁）**：`scripts/check-no-secrets.sh` 检查已追踪文件是否含凭据——敏感文件名（`secret.key` / `admin.pass` / `panel.db` / `sk5.json` / `agent_queue.json` / `ta.key`）、`panel/data/` 内文件、已发货密钥的 SHA-256（`panel/app.py` 的 tripwire 值，定义处除外）、私钥 PEM 块（含 `ENCRYPTED PRIVATE KEY` 块与 OpenVPN 静态密钥块；`tests/r17_core.py` 的 FAKE 夹具除外）、发布包内凭据条目；只报文件路径，不打印匹配内容。Git 模式只读索引（`git ls-files` / `git grep --cached`），未追踪文件对扫描不可见——门禁只在提交后才算数，跑门禁前先提交。两个执行点：① `verify-integration.sh` 的 0 号格（计入 30 格，跑在 venv 之前）；② pre-push hook（每 clone 装一次：`cp scripts/git-hooks/pre-push .git/hooks/pre-push`，或 `git config core.hooksPath scripts/git-hooks`）。
 
 ## 10. 审计与真机证据索引
 
 - 审计（1.0.2 发布时）：`docs/audit/AUDIT-R39.md`（114 行，可交付，差集 ∅）为该版本的终审；此前 R26–R38 各轮差集 0–3 条（R27 一 P1 其余全 P2；R36 与 R39 差集 ∅）均已修复闭合，历史 185 条全在 R39 §6 复扫（174 已修、2 部分按设计、1 未验 P0-1、0 复发）。
-- 审计（1.0.2 之后）：`docs/audit/AUDIT-R41.md`（30 条，P0 1/P1 9/P2 20，Fix-A～G 全修，差集 ∅）、`docs/audit/AUDIT-R42.md`（24 条＋1 瞬态，P1 3/P2 21，Fix-H～M＋Fix-N 全修，差集 ∅）、`docs/audit/AUDIT-R43.md`（7 条，Fix-O～R 全修，差集 ∅）。
-- 真机（1.0.2 发布时）：`docs/live-verify-R21.md`（207 行，全部通过、零新 bug）为该版本的终轮；R35–R39 修复格与域名反代成功路径全过（交互真装真实 LE 证书、换域＋安装器重启＋NRestarts=0、空重跑 Caddy 存活、TCP-443 守卫、R37-P2-1 守卫恢复、R38-P2-1 目录 0755 自愈），headline-9 毒树重跑硬门通过；S0–S4 与 headline 六项全过。1.0.2 之后又跑了 R41 真机轮（候选 c5bbd61，升级＋UDP 数据面通过；LIVE-R41-1 域名 502 已由 Fix-G 修）与 R42 真机轮（候选 9331daf，门禁 29/30、升级/新装/TCP 443/状态交叉全过；LIVE-R42-1 瞬态 502 已由 Fix-N 修，Fix-N 真机复验待补轮）。
+- 审计（1.0.2 之后）：`docs/audit/AUDIT-R41.md`（30 条，P0 1/P1 9/P2 20，Fix-A～G 全修，差集 ∅）、`docs/audit/AUDIT-R42.md`（24 条＋1 瞬态，P1 3/P2 21，Fix-H～M＋Fix-N 全修，差集 ∅）、`docs/audit/AUDIT-R43.md`（7 条，Fix-O～R 全修，差集 ∅）、`docs/audit/AUDIT-R44.md`（14 条，P2 14，Fix-S～W 全修，差集 ∅）、`docs/audit/AUDIT-R45.md`（22 条，P1 候选 1/P2 21，Fix-X～AB＋X2 全修，差集 ∅）。
+- 真机（1.0.2 发布时）：`docs/live-verify-R21.md`（207 行，全部通过、零新 bug）为该版本的终轮；R35–R39 修复格与域名反代成功路径全过（交互真装真实 LE 证书、换域＋安装器重启＋NRestarts=0、空重跑 Caddy 存活、TCP-443 守卫、R37-P2-1 守卫恢复、R38-P2-1 目录 0755 自愈），headline-9 毒树重跑硬门通过；S0–S4 与 headline 六项全过。1.0.2 之后又跑了 R41 真机轮（候选 c5bbd61，升级＋UDP 数据面通过；LIVE-R41-1 域名 502 已由 Fix-G 修）与 R42 真机轮（候选 9331daf，门禁 29/30、升级/新装/TCP 443/状态交叉全过；LIVE-R42-1 瞬态 502 已由 Fix-N 修，Fix-N 真机复验已过（R45 真机轮：域名轮询 150 次 200、0 个 502）。
+- 真机（1.0.2 之后）：R45 真机轮（候选 6eac5af）：Fix-N 真机复验通过（域名轮询 150 次 200、0 个 502）；升级带存量数据、新装、TCP 443、状态交叉、过期服务端证书续签、卸载全过；LIVE-R45-1（PID 父目录）与 LIVE-R45-2（agent 侧脚本未更新）由 Fix-AC/AD 修，复验轮（候选 e7f18ff）全过。复验轮又发现 LIVE-R45-3（P1 候选：面板证书轮换后 agent 的 TOFU pin 失效，静默断联约 10 小时）与 LIVE-R45-4（P2：纯代码升级不重启面板），随 R46 修法轮处理。
 - 探针资产在包外：`tests/` 未进发布包（开发验证用，见树内 `tests/README.md`）。
