@@ -50,7 +50,7 @@
 
 ## 一键安装
 
-目标机：全新 Debian 12 / Ubuntu 22.04 / 24.04，root，amd64 或 arm64。
+目标机：全新 Debian 12 / Ubuntu 22.04 / 24.04，root，amd64 或 arm64。**支持系统门**：不在这个清单上的系统，安装器直接报错退出（`unsupported OS`）；加 `ALLOW_UNSUPPORTED_OS=1` 可强行继续，但只警告、不保证能装——Ubuntu 20.04 不在支持之列，用该变量强行安装可能在旧版 OpenVPN/easy-rsa 上失败。
 
 以下命令全部在目标机上执行（先 ssh 登录到机器），直接粘贴即可。
 
@@ -62,7 +62,7 @@ git clone https://github.com/iiiiiiiii7125-art/openvpn-sk5-panel && cd openvpn-s
 cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443 bash install.sh
 ```
 
-安装器只按固定清单复制文件（`agent core egress panel systemd install.sh verify.sh verify-integration.sh README.md`），克隆来的 `.git/` 不会进 `/opt`。
+安装器只按固定清单复制文件（`agent core egress panel scripts systemd install.sh verify.sh verify-integration.sh README.md`），克隆来的 `.git/` 不会进 `/opt`。
 
 备选（目标机不能直连 GitHub 时）：在本机把整个 `openvpn-sk5-panel/` 目录拷到目标机（`scp -r` / `rsync` 任选），或在目标机上直接下载发布包后解包安装：
 
@@ -78,7 +78,7 @@ cd /root/openvpn-sk5-panel && bash install.sh
 cd /root && curl -L -o ovpn-release-1.0.2.tar.gz https://raw.githubusercontent.com/iiiiiiiii7125-art/openvpn-sk5-panel/1.0.2/releases/ovpn-release-1.0.2.tar.gz && tar xzf ovpn-release-1.0.2.tar.gz && cd openvpn-sk5-panel && bash install.sh
 ```
 
-安装完打印面板地址 `https://<服务器 IP>:8443` + 初始管理员密码（仅显示一次，也写在 `/etc/openvpn-sk5-panel/admin.pass`，0600）。重装不会轮换密码、CA 与服务端证书。装完自检：`bash /opt/openvpn-sk5-panel/verify.sh`（24 项检查，逐项 PASS/FAIL/SKIP）。
+安装完打印面板地址 `https://<服务器 IP>:8443` + 初始管理员密码（仅显示一次，也写在 `/etc/openvpn-sk5-panel/admin.pass`，0600）。**首次打开浏览器会提示“不安全 / 证书不受信任”，属预期**（面板证书是自签的）：点「高级」→「继续前往」即可；安装时填域名（Caddy + Let's Encrypt）可彻底消除该提示。重装不会轮换密码、CA、面板会话密钥与服务端证书。装完自检：`bash /opt/openvpn-sk5-panel/verify.sh`（24 项检查，逐项 PASS/FAIL/SKIP）。
 
 域名反代（安装时交互填写）：装到面板 TLS 与 `panel.env` 之后会问一次 `面板域名（留空则不设反代，直接用 https://IP:8443）`，填域名后自动装 Caddy 并反代到面板，自动办 Let's Encrypt 证书（HTTP-01，需 80 端口可达且域名已解析到本机），面板之后用 `https://<域名>` 访问，`https://IP:8443` 仍可用。留空 = 不设反代；重装时留空表示“不改动”，保留已配的域名。非交互安装用环境变量预设：`OVPN_PANEL_DOMAIN=panel.example.com bash install.sh`。域名须是裸域名（无 scheme/端口/路径，形如 `panel.example.com`）；解析未生效时只警告、不中断安装，Caddy 会在 DNS 生效后自动重试。换域名：`OVPN_PANEL_DOMAIN=<新域名> bash install.sh` 重装。去掉反代需手动操作：停并禁用 Caddy（`systemctl disable --now caddy`）、删 `/etc/caddy/Caddyfile` 里的 `# BEGIN openvpn-sk5-panel` … `# END openvpn-sk5-panel` 段、删 `/etc/openvpn-sk5-panel/panel.env` 里的 `OVPN_PANEL_DOMAIN`、`OVPN_PANEL_HTTPS`、`OVPN_TRUSTED_PROXY` 三行并重启面板（`systemctl restart openvpn-sk5-panel`）。三行必须一起删：只删域名行、留下 `OVPN_TRUSTED_PROXY=1` 时，面板在直连 8443 上仍信任伪造的 `X-Forwarded-For`。反代与 OpenVPN TCP 443 模式互斥：Caddy 占 TCP 80（HTTP-01 办证）与 TCP 443（HTTPS），同一台机器上域名反代与 TCP 443 模式不能共存。安装时服务端已是 TCP 443（`OVPN_PROTO=tcp OVPN_PORT=443`）时，填域名也会被跳过并大声警告、反代不设，面板仍用 `https://IP:8443`；要用域名先把服务端改回 UDP 1194（默认）或改出 TCP 443，再重装填域名。反代在跑时，面板里把服务端切到 TCP 443 会被拒绝（500，点名 caddy 占着 `*:443`），服务端保持原协议/端口；要切 TCP 443 先按上面「去掉反代」步骤拆掉反代再切。
 
@@ -87,9 +87,9 @@ cd /root && curl -L -o ovpn-release-1.0.2.tar.gz https://raw.githubusercontent.c
 `install.sh` 会做的事（幂等，可重跑）：
 
 1. 断言安装目标不是现存部署目录（命中 `/root/flmx-panel` 即退出；已装 FLMX 的机器只会收到提示，不会被碰）。
-2. `apt install` openvpn、easy-rsa、curl、jq、python3、pip 等；`iptables-persistent` 只在未装 ufw 的机器上装（与 ufw 冲突，装了会卸载 ufw；ufw 机上端口走 ufw 放行、NAT/FORWARD 规则仅 live 生效，重启后重跑安装器补回）。
+2. `apt install` openvpn、easy-rsa、curl、jq、python3、python3-pip、python3-venv 等；`iptables-persistent` 只在未装 ufw 的机器上装（与 ufw 冲突，装了会卸载 ufw；ufw 机上端口走 ufw 放行、NAT/FORWARD 规则仅 live 生效，重启后重跑安装器补回）。
 3. 装 sing-box **1.11.15**（官方 GitHub release tar.gz，sha256 校验，失败即停）与 tun2socks **2.7.0**（备用）。
-4. 复制 `core/`、`egress/`、`panel/`、`agent/`、`systemd/`、`verify-integration.sh` 到 `/opt/openvpn-sk5-panel/`；建 `/etc/openvpn-sk5-panel/`（0700）。
+4. 复制 `core/`、`egress/`、`panel/`、`agent/`、`scripts/`、`systemd/`、`verify-integration.sh` 到 `/opt/openvpn-sk5-panel/`；建 `/etc/openvpn-sk5-panel/`（0700）。
 5. 调 `core/openvpn_manager.py` 初始化 PKI（`/etc/openvpn/server/easy-rsa`）+ 建服务端证书 + 渲染 `/etc/openvpn/server/server.conf`。
 6. 写直连模式的 sing-box 初始配置（`/etc/openvpn-sk5-panel/sing-box.json`，`sing-box check` 通过才继续）。
 7. 生成面板自签 TLS 证书；装 systemd 单元并启动 `openvpn-server@server`、`openvpn-sk5-singbox`、`openvpn-sk5-panel`。
@@ -247,7 +247,7 @@ openvpn-sk5-panel/
 ```
 
 全链集成测试（沙箱实测，2026-11-12）：`bash verify-integration.sh` →
-**PASS=29 FAIL=0 SKIP=0**。覆盖：面板起（nobody 身份，/tmp 副本数据，
+**PASS=30 FAIL=0 SKIP=0**（R41 起 30 格：新增 0 号凭据扫描格）。覆盖：面板起（nobody 身份，/tmp 副本数据，
 未碰 /etc）、GET / 200 且含入站卡/SK5 卡标记、`/api/status` 未登录 401、
 登录、登录后 `/api/status` 200 且含 openvpn/sk5/egress 键（R2-P1-4 常驻
 回归：status() 变异恒 500 时本格必须变红）、注册节点拿 token、下发
@@ -279,7 +279,7 @@ report → 回执 done、下发 `create_user`（无 CA）→ 回执 failed 且 e
 ## 安全
 
 - SK5 密码只存在 `/etc/openvpn-sk5-panel/sk5.json`（0600），`get_status()`、日志、报错里永不出现明文；不要把它贴进工单或日志。
-- 面板自签证书浏览器会报不安全，属预期（无域名）；有域名时可把证书换成合法证书并重启 `openvpn-sk5-panel`。
+- 面板自签证书浏览器会报不安全，属预期（无域名）：首次打开点「高级」→「继续前往」即可；有域名时在安装时填域名，走 Caddy + Let's Encrypt 自动办证（见上「域名反代」），不要手动替换面板证书（Caddy 反代到面板时仍校验面板自签证书，手动换证会让反代失败）。
 - 面板以 root 运行（要操作路由/iptables/OpenVPN），只放内网或加访问控制，不要直接暴露到公网。
 - **改密（不强制）**：初始管理员密码随机生成、无默认值；登录即给完整 admin 会话，不设改密前置条件。改密接口 `POST /api/change-password` 存在（须旧密码，新密码 ≥12 位且含字母＋数字、UTF-8 不超过 72 字节（bcrypt 限制，按字节计）），改密后 `session_version` +1，全部旧会话立即失效。**仅服务器（Flask）模式可用；Cloudflare 模式下管理员密码是 Cloudflare secret，面板内改密回 501，须用 `wrangler secret put ADMIN_PASSWORD` 修改后重新部署（R11-P2-1）。**注：Flask 面板密码哈希已是 bcrypt（`panel/app.py` `_hash_password`，存量加盐 SHA-256 哈希在登录成功时透明迁移到 bcrypt）；bcrypt 未安装的极简环境才回落旧的加盐 SHA-256。
 - **登录限流（仅 IP 维）**：同一 IP 5 分钟内 5 次失败即锁 15 分钟，命中直接 429 + `Retry-After`。面板是单管理员密码登录，限流只看来源 IP。

@@ -7,9 +7,9 @@
 # (via core/openvpn_manager.py) -> direct-mode sing-box config ->
 # systemd units -> start everything -> print panel URL + admin password.
 #
-# Idempotent: re-running keeps the CA, server cert, admin password and
-# panel TLS cert, re-renders configs deterministically and restarts the
-# services. Safe to re-run after a failed first attempt.
+# Idempotent: re-running keeps the CA, server cert, admin password,
+# panel secret key and panel TLS cert, re-renders configs deterministically
+# and restarts the services. Safe to re-run after a failed first attempt.
 #
 # Usage:
 #   bash install.sh            # defaults: OpenVPN UDP 1194
@@ -301,7 +301,7 @@ apt-get update -qq
 # shellcheck disable=SC2086 -- _APT_EXTRA is intentionally word-split:
 # it is either empty (ufw host) or the single word iptables-persistent.
 apt-get install -y -qq --no-install-recommends \
-    openvpn easy-rsa ${_APT_EXTRA} curl jq python3 python3-pip \
+    openvpn easy-rsa ${_APT_EXTRA} curl jq python3 python3-pip python3-venv \
     iproute2 unzip ca-certificates openssl procps \
     || die "apt install failed"
 if [ "$_UFW_INSTALLED" -eq 1 ]; then
@@ -549,7 +549,10 @@ _TREE_COPY_FAILED=""
 if [ "$_SCRIPT_DIR_C" = "$_INSTALL_ROOT_C" ]; then
     log "source tree is the installed tree ($INSTALL_ROOT); skipping tree copy"
 else
-    for _item in agent core egress panel systemd install.sh verify.sh verify-integration.sh README.md; do
+    # scripts/ ships too: verify-integration.sh gate cell 0 runs
+    # scripts/check-no-secrets.sh from the installed tree, so the
+    # installed tree must carry it (and the pre-push hook next to it).
+    for _item in agent core egress panel scripts systemd install.sh verify.sh verify-integration.sh README.md; do
         if [ "$_item" = "panel" ]; then
             # R8-BUG-1: panel/ is NEVER copied wholesale. Its data/
             # subdirectory is live runtime state (panel.db, the agent
@@ -610,9 +613,17 @@ fi
 # itself: if the file ever equals the published shipped key, app.py
 # force-rotates it at startup and warns (P0-5 fingerprint check).
 mkdir -p "$INSTALL_ROOT/panel/data"
-python3 -c 'import os, secrets; open("/etc/openvpn-sk5-panel/secret.key", "wb").write(secrets.token_bytes(32))'
-chmod 600 "/etc/openvpn-sk5-panel/secret.key"
-log "generated fresh panel secret key (panel/data/ is never copied, so no shipped key can arrive)"
+# R41-L1-6: the panel secret is session state, not install state --
+# overwriting it on every re-run invalidates every signed session
+# cookie at the next panel restart (silent logout of all users).
+# Generate only when missing, like the TLS cert below.
+if [ ! -f "/etc/openvpn-sk5-panel/secret.key" ]; then
+    python3 -c 'import os, secrets; open("/etc/openvpn-sk5-panel/secret.key", "wb").write(secrets.token_bytes(32))'
+    chmod 600 "/etc/openvpn-sk5-panel/secret.key"
+    log "generated fresh panel secret key (panel/data/ is never copied, so no shipped key can arrive)"
+else
+    log "keeping existing panel secret key (a re-run never rotates it)"
+fi
 find "$INSTALL_ROOT" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 chmod 755 "$INSTALL_ROOT/core/easyrsa.sh" "$INSTALL_ROOT/egress/policy-routing.sh" 2>/dev/null || true
 chmod 755 "$INSTALL_ROOT/egress/test-egress.sh" 2>/dev/null || true
@@ -630,15 +641,42 @@ SERVER_IP="$(primary_ip)"
 [ -n "$SERVER_IP" ] || SERVER_IP="127.0.0.1"
 PANEL_CERT="$CONFIG_DIR/panel-cert.pem"
 PANEL_KEY="$CONFIG_DIR/panel-key.pem"
-if [ ! -f "$PANEL_CERT" ] || [ ! -f "$PANEL_KEY" ]; then
+# R41-L7-P2-1: the SANs must include IP:127.0.0.1 -- the agent verifies
+# the panel with hostname checking, and an empty panel_url defaults to
+# the access host, so a https://127.0.0.1:8443 panel_url is reachable
+# through the product's own default. A cert issued before this fix has
+# stale SANs: on re-run, regenerate it (backup first) instead of
+# keeping it forever. Only an installer-issued self-signed cert is
+# auto-regenerated: a cert that does not verify against itself (e.g. a
+# user-supplied CA-issued cert) is left alone, and an unparseable cert
+# is treated as stale (regenerated, backup first) rather than kept.
+_PANEL_CERT_STALE=0
+_PANEL_CERT_KEEP_NOTE=""
+if [ -f "$PANEL_CERT" ] && [ -f "$PANEL_KEY" ]; then
+    if ! _PANEL_CERT_TEXT="$(openssl x509 -in "$PANEL_CERT" -noout -text 2>/dev/null)"; then
+        _PANEL_CERT_STALE=1
+    elif ! printf '%s' "$_PANEL_CERT_TEXT" | grep -q "IP Address:127.0.0.1"; then
+        if openssl verify -CAfile "$PANEL_CERT" "$PANEL_CERT" >/dev/null 2>&1; then
+            _PANEL_CERT_STALE=1
+        else
+            _PANEL_CERT_KEEP_NOTE=" (not self-signed; SANs left as supplied)"
+        fi
+    fi
+fi
+if [ ! -f "$PANEL_CERT" ] || [ ! -f "$PANEL_KEY" ] || [ "$_PANEL_CERT_STALE" -eq 1 ]; then
+    if [ "$_PANEL_CERT_STALE" -eq 1 ]; then
+        log "existing panel TLS cert lacks IP:127.0.0.1 in SANs -- regenerating (old pair kept as .bak)"
+        cp "$PANEL_CERT" "$PANEL_CERT.bak" 2>/dev/null || true
+        cp "$PANEL_KEY" "$PANEL_KEY.bak" 2>/dev/null || true
+    fi
     log "generating self-signed panel TLS cert (CN=$SERVER_IP, 10y)..."
     openssl req -x509 -newkey rsa:2048 -keyout "$PANEL_KEY" -out "$PANEL_CERT" \
         -days 3650 -nodes -subj "/CN=$SERVER_IP" \
-        -addext "subjectAltName=IP:$SERVER_IP,DNS:localhost" 2>/dev/null \
+        -addext "subjectAltName=IP:$SERVER_IP,IP:127.0.0.1,DNS:localhost" 2>/dev/null \
         || die "failed to generate panel TLS cert"
     chmod 600 "$PANEL_KEY"; chmod 644 "$PANEL_CERT"
 else
-    log "keeping existing panel TLS cert"
+    log "keeping existing panel TLS cert${_PANEL_CERT_KEEP_NOTE}"
 fi
 
 cat > "$INSTALL_ROOT/run-panel-tls.py" <<EOF
@@ -1525,6 +1563,8 @@ cat <<EOF
  初始密码: $ADMIN_PASS
    (仅显示一次；已保存于 $ADMIN_PASS_FILE，权限 0600。
     登录后点顶栏「修改密码」可改密，改后请妥善保存新密码。)
+ 注意: 面板证书是自签的，浏览器首次打开会提示“不安全 / 证书不受信任”，属预期：
+       点「高级」->「继续前往」即可打开；安装时填域名（Caddy + Let's Encrypt 自动办证）可彻底消除该提示。
  OpenVPN: proto=$OVPN_PROTO port=$OVPN_PORT subnet=$OVPN_SUBNET dns=$OVPN_DNS$_INHERIT_NOTE
    服务:  openvpn-server@server / openvpn-sk5-singbox / openvpn-sk5-panel
           openvpn-sk5-policy (开机恢复策略路由) / openvpn-sk5-healthcheck.timer (60 秒健康检查)

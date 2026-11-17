@@ -201,9 +201,35 @@ if "-----BEGIN CERTIFICATE-----" not in pem:
     print(json.dumps({"mode": "error", "ca_cert": None, "insecure": False,
                       "error": "panel presented no certificate"}))
     sys.exit(0)
-with open(out_pem, "w", encoding="utf-8") as f:
+# R41 (O-L5-1): a pin that cannot verify the panel is worse than no pin --
+# the agent would fail every poll with CERTIFICATE_VERIFY_FAILED while the
+# installer reported success. Trial-verify the pin against the panel with
+# the same check the agent performs (create_default_context + hostname
+# verification), writing to a temp file first so a failed trial leaves
+# any previous pin untouched.
+_tmp_pem = out_pem + ".tmp"
+with open(_tmp_pem, "w", encoding="utf-8") as f:
     f.write(pem if pem.endswith("\n") else pem + "\n")
-os.chmod(out_pem, 0o600)
+os.chmod(_tmp_pem, 0o600)
+try:
+    _vctx = ssl.create_default_context(cafile=_tmp_pem)
+    with socket.create_connection((host, port), timeout=15) as _vsock:
+        with _vctx.wrap_socket(_vsock, server_hostname=host):
+            pass
+except ssl.SSLCertVerificationError as exc:
+    os.unlink(_tmp_pem)
+    print(json.dumps({"mode": "error", "ca_cert": None, "insecure": False,
+                      "error": "pinned panel certificate does not verify (%s); "
+                               "the panel cert cannot be used for host %s -- fix "
+                               "the panel certificate or pass --ca-cert / "
+                               "--insecure" % (exc, host)}))
+    sys.exit(0)
+except (OSError, ssl.SSLError) as exc:
+    os.unlink(_tmp_pem)
+    print(json.dumps({"mode": "error", "ca_cert": None, "insecure": False,
+                      "error": str(exc)}))
+    sys.exit(0)
+os.replace(_tmp_pem, out_pem)
 result.update(mode="pinned", ca_cert=out_pem)
 print(json.dumps(result))
 PYEOF

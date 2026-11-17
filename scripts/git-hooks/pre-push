@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# pre-push hook: block pushing a tree that contains shipped credentials.
+# Install once per clone:
+#   cp scripts/git-hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# (or point git at the committed hooks dir: git config core.hooksPath scripts/git-hooks)
+# R41-L7-P2-3. The scan itself lives in scripts/check-no-secrets.sh and is
+# also gate cell 0 of verify-integration.sh.
+set -uo pipefail
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+if [ -z "$ROOT" ]; then
+    ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fi
+if [ ! -x "$ROOT/scripts/check-no-secrets.sh" ]; then
+    echo "pre-push: scripts/check-no-secrets.sh missing -- refusing to push blind" >&2
+    exit 1
+fi
+exec bash "$ROOT/scripts/check-no-secrets.sh" "$ROOT"

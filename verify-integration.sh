@@ -48,6 +48,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ---------- 0. 凭据扫描（R41-L7-P2-3） ----------
+# 发版前强制门禁：树里一旦出现凭据（secret.key / admin.pass / 已发货
+# 密钥哈希 / 私钥 PEM 块 / panel/data/ 内文件 / 发布包内凭据条目），
+# 本格红。0 号格计入总数（R41 起 29 -> 30 格），放在 venv 之前，
+# 这样即使 venv 失败导致面板链 SKIP，扫描也已跑过。
+if [ -x "$ROOT/scripts/check-no-secrets.sh" ]; then
+    if bash "$ROOT/scripts/check-no-secrets.sh" "$ROOT"; then
+        ok "凭据扫描：树内无凭据"
+    else
+        bad "凭据扫描：树内发现凭据（见上行输出）-- 清除后重跑"
+    fi
+else
+    bad "凭据扫描脚本缺失：$ROOT/scripts/check-no-secrets.sh 不存在"
+fi
+
 # ---------- 0. 准备副本 ----------
 rm -rf "$TESTDIR"
 mkdir -p "$TESTDIR"
@@ -596,7 +611,7 @@ fi
 # 为该 (binary, arch) 命名的常量（`("sing-box","amd64")` 须指向
 # `SINGBOX_SHA256_AMD64`，余类推），且该常量的解析值须等于
 # install.sh 的同名赋值；字典项数须恰为 4，缺项／多项亦红。
-# 两层都绿，本格才绿；任一层红即本格红（门禁仍 29 格）。
+# 两层都绿，本格才绿；任一层红即本格红（门禁 30 格：R41 起新增 0 号凭据扫描格）。
 _hash_mismatch=0
 for _name in SINGBOX_SHA256_AMD64 SINGBOX_SHA256_ARM64 TUN2SOCKS_SHA256_AMD64 TUN2SOCKS_SHA256_ARM64; do
     _h_install="$(grep "^${_name}=" "$ROOT/install.sh" | grep -oE '[0-9a-f]{64}' | head -1)"
