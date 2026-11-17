@@ -53,6 +53,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import zipfile
 import urllib.error
@@ -739,16 +740,83 @@ def action_disable_sk5(_params: dict) -> dict:
 
 
 def action_get_status(_params: dict) -> dict:
+    # R42-F3-1: one probe max, never inline in the poll loop. The old
+    # code ran get_status() (probed when SK5 is enabled) AND
+    # current_egress_ip() back to back here: 10.08 s with SK5 disabled,
+    # 20.05 s enabled+blackholed -- one stall already eats a third of
+    # the 30 s node-online budget, and two back-to-back dispatches flap
+    # the node offline. get_status() is now taken probe-free
+    # (probe_egress=False: config + local checks only) and the egress
+    # IP comes from the stale-while-revalidate cache below (same
+    # pattern as the panel's _probe_egress_cached); the probe runs
+    # once, in a single-flight daemon thread. Both the top-level
+    # egress_ip and sk5["egress_ip"] carry the cached value, so the
+    # panel/Worker snapshot readers see the same shape as before.
+    # Cold cache returns None (same cold-cache tradeoff as the panel
+    # local status) and the value lands on the next dispatch.
+    sk5 = sk5_manager.get_status(probe_egress=False)
+    ip = _egress_ip_cached()
+    sk5["egress_ip"] = ip
     return {
         "openvpn": openvpn_manager.server_status(),
         "users": openvpn_manager.list_users(),
-        "sk5": sk5_manager.get_status(),
-        "egress_ip": sk5_manager.current_egress_ip(),
+        "sk5": sk5,
+        "egress_ip": ip,
         # P1-8: last timer-driven health check (None until the first
         # check_health run); the panel snapshot reads this instead of
         # re-probing on every status poll.
         "health": sk5_manager.last_health(),
     }
+
+
+# R42-F3-1: agent-side egress-IP cache, stale-while-revalidate.
+_EGRESS_IP_CACHE = {"at": 0.0, "ip": None}
+_EGRESS_IP_CACHE_TTL = 10.0
+_EGRESS_IP_LOCK = threading.Lock()
+_EGRESS_IP_REFRESHING = {"busy": False}
+
+
+def _refresh_in_background(flag, lock, fn):
+    """Run fn() in a daemon thread unless a refresh is already running.
+    The flag check/set happens under lock; fn() itself runs outside
+    it and must never raise out."""
+    with lock:
+        if flag["busy"]:
+            return
+        flag["busy"] = True
+
+    def _run():
+        try:
+            fn()
+        finally:
+            with lock:
+                flag["busy"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _refresh_egress_ip():
+    try:
+        ip = sk5_manager.current_egress_ip()
+    except Exception:  # noqa: BLE001 - background refresh never raises
+        return
+    with _EGRESS_IP_LOCK:
+        _EGRESS_IP_CACHE.update({"at": time.time(), "ip": ip})
+
+
+def _egress_ip_cached():
+    """Egress IP (via SK5 if enabled, else direct) without ever
+    blocking the caller on a probe: fresh cache returns at once;
+    stale cache returns the last known value and refreshes behind;
+    cold cache returns None and refreshes behind."""
+    with _EGRESS_IP_LOCK:
+        now = time.time()
+        if now - _EGRESS_IP_CACHE["at"] < _EGRESS_IP_CACHE_TTL:
+            return _EGRESS_IP_CACHE["ip"]
+        ip = _EGRESS_IP_CACHE["ip"]
+    _refresh_in_background(_EGRESS_IP_REFRESHING, _EGRESS_IP_LOCK,
+                           _refresh_egress_ip)
+    return ip
 
 
 ACTIONS = {

@@ -1225,20 +1225,42 @@ def _remote_warning(ip):
     return None
 
 
-def _outward_ip():
-    """生成 .ovpn 的 remote 地址：显式设置 > 环境变量 > 公网探测 >
-    局域网地址。观察-1：旧顺序把局域网地址放第一，NAT/云主机上
-    每个 .ovpn 的 remote 都是内网 IP，站外根本连不上。"""
-    ip = _stored_server_ip() or os.environ.get("OPENVPN_SERVER_IP")
-    if ip:
-        return ip
-    if detect_public_ip is not None:
-        try:
-            detected = detect_public_ip()
-        except Exception:  # noqa: BLE001 - 探测失败即回落，不阻塞
-            detected = None
-        if detected:
-            return detected
+# R42-F3-2: outward-IP detection cache (stale-while-revalidate, same
+# pattern as _probe_egress_cached). detect_public_ip() does 2x5 s HTTPS
+# lookups plus unbounded getaddrinfo DNS time; _outward_ip() used to run
+# it synchronously on every /api/status and every .ovpn render, so a
+# fresh install with dead/slow DNS stalled each call ~10 s. Stored
+# server IP / OVPN_SERVER_IP still win immediately (no probe at all).
+# Otherwise the cached detected IP is returned (TTL 60 s); cold cache
+# returns the LAN fallback at once and detects in a single-flight
+# daemon thread, so the first status poll after panel start may show
+# the LAN address until the detection lands (same cold-cache tradeoff
+# as the Fix-B egress cache). The explicit "自动探测公网 IP" button
+# (/api/openvpn/public-ip) still probes synchronously on purpose -- it
+# is a deliberate manual action.
+_OUTWARD_IP_CACHE = {"at": 0.0, "ip": None}
+_OUTWARD_IP_CACHE_TTL = 60.0
+_OUTWARD_IP_LOCK = threading.Lock()
+_OUTWARD_IP_REFRESHING = {"busy": False}
+
+
+def _refresh_outward_ip():
+    if detect_public_ip is None:
+        return
+    try:
+        ip = detect_public_ip()
+    except Exception:  # noqa: BLE001 - background refresh never raises
+        ip = None
+    with _OUTWARD_IP_LOCK:
+        # Always stamp the attempt: a failed detection must not spin a
+        # refresh thread on every call (negative cache for one TTL).
+        _OUTWARD_IP_CACHE["at"] = time.time()
+        if ip:
+            _OUTWARD_IP_CACHE["ip"] = ip
+
+
+def _lan_address():
+    """Local address from the default route (no network probe)."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -1248,6 +1270,30 @@ def _outward_ip():
             sock.close()
     except OSError:
         return "127.0.0.1"
+
+
+def _outward_ip():
+    """生成 .ovpn 的 remote 地址：显式设置 > 环境变量 > 公网探测 >
+    局域网地址。观察-1：旧顺序把局域网地址放第一，NAT/云主机上
+    每个 .ovpn 的 remote 都是内网 IP，站外根本连不上。"""
+    ip = _stored_server_ip() or os.environ.get("OPENVPN_SERVER_IP")
+    if ip:
+        return ip
+    # R42-F3-2: never probe synchronously in the request path (see the
+    # cache comment above); the LAN fallback is the same value the old
+    # code returned after the probe failed.
+    with _OUTWARD_IP_LOCK:
+        cached = _OUTWARD_IP_CACHE["ip"]
+        age = time.time() - _OUTWARD_IP_CACHE["at"]
+    if cached is not None:
+        if age >= _OUTWARD_IP_CACHE_TTL:
+            _refresh_in_background(_OUTWARD_IP_REFRESHING,
+                                   _OUTWARD_IP_LOCK, _refresh_outward_ip)
+        return cached
+    if age >= _OUTWARD_IP_CACHE_TTL:
+        _refresh_in_background(_OUTWARD_IP_REFRESHING,
+                               _OUTWARD_IP_LOCK, _refresh_outward_ip)
+    return _lan_address()
 
 
 def _rebuild_user_ovpn(name):
@@ -2200,7 +2246,11 @@ def sk5_save():
         # and both run the full render + daemon restart.
         with _SK5_MUTATE_LOCK:
             try:
-                stored = sk5_get_status()
+                # R42-F3-5: probe-free read -- this branch only needs
+                # the stored host; the old call probed the egress
+                # (up to 10 s) inside _SK5_MUTATE_LOCK on every
+                # toggle-only save. Same dict shape, egress_ip None.
+                stored = sk5_get_status(probe_egress=False)
             except Exception as exc:  # noqa: BLE001
                 return jsonify({"ok": False, "error": str(exc)}), 500
             if not stored.get("host"):
@@ -2361,7 +2411,11 @@ def sk5_disable():
         # two concurrent disables would otherwise both read
         # enabled=true and both restart the daemon.
         with _SK5_MUTATE_LOCK:
-            stored = sk5_get_status()
+            # R42-F3-5: probe-free read -- this branch only needs the
+            # stored host; the old call probed the egress (up to 10 s)
+            # inside _SK5_MUTATE_LOCK on every disable. Same dict
+            # shape, egress_ip None.
+            stored = sk5_get_status(probe_egress=False)
             if not stored.get("host"):
                 return jsonify({"ok": True, "result": stored})
             result = sk5_set_sk5(enabled=False)
