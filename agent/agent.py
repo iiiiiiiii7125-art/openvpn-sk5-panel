@@ -326,6 +326,20 @@ def _post_json(
 # heartbeat (cheap: no network probes -- a curl per poll would be wasteful)
 # ---------------------------------------------------------------------------
 
+def _installed_bundle_sha256() -> str | None:
+    """Hash of the bundle this agent was installed from (written by
+    install-agent.sh to <install-root>/bundle.sha256), or None when
+    unknown: a local-checkout install, or an agent installed before
+    the hash was recorded. A malformed record is treated as unknown,
+    never as a hash -- the heartbeat must never lie about staleness."""
+    try:
+        text = (Path(__file__).resolve().parent.parent
+                / "bundle.sha256").read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return None
+    return text if re.fullmatch(r"[0-9a-f]{64}", text) else None
+
+
 def heartbeat_status() -> dict:
     """Small status block sent with every poll."""
     try:
@@ -355,6 +369,10 @@ def heartbeat_status() -> dict:
         "hostname": platform.node(),
         "openvpn_running": running,
         "sk5_enabled": sk5_enabled,
+        # R45-LIVE-2: installed bundle hash; the panel compares it
+        # against its current bundle and flags a stale agent. None
+        # when unknown (never a lie).
+        "bundle_sha256": _installed_bundle_sha256(),
     }
 
 

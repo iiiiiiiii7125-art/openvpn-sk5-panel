@@ -769,11 +769,16 @@ function installCommand(panelUrl, token, nodeName) {
 
 async function handleListNodes(request, env) {
   const nodes = await listNodes(env);
+  // R45-LIVE-2: 源站当前 bundle 哈希只取一次，供全表 agent 代码
+  // 过期标记复用（取不到时各节点的 outdated 即未知，不谎报）。
+  const currentHash = await originBundleSha256(env);
   const out = [];
   for (const n of nodes) {
     const snap = await kvGetJson(env, `status:${n.name}`);
     // R41-L5-P2-3：心跳形快照的扁平键也参与派生（全量对象优先）。
     const { ovpn: ovpnRaw, sk5Enabled } = deriveSnapshotSections(snap);
+    const installedHash =
+      (snap && typeof snap.bundle_sha256 === "string" && snap.bundle_sha256) || null;
     const ovpn = ovpnRaw ? await mergeServerCfg(env, n.name, ovpnRaw) : null;
     out.push({
       name: n.name,
@@ -784,6 +789,10 @@ async function handleListNodes(request, env) {
       online_users: ovpn ? ovpn.online_users || 0 : null,
       egress_ip: snap && snap.egress ? snap.egress.ip || null : null,
       sk5_enabled: sk5Enabled,
+      agent_bundle_sha256: installedHash,
+      agent_code_outdated: installedHash
+        ? (currentHash ? installedHash !== currentHash : null)
+        : null,
       status_age_s:
         snap && snap.at ? Math.floor((nowMs() - snap.at) / 1000) : null,
     });
@@ -1133,6 +1142,9 @@ async function handleAgentPoll(request, env) {
     if (typeof body.status.hostname === "string") hb.hostname = body.status.hostname;
     if (typeof body.status.openvpn_running === "boolean") hb.openvpn_running = body.status.openvpn_running;
     if (typeof body.status.sk5_enabled === "boolean") hb.sk5_enabled = body.status.sk5_enabled;
+    // R45-LIVE-2: agent 上报的安装包哈希随心跳进快照（panel 比对
+    // 当前包后给出 agent_code_outdated；未上报即未知，不谎报）。
+    if (typeof body.status.bundle_sha256 === "string") hb.bundle_sha256 = body.status.bundle_sha256;
     await kvPutJson(env, `status:${node.name}`, { ...prev, ...hb });
   }
   const now = nowMs();
@@ -1440,6 +1452,15 @@ async function cachedStatus(env, nodeName) {
     ovpn.remote_warning = remoteWarning(rawEgressIp);
   }
   const egress = (snap && snap.egress) || {};
+  // R45-LIVE-2: agent 代码过期标记。installedHash 取心跳上报的
+  // bundle_sha256（未上报即未知）；currentHash 只在有上报值时才取
+  // （取不到即未知，绝不谎报）。
+  const installedHash =
+    (snap && typeof snap.bundle_sha256 === "string" && snap.bundle_sha256) || null;
+  const currentHash = installedHash ? await originBundleSha256(env) : null;
+  const agentCodeOutdated = installedHash
+    ? (currentHash ? installedHash !== currentHash : null)
+    : null;
   // R7-P1-1: via_sk5 的唯一判据是实测的 policy_routing_active，与 Flask
   // status() 同款。agent 的 get_status() 在 enabled 时恒写 egress_ip
   // 探针值，只看 sk5.enabled 会在策略路由缺失时谎称流量经 SK5
@@ -1478,6 +1499,8 @@ async function cachedStatus(env, nodeName) {
     users: (snap && snap.users) || [],
     stale: ageS === null || ageS > 60,
     age_s: ageS,
+    agent_bundle_sha256: installedHash,
+    agent_code_outdated: agentCodeOutdated,
     note:
       ageS === null
         ? "节点尚未上报状态：agent 首次 poll 后执行一次 get_status 即可"
@@ -1876,6 +1899,25 @@ async function handleAgentBundle(request, env) {
       "Content-Disposition": 'attachment; filename="ovpn-agent-bundle.tar.gz"',
     },
   });
+}
+
+// R45-LIVE-2: 源站当前 bundle 哈希（KV 缓存 1 小时，供
+// agent_code_outdated 比对）。源站未配置或取不到时回 null——
+// outdated 即未知，绝不谎报过期。安装包下发仍走 handleAgentBundle
+// 的逐次校验，不复用此缓存。
+async function originBundleSha256(env) {
+  const cached = await kvGetJson(env, "origin_bundle_sha256");
+  if (cached && typeof cached.hash === "string" && typeof cached.at === "number"
+      && nowMs() - cached.at < 3600 * 1000) return cached.hash;
+  const origin = bundleOrigin(env);
+  if (!origin) return null;
+  const got = await fetchFromOrigin(origin, "/api/agent/bundle.sha256");
+  if (!got.ok) return null;
+  const text = (await got.res.text()).trim();
+  const hash = text.split(/\s+/)[0] || "";
+  if (!/^[0-9a-f]{64}$/.test(hash)) return null;
+  await kvPutJson(env, "origin_bundle_sha256", { hash, at: nowMs() }, { expirationTtl: 3600 });
+  return hash;
 }
 
 async function handleInstallAgentScript(request, env, shaOnly) {

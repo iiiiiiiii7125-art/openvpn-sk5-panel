@@ -834,7 +834,11 @@ function normalizeNode(n) {
     sk5_enabled: (n.sk5_enabled != null ? n.sk5_enabled : (ls.sk5 ? !!ls.sk5.enabled : null)),
     online_users: ovpn.online_users || 0,
     proto: ovpn.proto || null,
-    port: ovpn.port || null
+    port: ovpn.port || null,
+    /* R45-LIVE-2: agent 代码过期标记（服务端比对心跳上报的安装包
+       哈希与当前包；顶层键优先，快照里的 bundle_sha256 兜底）。 */
+    agent_bundle_sha256: (n.agent_bundle_sha256 != null ? n.agent_bundle_sha256 : (ls.bundle_sha256 || null)),
+    agent_code_outdated: (n.agent_code_outdated != null ? n.agent_code_outdated : null)
   };
 }
 function setCurrentNode(name) {
@@ -861,6 +865,20 @@ function buildInstallCommand(panelUrl, token, nodeName) {
     + "curl -ksSL " + shellQuote(base + "/install-agent.sh.sha256") + " -o /tmp/install-agent.sh.sha256 && "
     + "cd /tmp && sha256sum -c install-agent.sh.sha256 && "
     + "bash /tmp/install-agent.sh --panel-url " + shellQuote(base) + " --token " + shellQuote(token);
+  if (nodeName) cmd += " --node-name " + shellQuote(nodeName);
+  return cmd;
+}
+/* R45-LIVE-2: agent 代码更新命令 -- 与 buildInstallCommand 同款
+   （-k 下脚本 + sha256 校验后执行），但不带 --token（重跑沿用已有
+   token）且带 --force（否则 P2-13 拒绝覆盖已有安装）。面板升级不
+   动已部署的 agent；节点表报“agent 代码过期”时在 agent 机器上
+   跑这条命令即可。 */
+function buildUpdateCommand(panelUrl, nodeName) {
+  var base = String(panelUrl || location.origin).replace(/\/$/, "");
+  var cmd = "curl -ksSL " + shellQuote(base + "/install-agent.sh") + " -o /tmp/install-agent.sh && "
+    + "curl -ksSL " + shellQuote(base + "/install-agent.sh.sha256") + " -o /tmp/install-agent.sh.sha256 && "
+    + "cd /tmp && sha256sum -c install-agent.sh.sha256 && "
+    + "bash /tmp/install-agent.sh --panel-url " + shellQuote(base) + " --force";
   if (nodeName) cmd += " --node-name " + shellQuote(nodeName);
   return cmd;
 }
@@ -920,7 +938,17 @@ async function loadNodes() {
       var ob = document.createElement("span");
       ob.className = "badge " + (n.online ? "ok" : "idle");
       ob.textContent = n.online ? "在线" : (n.age_s != null ? "离线 " + n.age_s + "s 前" : "从未上报");
-      tdOn.appendChild(ob); tr.appendChild(tdOn);
+      tdOn.appendChild(ob);
+      /* R45-LIVE-2: agent 代码过期（心跳上报的安装包哈希与当前包
+         不同）-- 面板升级不动已部署的 agent，须在 agent 机器上
+         重跑更新命令；未上报哈希时不显示（未知，不谎报）。 */
+      if (n.agent_code_outdated === true) {
+        tdOn.appendChild(document.createTextNode(" "));
+        var wb = document.createElement("span");
+        wb.className = "badge warn"; wb.textContent = "agent 代码过期";
+        tdOn.appendChild(wb);
+      }
+      tr.appendChild(tdOn);
       tr.appendChild(td(n.egress_ip || "—"));
       tr.appendChild(td(n.sk5_enabled === true ? "已启用" : n.sk5_enabled === false ? "未启用" : "—"));
       var tdOps = document.createElement("td");
@@ -960,6 +988,15 @@ async function loadNodes() {
         } catch (e) { showMsg("nodeMsg", e.message, false); }
       };
       ops.appendChild(useBtn); ops.appendChild(cmdBtn); ops.appendChild(rotBtn); ops.appendChild(delBtn);
+      /* R45-LIVE-2: 代码过期时给更新命令（不带 token，带 --force）。 */
+      if (n.agent_code_outdated === true) {
+        var upBtn = document.createElement("button");
+        upBtn.type = "button"; upBtn.className = "btn secondary small"; upBtn.textContent = "更新 agent";
+        upBtn.onclick = function () {
+          copyText(buildUpdateCommand(n.panel_url || location.origin, n.name), "更新命令已复制（在 agent 机器上跑，不用 token，--force 覆盖安装）");
+        };
+        ops.appendChild(upBtn);
+      }
       tdOps.appendChild(ops); tr.appendChild(tdOps);
       tb.appendChild(tr);
     });

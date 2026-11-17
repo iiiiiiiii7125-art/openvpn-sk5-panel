@@ -37,7 +37,10 @@
 #      sha256 fail-closed (bundle.sha256 endpoint, else
 #      $OVPN_AGENT_BUNDLE_SHA256; neither available -> refuse).
 #      All fetches use the step-2 anchor; failures name the exact
-#      layer (TLS vs HTTP vs network).
+#      layer (TLS vs HTTP vs network). The verified bundle hash is
+#      recorded at /opt/ovpn-agent/bundle.sha256 so the agent can
+#      report it in its poll heartbeat and the panel can flag a stale
+#      agent (R45-LIVE-2); a local-checkout install records none.
 #   4. Writes /etc/ovpn-agent/config.json (0600) with panel_url +
 #      node_token (+ the step-2 trust anchor). Re-running WITHOUT
 #      --token keeps the existing token.
@@ -331,6 +334,10 @@ fi
 # Local copy wins when run from a checkout (agent.py + core/ + egress/
 # next to this script); otherwise download the tarball from the panel.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)"
+# R45-LIVE-2: the verified bundle hash, recorded under $INSTALL_ROOT
+# after install so the agent can report it (see the record step below).
+# Stays empty for a local-checkout install (no bundle tarball exists).
+_BUNDLE_SHA256=""
 if [ -f "$SCRIPT_DIR/agent.py" ] && [ -d "$SCRIPT_DIR/../core" ]; then
     log "using local bundle from $SCRIPT_DIR"
     BUNDLE_DIR="$SCRIPT_DIR/.."
@@ -367,6 +374,7 @@ else
     printf '%s  %s\n' "$_want" "$WORKDIR/bundle.tar.gz" | sha256sum -c - \
         || die "agent bundle sha256 mismatch -- refusing to install (expected $_want)"
     log "sha256 OK: agent bundle"
+    _BUNDLE_SHA256="$_want"
     tar -xzf "$WORKDIR/bundle.tar.gz" -C "$WORKDIR" \
         || die "cannot unpack agent bundle"
     BUNDLE_DIR="$WORKDIR"
@@ -383,6 +391,23 @@ rm -rf "$INSTALL_ROOT/core/__pycache__" "$INSTALL_ROOT/egress/__pycache__"
 chmod 755 "$INSTALL_ROOT/agent/agent.py"
 python3 -m py_compile "$INSTALL_ROOT/agent/agent.py" \
     || die "agent.py does not compile"
+
+# R45-LIVE-2: record the installed bundle hash so the agent can report
+# it in its poll heartbeat and the panel can flag a stale agent
+# (agent_code_outdated). The hash is of public code, not a secret
+# (0644). A local-checkout install has no bundle hash -- drop any stale
+# record so the agent reports unknown instead of a hash that no longer
+# describes its code. Without this record, a panel upgrade silently
+# leaves deployed agents on old code (the Nov 13 policy-routing.sh
+# that lacked the R45-L6-3 termination was only found live).
+if [ -n "${_BUNDLE_SHA256:-}" ]; then
+    printf '%s\n' "$_BUNDLE_SHA256" > "$INSTALL_ROOT/bundle.sha256"
+    chmod 644 "$INSTALL_ROOT/bundle.sha256"
+    log "recorded agent bundle sha256 to $INSTALL_ROOT/bundle.sha256"
+else
+    rm -f "$INSTALL_ROOT/bundle.sha256"
+    log "local-checkout install: no bundle hash recorded (agent reports unknown)"
+fi
 
 # --- config (0600) ----------------------------------------------------------
 python3 - "$CONFIG_FILE" "$PANEL_URL" "$TOKEN" "$NODE_NAME" "$_TRUST_MODE" "$_TRUST_CA" <<'PYEOF'
