@@ -98,7 +98,7 @@ wrangler deploy
 
 - 改密：Worker 的 `/api/change-password` 返回 **501**（面板按钮在 Cloudflare 模式下不可用）。轮换密码须 `wrangler secret put ADMIN_PASSWORD` 后重新 `wrangler deploy`。
 - agent 安装依赖 `AGENT_BUNDLE_ORIGIN` 源站面板：源站须提供 `/install-agent.sh(.sha256)` 与 `/api/agent/bundle(.sha256)`；源站不可达或不提供时安装走不通（503/502 明示）。
-- 面板证书信任：Cloudflare 前端是公网 CA，agent 直接信任，无须 TOFU 钉证书（服务器模式面板用自签证书，见 §3）。
+- 面板证书信任：Cloudflare 前端是公网 CA，agent 直接信任，无须 TOFU 钉证书（服务器模式面板用面板 CA 签发的证书，agent 钉 CA，见 §3）。
 
 ### 2.3 部署验活（必做，不要只看 deploy 成功回显）
 
@@ -123,7 +123,7 @@ bash /tmp/install-agent.sh --panel-url https://<面板> --token '<节点TOKEN>' 
 
 **agent 代码更新（R45-LIVE-2）**：面板升级不动已部署的 agent；agent 每次 poll 上报安装包哈希（装机时记在 `/opt/ovpn-agent/bundle.sha256`），面板比对后在节点表给过期的 agent 打 “agent 代码过期” 标记。更新时在 agent 机器上重跑安装命令（节点表 “更新 agent” 按钮可复制），**不用 token、带 `--force`**：重跑沿用已有 token 与配置，只刷新代码并重启 agent。
 
-面板证书信任：服务器模式面板用自签 TLS 证书，安装器在装 agent 时自动建立信任：先试系统信任库能直接验证的握手（公网 CA 面板什么都不用做）；验证失败时把面板当前出示的证书 TOFU 钉到 `/etc/ovpn-agent/panel-ca.pem`，并写进 `config.json` 的 `ca_cert`。面板换证书后须重跑安装器 `--force` 重新钉。也可显式给 `--ca-cert <panel.pem>`（直接钉该 PEM）或 `--insecure`（跳过校验，**仅调试用**：token 与用户 .ovpn 可被中间人截获，面板 UI 与 agent 日志都会告警）。
+面板证书信任：服务器模式面板用面板 CA 签发的 TLS 证书，安装器在装 agent 时自动建立信任：先试系统信任库能直接验证的握手（公网 CA 面板什么都不用做）；验证失败时把面板 CA 证书从 `/api/agent/panel-ca` 取回、TOFU 钉到 `/etc/ovpn-agent/panel-ca.pem`，并写进 `config.json` 的 `ca_cert`。钉的是 CA 不是叶证书，面板叶证书轮换不断连；只有面板 CA 本身轮换后才须重跑安装器 `--force` 重新钉（面板把这类节点标为“证书已轮换”）。也可显式给 `--ca-cert <panel.pem>`（直接钉该 PEM）或 `--insecure`（跳过校验，**仅调试用**：token 与用户 .ovpn 可被中间人截获，面板 UI 与 agent 日志都会告警）。
 
 本机离线装法：从包内直接跑 `bash agent/install-agent.sh --panel-url ... --token ...`，脚本检测到身边的 `agent.py` + `core/` 后走本地复制，不下载。
 
@@ -177,7 +177,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 | 客户端能连隧道但数据全死（curl 超时） | 链路在黑洞态或 restore 损坏态：先看面板 SK5 卡片与 `ip rule` / `ip route show table 100`；sk5.json 损坏时 restore 单元 exit 1 且策略状态字节不变，须手工修文件后重开。 |
 | 客户端列表为空但刚连上 | 状态文件约 60 秒滞后，等一档再看（§6-5）。 |
 | agent poll 恒 401 | `--node-name` 与注册名不一致，或 token 已轮换：重跑安装器并带正确 `--node-name` 与新 `--token`。 |
-| agent 日志 `CERTIFICATE_VERIFY_FAILED` | 面板证书信任未建立：重跑安装器（TOFU 钉证书，见 §3）；面板换证书后重跑 `--force`。 |
+| agent 日志 `CERTIFICATE_VERIFY_FAILED` | 面板证书信任未建立：重跑安装器（TOFU 钉面板 CA，见 §3）；只有面板 CA 本身轮换后才须重跑 `--force`（面板把这类节点标为“证书已轮换”），叶证书轮换不断连。 |
 
 ## 9. 发布包清单与校验
 

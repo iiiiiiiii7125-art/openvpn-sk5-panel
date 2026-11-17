@@ -983,6 +983,10 @@ def _remote_status_payload(node):
     _installed, _outdated = _agent_code_status(snap)
     out["agent_bundle_sha256"] = _installed
     out["agent_code_outdated"] = _outdated
+    # R46 Fix-AH：面板 CA 轮换后钉着旧 CA 的 agent 再也 poll 不上来，
+    # last_seen 冻结在轮换时间之前；该标记就是面板侧的可见信号。
+    out["cert_pin_stale"] = _cert_pin_stale(_last_seen,
+                                            _panel_ca_rotated_at())
     if snap is None:
         out["note"] = "节点尚未上报状态：agent 首次 poll 后执行一次 get_status 即可"
     return out
@@ -2662,6 +2666,8 @@ def nodes_list():
         "SELECT name, panel_url, created_at, last_seen, last_status"
         " FROM nodes ORDER BY name").fetchall()
     conn.close()
+    # R46 Fix-AH：CA 轮换时间每请求只读一次（文件极小，读不到即无轮换）。
+    _ca_rotated_at = _panel_ca_rotated_at()
     nodes = []
     for r in rows:
         try:
@@ -2676,7 +2682,9 @@ def nodes_list():
                       "last_seen": r["last_seen"],
                       "last_status": last_status,
                       "agent_bundle_sha256": _installed,
-                      "agent_code_outdated": _outdated})
+                      "agent_code_outdated": _outdated,
+                      "cert_pin_stale": _cert_pin_stale(
+                          r["last_seen"], _ca_rotated_at)})
     return jsonify({"ok": True, "nodes": nodes})
 
 
@@ -3223,6 +3231,69 @@ def agent_bundle_sha256():
     digest = hashlib.sha256(buf.read()).hexdigest()
     return "%s  ovpn-agent-bundle.tar.gz\n" % digest, 200, {
         "Content-Type": "text/plain; charset=utf-8"}
+
+
+def _panel_ca_rotated_at():
+    """最近一次面板 CA 轮换时间（ISO 字符串），无轮换记录时回 None。
+    R46 Fix-AH：install.sh 在生成全新 CA 且此前已有叶证书时，把轮换
+    事件追加到 panel-ca-rotations.log（一行一条：<ISO 时间> <CA 指纹>）；
+    叶证书轮换不记——agent 钉的是 CA，叶轮换不断连。路径可用
+    OVPN_PANEL_CA_ROTATIONS_PATH 覆盖（测试用），默认
+    /etc/openvpn-sk5-panel/panel-ca-rotations.log。"""
+    path = os.environ.get("OVPN_PANEL_CA_ROTATIONS_PATH",
+                          "/etc/openvpn-sk5-panel/panel-ca-rotations.log")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    return lines[-1].split()[0]
+
+
+def _cert_pin_stale(last_seen, rotated_at):
+    """某节点 last_seen 是否早于最近一次面板 CA 轮换。
+    R46 Fix-AH：CA 轮换后，钉着旧 CA 的 agent 每次 poll 都
+    CERTIFICATE_VERIFY_FAILED，last_seen 就此冻结；last_seen 早于轮换
+    时间即判定 pin 已过期（True），晚于则正常（False），无轮换记录或
+    从未上报时未知（None，绝不谎报）。"""
+    if not rotated_at or not last_seen:
+        return None
+    try:
+        rot = datetime.fromisoformat(str(rotated_at).replace("Z", "+00:00"))
+        seen = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if rot.tzinfo is None:
+        rot = rot.replace(tzinfo=timezone.utc)
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return seen < rot
+
+
+@app.route("/api/agent/panel-ca", methods=["GET"])
+def agent_panel_ca():
+    """面板 CA 证书（PEM 明文公开下发）。
+    R46 Fix-AH：agent 钉的是面板 CA 而非叶证书（见 install-agent.sh），
+    装机时先取本端点再试握手；CA 证书是公开的密钥材料（叶证书本来就
+    对任何连接者公开），无鉴权下发与 /api/agent/bundle 同理。CA 文件
+    不存在时（CA 之前的面板、或用户自带证书）回 404，安装器回退到钉
+    叶证书的老行为。路径可用 OVPN_PANEL_CA_CERT_PATH 覆盖（测试用），
+    默认 /etc/openvpn-sk5-panel/panel-ca.crt。"""
+    ca_path = os.environ.get("OVPN_PANEL_CA_CERT_PATH",
+                             "/etc/openvpn-sk5-panel/panel-ca.crt")
+    try:
+        with open(ca_path, "rb") as f:
+            pem = f.read()
+    except OSError:
+        return jsonify({"ok": False,
+                        "error": "panel CA certificate not available "
+                                 "(pre-CA panel or user-supplied certificate)"}), 404
+    if b"-----BEGIN CERTIFICATE-----" not in pem:
+        return jsonify({"ok": False,
+                        "error": "panel CA certificate is not a PEM certificate"}), 404
+    return pem, 200, {"Content-Type": "application/x-pem-file"}
 
 
 _BUNDLE_SHA256_CACHE = False  # False = not computed yet (None = failed)

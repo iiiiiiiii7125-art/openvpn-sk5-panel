@@ -134,21 +134,29 @@ if [ -f "$INSTALL_ROOT/agent/agent.py" ] || [ -f "$CONFIG_FILE" ]; then
 fi
 
 # --- panel TLS trust (BUG-5) ------------------------------------------------
-# The panel serves a self-signed certificate by default (install.sh
-# generates one), and the agent verifies TLS -- without a trust anchor
-# every poll fails with CERTIFICATE_VERIFY_FAILED and the whole
-# command chain is dead. Resolution, in order:
+# The panel serves a certificate issued by its panel CA by default
+# (install.sh generates the CA + leaf), and the agent verifies TLS --
+# without a trust anchor every poll fails with CERTIFICATE_VERIFY_FAILED
+# and the whole command chain is dead. Resolution, in order:
 #   --ca-cert PATH : that PEM is copied to $PANEL_CA_PEM and pinned.
+#                    Supply the panel CA certificate (panel-ca.crt) --
+#                    a leaf certificate also works, but only until the
+#                    panel rotates its leaf.
 #   --insecure     : config insecure=true (explicit opt-in ONLY -- the
 #                    node token and .ovpn contents can then be
 #                    intercepted; the installer prints a loud warning).
 #   otherwise      : a validated handshake first -- public-CA panels
 #                    (e.g. a Cloudflare front) need nothing extra. If
 #                    the system store rejects the panel certificate,
-#                    the presented leaf is TOFU-pinned to $PANEL_CA_PEM
-#                    and recorded as ca_cert. A pinned cert goes stale
-#                    if the panel regenerates its certificate: re-run
-#                    this script with --force to re-fetch it.
+#                    the panel CA is fetched from the panel's public
+#                    /api/agent/panel-ca endpoint and TOFU-pinned to
+#                    $PANEL_CA_PEM, then trial-verified against the
+#                    served leaf. R46 Fix-AH: the pin is the CA, not the
+#                    leaf -- a leaf rotation no longer bricks the agent;
+#                    only a CA rotation needs a re-pin. A pre-fix panel
+#                    has no CA endpoint: fall back to pinning the
+#                    presented leaf (old behavior, with a warning that
+#                    leaf pins go stale on rotation).
 # If the panel is unreachable now and a previous pin exists, the old
 # pin is kept (with a warning); with no previous pin the install stops
 # -- installing an agent that can never poll would be a silent lie.
@@ -164,9 +172,9 @@ elif [ "$INSECURE" -eq 1 ]; then
     _TRUST_HINT="insecure"
 fi
 _TRUST_JSON="$(python3 - "$PANEL_URL" "$_TRUST_HINT" "$PANEL_CA_PEM" <<'PYEOF'
-import json, os, socket, ssl, sys, urllib.parse
+import json, os, socket, ssl, sys, urllib.parse, urllib.request
 panel_url, hint, out_pem = sys.argv[1:4]
-result = {"mode": "system", "ca_cert": None, "insecure": False}
+result = {"mode": "system", "ca_cert": None, "insecure": False, "pin": None}
 if hint == "insecure":
     result.update(mode="insecure", insecure=True)
     print(json.dumps(result))
@@ -195,7 +203,36 @@ except (OSError, ssl.SSLError) as exc:
                       "insecure": False, "error": str(exc)}))
     sys.exit(0)
 try:
-    pem = ssl.get_server_certificate((host, port), timeout=15)
+    pem = None
+    pin_kind = None
+    # R46 Fix-AH: pin the panel CA, not the leaf. Fetch it from the
+    # panel's public /api/agent/panel-ca endpoint over the same
+    # unverified (TOFU) channel get_server_certificate uses below --
+    # no weaker than today's leaf pin: the trial-verify after this
+    # proves the candidate actually verifies the served leaf. A
+    # pre-fix panel has no such endpoint: fall back to pinning the
+    # presented leaf (old behavior).
+    try:
+        ca_url = panel_url.rstrip("/") + "/api/agent/panel-ca"
+        ca_req = urllib.request.Request(ca_url, method="GET")
+        with urllib.request.urlopen(
+                ca_req, timeout=15,
+                context=ssl._create_unverified_context()) as ca_resp:
+            if ca_resp.status == 200:
+                ca_body = ca_resp.read().decode("utf-8", "replace")
+                if "-----BEGIN CERTIFICATE-----" in ca_body:
+                    pem = ca_body
+                    pin_kind = "ca"
+    except Exception:
+        pem = None
+    if pem is None:
+        try:
+            pem = ssl.get_server_certificate((host, port), timeout=15)
+            pin_kind = "leaf"
+        except (OSError, ssl.SSLError) as exc:
+            print(json.dumps({"mode": "error", "ca_cert": None,
+                              "insecure": False, "error": str(exc)}))
+            sys.exit(0)
 except (OSError, ssl.SSLError) as exc:
     print(json.dumps({"mode": "error", "ca_cert": None,
                       "insecure": False, "error": str(exc)}))
@@ -233,12 +270,13 @@ except (OSError, ssl.SSLError) as exc:
                       "error": str(exc)}))
     sys.exit(0)
 os.replace(_tmp_pem, out_pem)
-result.update(mode="pinned", ca_cert=out_pem)
+result.update(mode="pinned", ca_cert=out_pem, pin=pin_kind)
 print(json.dumps(result))
 PYEOF
 )" || die "panel TLS trust detection failed"
 _TRUST_MODE="$(printf '%s' "$_TRUST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mode",""))')"
 _TRUST_CA="$(printf '%s' "$_TRUST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ca_cert") or "")')"
+_TRUST_PIN="$(printf '%s' "$_TRUST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("pin") or "")')"
 if [ "$_TRUST_MODE" = "error" ]; then
     _ERR="$(printf '%s' "$_TRUST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error",""))')"
     if [ -f "$PANEL_CA_PEM" ]; then
@@ -253,7 +291,12 @@ case "$_TRUST_MODE" in
     system)  log "panel certificate is trusted by the system store (no pin needed)" ;;
     http)    log "panel URL is plain http (loopback only); no TLS trust to establish" ;;
     supplied) log "trusting panel certificate supplied via --ca-cert ($PANEL_CA_PEM)" ;;
-    pinned)  log "pinned panel self-signed certificate (TOFU) to $PANEL_CA_PEM -- re-run with --force if the panel regenerates its certificate" ;;
+    pinned)
+        if [ "$_TRUST_PIN" = "leaf" ]; then
+            warn "pinned the panel leaf certificate (this panel has no /api/agent/panel-ca endpoint -- pre-fix panel); re-run with --force if the panel regenerates its certificate"
+        else
+            log "pinned panel CA certificate (TOFU) to $PANEL_CA_PEM -- leaf rotations no longer require re-pinning; re-run with --force only if the panel CA itself rotates"
+        fi ;;
     insecure) log "TLS verification disabled for this agent (explicit --insecure)" ;;
 esac
 

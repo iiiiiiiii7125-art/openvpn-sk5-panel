@@ -206,9 +206,11 @@ def load_config(path: Path | None = None) -> dict:
     if not token:
         raise RuntimeError("node_token missing in %s" % path)
     # BUG-5: how the agent trusts the panel's TLS certificate.
-    # "ca_cert": path to a PEM file with the panel's (self-signed)
-    # certificate -- install-agent.sh fetches it from the panel on
-    # first install (TOFU) and writes it here. "insecure": skip
+    # "ca_cert": path to a PEM file with the panel CA certificate --
+    # install-agent.sh fetches it from the panel on first install
+    # (TOFU) and writes it here. R46 Fix-AH: the pin is the CA, not
+    # the leaf -- a panel leaf rotation keeps verifying against the
+    # pinned CA; only a CA rotation needs a re-pin. "insecure": skip
     # verification entirely -- only ever set explicitly, never the
     # default; the panel UI / installer warn loudly when it is on.
     ca_cert = str(cfg.get("ca_cert") or "").strip() or None
