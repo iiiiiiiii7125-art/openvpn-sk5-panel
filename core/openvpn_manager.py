@@ -118,9 +118,19 @@ def validate_username(name: str) -> str:
 
 
 def _run(cmd: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
-    """Run *cmd*, raising :class:`OpenVPNError` (with stderr) on failure."""
+    """Run *cmd*, raising :class:`OpenVPNError` (with stderr) on failure.
+
+    stdin is /dev/null (R41-L3-F1): a prompting child (openssl req
+    asking for a PEM pass phrase) must fail at once, never hang on
+    the caller's stdin -- under the panel/agent that stdin is a pipe
+    that never EOFs, so the prompt used to block up to the 600 s
+    timeout instead of failing. No product call reads stdin, so
+    DEVNULL is safe for every caller, including start_server's
+    ``openvpn --config --daemon``.
+    """
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise OpenVPNError("failed to run %s: %s" % (" ".join(cmd), exc)) from exc
     if proc.returncode != 0:
@@ -215,7 +225,11 @@ def build_server_cert(
     for nothing. Only the CRL is refreshed in that case. A *partial*
     set (e.g. an interrupted first run left req/key but no issued
     cert) is cleared first, mirroring install.sh's stale cleanup, so
-    build-server can run cleanly.
+    build-server can run cleanly. R41-L3-F3: before clearing, any
+    pre-existing server.crt/server.req/server.key is backed up into a
+    timestamped ``pki/.server-key-backup-<ts>-<pid>/`` dir (mode 0700)
+    and its path returned as ``"backup_dir"`` -- the triple may be
+    operator key material this product did not create.
     """
     ca_dir = _resolve_ca_dir(ca_dir)
     server_dir = _resolve_server_dir(server_dir)
@@ -227,6 +241,7 @@ def build_server_cert(
         "dh.pem": pki / "dh.pem",
         "ta.key": pki / "ta.key",
     }
+    backup_dir: Path | None = None
     if all(p.exists() for p in artifacts.values()):
         if not (pki / "crl.pem").exists():
             _run_easyrsa("gen-crl", str(ca_dir))
@@ -234,6 +249,34 @@ def build_server_cert(
         # Partial set blocks gen-req: drop the server pair (issued
         # cert / req / key) so build-server starts clean. A complete
         # set never reaches this branch and is never touched.
+        # R41-L3-F3: the pair being dropped may be key material this
+        # product did not create -- a foreign/operator PKI whose
+        # dh.pem and ta.key are absent lands exactly here, and its
+        # only server key was destroyed with no backup before the
+        # fallible easy-rsa run. Back the triple up first (timestamped
+        # dir inside the PKI, mode 0700, source modes preserved) and
+        # report it as "backup_dir" so the operator can restore it.
+        existing = [
+            p for p in (
+                pki / "issued" / "server.crt",
+                pki / "reqs" / "server.req",
+                pki / "private" / "server.key",
+            )
+            if p.exists()
+        ]
+        if existing:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            backup_dir = pki / (
+                ".server-key-backup-%s-%d" % (stamp, os.getpid())
+            )
+            backup_dir.mkdir(mode=0o700, parents=True)
+            for src in existing:
+                dest = backup_dir / src.name
+                dest.write_bytes(src.read_bytes())
+                try:
+                    dest.chmod(src.stat().st_mode & 0o777)
+                except OSError:
+                    pass
         for stale in (
             pki / "issued" / "server.crt",
             pki / "reqs" / "server.req",
@@ -262,7 +305,32 @@ def build_server_cert(
         dest.write_bytes(src.read_bytes())
         dest.chmod(0o600 if name.endswith((".key", "ta.key")) else 0o644)
         installed[name] = str(dest)
+    if backup_dir is not None:
+        installed["backup_dir"] = str(backup_dir)
     return installed
+
+
+def _pem_only(blob: str) -> str:
+    """First PEM block of *blob*, or *blob* unchanged when it has none.
+
+    R41-L3-F2: easy-rsa-issued cert files are text+PEM (``openssl
+    x509 -text`` output prepended to the PEM block). The text dump is
+    not part of the credential -- it was copied verbatim into
+    downloaded .ovpn ``<cert>`` blocks and fed to the serial parser,
+    which then decoded garbage. A PEM block is self-delimiting: the
+    block runs from its BEGIN line to its END line. Label-agnostic,
+    so it also works for PRIVATE KEY and OpenVPN Static key V1.
+    """
+    start = blob.find("-----BEGIN ")
+    if start < 0:
+        return blob
+    end = blob.find("-----END ", start)
+    if end < 0:
+        return blob
+    end_line = blob.find("\n", end)
+    if end_line < 0:
+        return blob
+    return blob[start:end_line]
 
 
 def _cert_serial_hex(cert_path: Path) -> str | None:
@@ -277,12 +345,16 @@ def _cert_serial_hex(cert_path: Path) -> str | None:
         text = cert_path.read_text(encoding="utf-8", errors="strict")
     except (OSError, UnicodeDecodeError):
         return None
+    # R41-L3-F2: easy-rsa cert files are text+PEM -- strip the text
+    # dump first, or the base64 below decodes garbage (b64decode
+    # without validate silently drops non-alphabet characters).
+    pem = _pem_only(text)
     b64 = "".join(
-        ln.strip() for ln in text.splitlines()
+        ln.strip() for ln in pem.splitlines()
         if ln.strip() and not ln.startswith("-----")
     )
     try:
-        der = base64.b64decode(b64)
+        der = base64.b64decode(b64, validate=True)
     except Exception:
         return None
 
@@ -655,14 +727,17 @@ def build_client_config(
         if not blob or "-----BEGIN" not in blob:
             raise OpenVPNError("missing/invalid PEM block for %s" % label)
     template = CLIENT_OVPN_TEMPLATE.read_text(encoding="utf-8")
+    # R41-L3-F2: strip the text dump from text+PEM certs -- only the
+    # PEM block is a credential. _pem_only preserves a pure-PEM blob
+    # unchanged, so fixture blobs pass through byte-identical.
     return Template(template).substitute(
         SERVER_IP=server_ip,
         PROTO=proto,
         PORT=port,
-        CA=ca.strip(),
-        CERT=cert.strip(),
-        KEY=key.strip(),
-        TA=ta_key.strip(),
+        CA=_pem_only(ca).strip(),
+        CERT=_pem_only(cert).strip(),
+        KEY=_pem_only(key).strip(),
+        TA=_pem_only(ta_key).strip(),
     )
 
 
@@ -1040,6 +1115,31 @@ def _parse_existing_server_conf(text: str) -> tuple[str | None, int | None, str 
     return old_proto, old_port, damage
 
 
+def _openvpn_version() -> tuple[int, int] | None:
+    """Installed OpenVPN version as (major, minor), or None when the
+    binary is absent or its version line is unparseable.
+
+    R41-L1-1: ``data-ciphers`` exists only since OpenVPN 2.5. Stock
+    Ubuntu 20.04 ships 2.4.12, which rejects the rendered config at
+    the ``data-ciphers`` line. None means "unknown" -- the caller
+    keeps the current behaviour (emit the line) so an undetectable
+    binary never regresses a working 2.6 install; only a positively
+    detected < 2.5 omits it.
+    """
+    try:
+        proc = subprocess.run(
+            ["openvpn", "--version"], capture_output=True, text=True,
+            timeout=10, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = (proc.stdout or "") + (proc.stderr or "")
+    m = re.search(r"OpenVPN (\d+)\.(\d+)", out)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
+
+
 def render_server_conf(
     proto: str = "udp",
     port: int | None = None,
@@ -1146,8 +1246,20 @@ def render_server_conf(
                 % (port, proto, occupant)
             )
     template = SERVER_CONF_TEMPLATE.read_text(encoding="utf-8")
+    # R41-L1-1: data-ciphers is a 2.5+ option; stock Ubuntu 20.04
+    # OpenVPN 2.4.12 rejects the rendered config at that line. Emit
+    # it only when the installed OpenVPN supports it (>= 2.5) or when
+    # the version is undetectable (keep current behaviour). The
+    # plain `cipher` line stays in all cases (valid on 2.4 too).
+    version = _openvpn_version()
+    data_ciphers = (
+        "data-ciphers AES-256-GCM\n"
+        if version is None or version >= (2, 5)
+        else ""
+    )
     rendered = Template(template).substitute(
-        PROTO=proto, PORT=port, SERVER_DIR=str(server_dir), DNS=dns
+        PROTO=proto, PORT=port, SERVER_DIR=str(server_dir), DNS=dns,
+        DATA_CIPHERS=data_ciphers,
     )
     server_dir.mkdir(parents=True, exist_ok=True)
     conf_path.write_text(rendered, encoding="utf-8")

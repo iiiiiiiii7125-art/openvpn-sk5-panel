@@ -1,9 +1,13 @@
 # OpenVPN 2.6 server config -- rendered by core/openvpn_manager.py
 # render_server_conf(). Placeholders (string.Template): PROTO, PORT,
-# SERVER_DIR, DNS. Defaults: proto udp / port 1194; TCP mode: proto tcp /
+# SERVER_DIR, DNS, DATA_CIPHERS. Defaults: proto udp / port 1194; TCP mode: proto tcp /
 # port 443; DNS from the OVPN_DNS env var (default 1.1.1.1).
 # NOTE: explicit-exit-notify is UDP-only; OpenVPN ignores it (with a
 # warning) when proto is tcp.
+# NOTE (R41-L1-1): the data-ciphers line below is emitted only when
+# the installed OpenVPN is >= 2.5 (or its version is undetectable);
+# stock Ubuntu 20.04 OpenVPN 2.4.12 rejects that option, so on 2.4
+# the line is empty and only the plain `cipher` line applies.
 
 port $PORT
 proto $PROTO
@@ -28,8 +32,7 @@ keepalive 10 120
 tun-mtu 1400
 mssfix 1360
 
-data-ciphers AES-256-GCM
-cipher AES-256-GCM
+${DATA_CIPHERS}cipher AES-256-GCM
 auth SHA256
 
 persist-key
