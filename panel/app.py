@@ -979,6 +979,10 @@ def _remote_status_payload(node):
     out = {"ok": True, "node": node["name"], "openvpn": ovpn, "sk5": sk5,
            "egress": egress, "stale": stale,
            "age_s": (int(age) if age is not None else None)}
+    # R45-LIVE-2: agent 代码过期标记（与 /api/nodes 同款判定）。
+    _installed, _outdated = _agent_code_status(snap)
+    out["agent_bundle_sha256"] = _installed
+    out["agent_code_outdated"] = _outdated
     if snap is None:
         out["note"] = "节点尚未上报状态：agent 首次 poll 后执行一次 get_status 即可"
     return out
@@ -2664,10 +2668,15 @@ def nodes_list():
             last_status = json.loads(r["last_status"]) if r["last_status"] else None
         except ValueError:
             last_status = None
-        nodes.append({"name": r["name"], "panel_url": r["panel_url"],
+        # R45-LIVE-2: agent 代码过期标记（快照心跳里的 bundle_sha256
+        # 与当前安装包比对；未上报即未知，不谎报）。
+        _installed, _outdated = _agent_code_status(last_status)
+        nodes.append({ "name": r["name"], "panel_url": r["panel_url"],
                       "created_at": r["created_at"],
                       "last_seen": r["last_seen"],
-                      "last_status": last_status})
+                      "last_status": last_status,
+                      "agent_bundle_sha256": _installed,
+                      "agent_code_outdated": _outdated})
     return jsonify({"ok": True, "nodes": nodes})
 
 
@@ -3214,6 +3223,36 @@ def agent_bundle_sha256():
     digest = hashlib.sha256(buf.read()).hexdigest()
     return "%s  ovpn-agent-bundle.tar.gz\n" % digest, 200, {
         "Content-Type": "text/plain; charset=utf-8"}
+
+
+_BUNDLE_SHA256_CACHE = False  # False = not computed yet (None = failed)
+
+
+def _current_bundle_sha256():
+    """当前 agent 安装包的 SHA-256（进程内记忆：面板每次升级都重启
+    服务，记忆不可能滞后于磁盘上的代码；读不到时回 None，即未知）。"""
+    global _BUNDLE_SHA256_CACHE
+    if _BUNDLE_SHA256_CACHE is False:
+        try:
+            _BUNDLE_SHA256_CACHE = hashlib.sha256(
+                _build_agent_bundle().read()).hexdigest()
+        except Exception:  # noqa: BLE001 - bundle 不可读 -> 未知
+            _BUNDLE_SHA256_CACHE = None
+    return _BUNDLE_SHA256_CACHE
+
+
+def _agent_code_status(snap):
+    """某节点快照的 agent 代码状态 -> (installed_hash, outdated)。
+    installed_hash 是 agent 心跳上报的安装包哈希（无则 None）；
+    outdated 为 True（上报哈希与当前包不同）、False（相同）、None
+    （agent 未上报，或当前包算不出——未知时绝不谎报过期）。"""
+    installed = (snap or {}).get("bundle_sha256")
+    if not isinstance(installed, str) or not installed:
+        return None, None
+    current = _current_bundle_sha256()
+    if current is None:
+        return installed, None
+    return installed, installed != current
 
 
 @app.route("/install-agent.sh", methods=["GET"])

@@ -121,6 +121,8 @@ bash /tmp/install-agent.sh --panel-url https://<面板> --token '<节点TOKEN>' 
 
 字段说明：先用 `-k` 下脚本（面板默认自签证书，plain curl 会 TLS 校验失败），再 `sha256sum -c` 校验通过才执行，校验失败即停；`--node-name` 必带且须与注册名一致，否则 agent 默认用 hostname 注册，poll 恒 401；`--token` 只在注册节点时返回一次，轮换后重跑安装器并带新 token。bundle 的 sha256 校验由安装器内部 fail-closed 执行（远程下载 bundle 时先取 `$PANEL_URL/api/agent/bundle.sha256` 比对，通过才解压，无校验来源即拒绝安装）。
 
+**agent 代码更新（R45-LIVE-2）**：面板升级不动已部署的 agent；agent 每次 poll 上报安装包哈希（装机时记在 `/opt/ovpn-agent/bundle.sha256`），面板比对后在节点表给过期的 agent 打 “agent 代码过期” 标记。更新时在 agent 机器上重跑安装命令（节点表 “更新 agent” 按钮可复制），**不用 token、带 `--force`**：重跑沿用已有 token 与配置，只刷新代码并重启 agent。
+
 面板证书信任：服务器模式面板用自签 TLS 证书，安装器在装 agent 时自动建立信任：先试系统信任库能直接验证的握手（公网 CA 面板什么都不用做）；验证失败时把面板当前出示的证书 TOFU 钉到 `/etc/ovpn-agent/panel-ca.pem`，并写进 `config.json` 的 `ca_cert`。面板换证书后须重跑安装器 `--force` 重新钉。也可显式给 `--ca-cert <panel.pem>`（直接钉该 PEM）或 `--insecure`（跳过校验，**仅调试用**：token 与用户 .ovpn 可被中间人截获，面板 UI 与 agent 日志都会告警）。
 
 本机离线装法：从包内直接跑 `bash agent/install-agent.sh --panel-url ... --token ...`，脚本检测到身边的 `agent.py` + `core/` 后走本地复制，不下载。

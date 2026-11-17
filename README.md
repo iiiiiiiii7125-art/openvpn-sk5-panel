@@ -144,6 +144,15 @@ agent 安装器本身也是 fail-closed（FLMX §1-13 同款）：远程下载 b
 UI 与 agent 日志都会告警）。重装换 panel-url/token 后安装器会重启
 已运行的 agent（BUG-6），旧进程不会继续用旧配置 poll。
 
+**agent 代码更新（R45-LIVE-2）**：面板升级只换面板自己的代码，**不
+动已部署的 agent**——装机时 agent 从面板拉到的安装包就定格在那一
+版。agent 每次 poll 都上报自己安装包的哈希，面板比对后在节点表
+给过期的 agent 打 “agent 代码过期” 标记（未上报哈希的旧 agent
+显示未知、不谎报）。更新办法：在 agent 机器上重跑安装命令（节点
+表 “更新 agent” 按钮可复制），**不用 token、带 `--force`**——重
+跑沿用已有 token 与配置，只把代码刷新到当前版；agent 服务会自动
+重启。
+
 服务器部署模式（方式一）与 Cloudflare 模式用同一套前端与命令契约：
 同一 agent、同一 13 个动作，只是指向的面板地址不同（见
 `cloudflare/server-mode.md` 对照表）。
