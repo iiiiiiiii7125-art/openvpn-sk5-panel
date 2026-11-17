@@ -12,7 +12,6 @@ nobind
 persist-key
 persist-tun
 remote-cert-tls server
-data-ciphers AES-256-GCM
 cipher AES-256-GCM
 auth SHA256
 verb 3
