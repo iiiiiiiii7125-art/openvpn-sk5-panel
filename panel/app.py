@@ -1124,6 +1124,19 @@ def _strict_bool(data, key, default=False):
     return _coerce_bool(data[key], key)
 
 
+def _strict_str(data, key, field, default=""):
+    """R43-J7-1：读 data 里一个字符串字段。缺键取 default（旧缺省语义），
+    在键时须为真字符串，否则返回 (None, err)——禁止 str() 隐式转换：
+    str(123) 是 "123"、str(None) 是 "None"、str(True) 是 "True"，都会
+    骗过随后的正则/非空校验而被静默存下（与 R12-P1-2 的布尔端口同族）。"""
+    if key not in data:
+        return default, None
+    value = data[key]
+    if not isinstance(value, str):
+        return None, "%s 须为字符串，收到 %s" % (field, type(value).__name__)
+    return value, None
+
+
 def _toggle_value(data, key, fallback=None, default=False):
     """R12-P2-2：读 key 优先、回落 fallback 键，两者都缺时 default。
     值须为真布尔或 0/1，否则返回 (None, err)。"""
@@ -1957,7 +1970,10 @@ def ovpn_users_create():
     missing = _require_module("openvpn_manager")
     if missing:
         return missing
-    name = str(data.get("name", "")).strip()
+    name, err = _strict_str(data, "name", "用户名")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    name = name.strip()
     try:
         validate_username(name)
     except Exception as exc:  # noqa: BLE001 - core 规则 [a-zA-Z0-9_-]{1,32}
@@ -2141,7 +2157,10 @@ def _sk5_save_remote(node, data):
     只带本次翻转的键，不带全量 host/port——agent 不需要它们也能
     只改开关。无快照时开关照样入队（agent 自决；面板不知道远程
     存量，不编造 400）。"""
-    host = str(data.get("host", "")).strip()
+    host, err = _strict_str(data, "host", "host")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    host = host.strip()
     port = data.get("port")
     toggle_only = (not host and port is None and "password" not in data
                    and "username" not in data)
@@ -2179,13 +2198,19 @@ def _sk5_save_remote(node, data):
     enabled, err = _strict_bool(data, "enabled", False)
     if err:
         return jsonify({"ok": False, "error": err}), 400
+    username, err = _strict_str(data, "username", "用户名")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
     params = {"host": host, "port": port,
-              "username": str(data.get("username", "")),
+              "username": username,
               "enabled": enabled}
     # P0-4：空密码/缺密码即不传该键——agent 侧保留已存密码；只有
     # 显式非空密码才覆盖；clear_password=true 时照传，由 agent 清掉。
     if data.get("password"):
-        params["password"] = str(data["password"])
+        if not isinstance(data["password"], str):
+            return jsonify({"ok": False,
+                            "error": "密码须为字符串"}), 400
+        params["password"] = data["password"]
     if "clear_password" in data:
         # R12-P2-1：只有真 true 才清密码；"false" 字符串是真值，
         # 旧的真值判断曾把它当成清密码。
@@ -2225,14 +2250,21 @@ def sk5_save():
     missing = _require_module("sk5_manager")
     if missing:
         return missing
-    host = str(data.get("host", "")).strip()
+    host, err = _strict_str(data, "host", "host")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    host = host.strip()
     port = data.get("port")
-    username = str(data.get("username", ""))
+    username, err = _strict_str(data, "username", "用户名")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
     # P0-4：面板语义——password 缺失/空串/None = 保留已有密码；只有
     # 显式传非空密码才覆盖；想清掉密码须同时传 clear_password=true。
     # 新版 egress（部分合并）直接按此语义调 set_sk5；旧版全量覆盖
     # set_sk5 则由面板侧解析：空密码用已存密码顶替，清密码传 ""。
     pw = data.get("password")
+    if pw is not None and not isinstance(pw, str):
+        return jsonify({"ok": False, "error": "密码须为字符串"}), 400
     # R12-P2-1：clear_password/enabled 只接受真布尔或 0/1；
     # 字符串 "false" 曾被 bool() 变成 True 而反向执行。
     clear_pw, err = _strict_bool(data, "clear_password", False)
@@ -2649,7 +2681,10 @@ def nodes_register():
     data, err = _json_body()
     if err:
         return jsonify({"ok": False, "error": err}), 400
-    name = str(data.get("name", "")).strip()
+    name, err = _strict_str(data, "name", "节点名")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    name = name.strip()
     if not _NODE_NAME_RE.match(name):
         return jsonify({"ok": False, "error": "节点名非法：只允许字母/数字/_/-，1–32 字符"}), 400
     panel_url = str(data.get("panel_url", "") or "").strip().rstrip("/")

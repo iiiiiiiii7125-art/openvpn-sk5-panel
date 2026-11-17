@@ -669,7 +669,12 @@ def action_restart_openvpn(_params: dict) -> dict:
 
 def action_create_user(params: dict) -> dict:
     _need_params(params, "name")
-    name = str(params["name"])
+    # R43-J7-1：名字须为真字符串——str(123) 是 "123"，会骗过下面的
+    # 正则（与 R12-P1-2 的布尔端口同族）。面板侧已拦，但 agent 是
+    # Worker 面（名字原样入队）的唯一 enforcement 点，必须同样拦。
+    name = params["name"]
+    if not isinstance(name, str):
+        raise ValueError("invalid username: must be a string")
     if not _NAME_RE.match(name):
         raise ValueError("invalid username: must match [A-Za-z0-9_-]{1,32}")
     ovpn = openvpn_manager.create_user(
@@ -686,7 +691,10 @@ def action_create_user(params: dict) -> dict:
 
 def action_revoke_user(params: dict) -> dict:
     _need_params(params, "name")
-    name = str(params["name"])
+    # R43-J7-1：同 action_create_user——名字须为真字符串，禁止 str() 转换。
+    name = params["name"]
+    if not isinstance(name, str):
+        raise ValueError("invalid username: must be a string")
     if not _NAME_RE.match(name):
         raise ValueError("invalid username: must match [A-Za-z0-9_-]{1,32}")
     revoked = openvpn_manager.revoke_user(name)
@@ -706,17 +714,24 @@ def action_set_sk5(params: dict) -> dict:
     # (clear_password=True switches to an auth-free merchant).
     host = params.get("host")
     if host is not None:
-        host = str(host)
+        # R43-J7-1：host 须为真字符串——str(123) 是 "123"，会骗过
+        # _HOST_RE 而被静默存下（M1 实测）。
+        if not isinstance(host, str):
+            raise ValueError("invalid SK5 host: must be a string")
         if not _HOST_RE.match(host):
             raise ValueError("invalid SK5 host %r" % host)
     port = _as_int(params["port"], "port") if params.get("port") is not None else None
+    username = params.get("username")
+    if username is not None and not isinstance(username, str):
+        raise ValueError("invalid SK5 username: must be a string")
+    password = params.get("password")
+    if password and not isinstance(password, str):
+        raise ValueError("invalid SK5 password: must be a string")
     return sk5_manager.set_sk5(
         host,
         port,
-        username=(str(params["username"])
-                  if params.get("username") is not None else None),
-        password=(str(params["password"])
-                  if params.get("password") else None),
+        username=username,
+        password=(password if password else None),
         enabled=(_as_bool(params["enabled"], "enabled")
                  if params.get("enabled") is not None else None),
         fail_open=(_as_bool(params["fail_open"], "fail_open")
