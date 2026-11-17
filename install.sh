@@ -618,7 +618,12 @@ mkdir -p "$INSTALL_ROOT/panel/data"
 # cookie at the next panel restart (silent logout of all users).
 # Generate only when missing, like the TLS cert below.
 if [ ! -f "/etc/openvpn-sk5-panel/secret.key" ]; then
-    python3 -c 'import os, secrets; open("/etc/openvpn-sk5-panel/secret.key", "wb").write(secrets.token_bytes(32))'
+    # R45-L6-1: write atomically (temp + rename) -- the old direct
+    # open("wb").write left a 0-byte secret.key behind on a kill /
+    # power loss, and a 0-byte key locks the admin out with a bare
+    # 500 (app.py now also regenerates a short key loudly, but the
+    # installer must not create one in the first place).
+    python3 -c 'import os, secrets; p="/etc/openvpn-sk5-panel/secret.key"; t=p+".tmp.%d" % os.getpid(); open(t, "wb").write(secrets.token_bytes(32)); os.chmod(t, 0o600); os.replace(t, p)'
     chmod 600 "/etc/openvpn-sk5-panel/secret.key"
     log "generated fresh panel secret key (panel/data/ is never copied, so no shipped key can arrive)"
 else
@@ -1653,7 +1658,15 @@ if [ -n "${WAN_IF:-}" ]; then
     # never configured = direct mode.
     _SK5_ON=0
     if [ -f "$CONFIG_DIR/sk5.json" ]; then
-        _SK5_ON="$(python3 -c 'import json,sys; print(1 if json.load(open(sys.argv[1])).get("enabled") else 0)' "$CONFIG_DIR/sk5.json" 2>/dev/null || echo 0)"
+        # R45-L4-3: a sk5.json that EXISTS but does not parse must
+        # die naming the file -- the old `|| echo 0` silently read
+        # a corrupt file as direct mode (_SK5_ON=0) and killed a
+        # healthy SK5 chain with a misleading routing error. Never
+        # guess the egress mode.
+        if ! _SK5_ON="$(python3 -c 'import json,sys; print(1 if json.load(open(sys.argv[1])).get("enabled") else 0)' "$CONFIG_DIR/sk5.json" 2>"$WORKDIR/sk5-parse.err")"; then
+            _SK5_PARSE_ERR="$(head -c 200 "$WORKDIR/sk5-parse.err" 2>/dev/null || true)"
+            die "health gate: cannot read $CONFIG_DIR/sk5.json -- fix or remove the file and re-run install.sh; refusing to guess the egress mode (parse error: ${_SK5_PARSE_ERR:-unknown})"
+        fi
     fi
     if [ "$_SK5_ON" = "1" ]; then
         if ! printf '%s' "$FWD_ROUTE" | grep -q "table 100"; then
