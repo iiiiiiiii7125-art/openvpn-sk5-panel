@@ -397,17 +397,26 @@ def main():
         if logged_in:
             calls = []
             real_restart = panel.restart_server
+            real_status = panel.server_status
 
             def _stub_restart():
                 calls.append("restart")
                 return {"running": True}
 
+            # R44-L5-F4: the endpoint now checks server_status()
+            # first and skips the restart when the daemon is
+            # stopped. These cells assert the running-daemon case,
+            # so stub the status to running alongside the restart;
+            # the stopped case is covered with a real fake daemon
+            # by tests/r44_l5_state.py (S2d-3).
             panel.restart_server = _stub_restart
+            panel.server_status = lambda: {"running": True}
             try:
                 r = client.delete("/api/openvpn/users/dave")
                 d = r.get_json() or {}
             finally:
                 panel.restart_server = real_restart
+                panel.server_status = real_status
             cell("I9 panel DELETE revoke restarts the daemon",
                  r.status_code == 200 and calls == ["restart"]
                  and d.get("needs_restart") is False
@@ -422,6 +431,7 @@ def main():
                 raise om.OpenVPNError("systemctl restart failed (stub)")
 
             panel.restart_server = _boom_restart
+            panel.server_status = lambda: {"running": True}
             try:
                 # Re-create dave so there is something to revoke.
                 try:
@@ -435,6 +445,7 @@ def main():
                 d = r.get_json() or {}
             finally:
                 panel.restart_server = real_restart
+                panel.server_status = real_status
             cell("I10 panel DELETE revoke: restart failure is a loud 500",
                  not recreate_err and r.status_code == 500
                  and d.get("needs_restart") is True

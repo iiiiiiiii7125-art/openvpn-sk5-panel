@@ -2056,6 +2056,23 @@ def ovpn_users_revoke(name):
     # call returns. A failed restart is LOUD: the revoke is recorded
     # but not yet enforced, and the response says so (needs_restart
     # stays True) instead of reporting success.
+    # R44-L5-F4: restart only if the daemon is actually running --
+    # restart_server() falls back to start_server() when the
+    # systemctl restart fails, so an unconditional restart STARTS a
+    # stopped server. A stopped server reads the CRL on its next
+    # start, so the recorded revoke is already effective then; say
+    # so honestly instead of reporting a restart that never happened.
+    was_running = True
+    try:
+        st = server_status() if server_status is not None else None
+        was_running = bool(st and st.get("running"))
+    except Exception:  # noqa: BLE001 - unknown state: keep old behavior
+        was_running = True
+    if not was_running:
+        return jsonify({"ok": True, "result": result,
+                        "needs_restart": False, "restarted": False,
+                        "note": "已吊销 %s；OpenVPN 服务未运行，吊销在服务下次启动时生效"
+                                % name})
     try:
         restart_server()
     except Exception as exc:  # noqa: BLE001
@@ -2795,9 +2812,19 @@ def nodes_revoke(name):
             state["cmds"][cmd_id]["status"] = "failed"
             state["cmds"][cmd_id]["error"] = "节点已吊销"
             state["cmds"][cmd_id]["finished_at"] = _utcnow_iso()
+        # R44-L5-F5: node DELETE must also drop that node's .ovpn
+        # receipts -- otherwise re-registering the same node name
+        # serves a previous user's credential for a user the fresh
+        # node never had.
+        ovpn = state.get("ovpn") or {}
+        dropped = [k for k in ovpn if isinstance(k, str)
+                   and k.startswith(name + ":")]
+        for key in dropped:
+            del ovpn[key]
         _save_queue(state)
     _audit("node_revoke", node=name, result="ok",
-           detail="token 已作废，该节点后续 poll 一律 401")
+           detail="token 已作废，该节点后续 poll 一律 401；"
+                  "已清理 .ovpn 回执 %d 条" % len(dropped))
     return jsonify({"ok": True, "node": name})
 
 
