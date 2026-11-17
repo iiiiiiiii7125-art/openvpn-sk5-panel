@@ -537,7 +537,10 @@ def _load_queue():
     空队列，面板继续工作（调用方随后 _save_queue 写回全新空队列）。
     文件存在但不可读（OSError，如权限错）与解析失败同待遇（R23-P2-3）：
     先隔离备份＋审计行再返空——否则调用方随后 _save_queue 会把不可读
-    文件里的已排队命令物理销毁且零痕迹。隔离失败（备份 rename 不成）
+    文件里的已排队命令物理销毁且零痕迹。文件含非 UTF-8 字节时同待遇
+    （R43-J7-3）：f.read() 抛 UnicodeDecodeError（ValueError 子类），
+    必须走隔离分支，不得越过 OSError/ValueError 处理直出——否则隔离
+    永不执行、每次队列操作都 500 直到人工删文件。隔离失败（备份 rename 不成）
     时宁可大声失败（raise）也不返空：返空后写回即销毁命令，而备份又
     不在——正是本缺陷的静默销毁。所有 _save_queue 调用点都在同一
     _QUEUE_LOCK 内、紧跟本次 _load_queue，故加载点隔离＋失败即 raise
@@ -548,6 +551,17 @@ def _load_queue():
         with open(AGENT_QUEUE_PATH, encoding="utf-8") as f:
             raw = f.read()
     except FileNotFoundError:
+        return {"queue": {}, "cmds": {}, "ovpn": {}}
+    except UnicodeDecodeError as exc:
+        # R43-J7-3: decode failure is corruption, not a crash — same
+        # quarantine-or-raise discipline as the unreadable-file branch.
+        backup = _quarantine_corrupt_queue(
+            "queue file is not valid UTF-8: %s" % exc)
+        if backup is None:
+            raise RuntimeError(
+                "agent queue file %s is not valid UTF-8 (%s) and could "
+                "not be quarantined; refusing to return an empty queue" % (
+                    AGENT_QUEUE_PATH, exc))
         return {"queue": {}, "cmds": {}, "ovpn": {}}
     except OSError as exc:
         backup = _quarantine_corrupt_queue(
