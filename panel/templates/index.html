@@ -1109,7 +1109,7 @@ document.getElementById("detectIpBtn").onclick = async function () {
     } else {
       showMsg("serverMsg", "探测不到公网 IP：" + (d && d.error ? d.error : "未知错误"), false);
     }
-  } catch (e) { showMsg("serverMsg", "自动探测不可用：" + e.message + "（Cloudflare 模式无此端点，请手动填公网 IP/域名）", false); }
+  } catch (e) { showMsg("serverMsg", "自动探测不可用：" + e.message + "（请手动填公网 IP/域名）", false); }
 };
 document.getElementById("saveServerBtn").onclick = async function () {
   try {
