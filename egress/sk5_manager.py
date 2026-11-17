@@ -103,6 +103,15 @@ def _default_config() -> dict:
         # False = native SOCKS5 UDP ASSOCIATE (needs merchant UDP).
         # True  = udp_over_tcp: sing-box wraps UDP in TCP to the SK5.
         "udp_over_tcp": False,
+        # R44-L5-F1: True when the last set_udp_over_tcp flip stored a
+        # new value but its restart FAILED, so the stored value was
+        # never applied (daemon down, old encapsulation). The
+        # same-value branch must re-attempt the restart instead of
+        # hitting the R6-P2-2 no-op short-circuit and returning a
+        # silent 200 on a dead chain. Cleared by any successful
+        # enable() (the stored config is in effect again) and by
+        # the flip path before its restart attempt.
+        "uot_restart_failed": False,
     }
 
 
@@ -156,7 +165,8 @@ def _validate_stored(cfg: dict) -> None:
         raise ValueError(
             "bad stored %s: port must be an integer 1-65535, got %s %s"
             % (CONFIG_FILE, type(port).__name__, repr(port)[:64]))
-    for key in ("enabled", "fail_open", "udp_over_tcp"):
+    for key in ("enabled", "fail_open", "udp_over_tcp",
+                "uot_restart_failed"):
         v = cfg.get(key)
         if type(v) is bool:
             continue
@@ -1333,6 +1343,11 @@ def enable() -> dict:
             "fallback blackhole so VPN traffic is dropped, not "
             "leaked -- re-enable via the panel once sing-box is up")
     cfg["enabled"] = True
+    # R44-L5-F1: the daemon is up and the policy is applied, so the
+    # stored config (including udp_over_tcp) is in effect again --
+    # any stale "flip restart failed" marker from set_udp_over_tcp
+    # is false now, whichever path got us here.
+    cfg["uot_restart_failed"] = False
     _save_config(cfg)
     return get_status()
 
@@ -1474,9 +1489,23 @@ def check_health() -> dict:
     serves direct mode, where policy must NOT be installed.
     Every outcome is recorded to health.json so the panel / agent
     can show the last check without re-probing. Returns
-    {"healthy","action","detail"}; never raises on probe error.
+    {"healthy","action","detail"}; never raises on probe error. A
+    corrupt or unreadable sk5.json is a verdict, not an exception:
+    action="config_error" (healthy=False, recorded to health.json,
+    no state change -- fail_open is unreadable, so no fail-over is
+    attempted).
     """
-    cfg = _load_config()
+    try:
+        cfg = _load_config()
+    except (RuntimeError, ValueError, OSError) as exc:
+        # R44-L5-F2: the bare _load_config() used to raise out of the
+        # 60 s timer tick, so health.json went stale and no verdict
+        # was ever recorded. The timer must always get a verdict.
+        result = {"healthy": False, "action": "config_error",
+                  "detail": "cannot read SK5 config %s: %s"
+                            % (CONFIG_FILE, exc)}
+        _record_health(result)
+        return result
     if not cfg.get("enabled"):
         result = {"healthy": True, "action": "chain_disabled",
                   "detail": "not enabled"}
@@ -1627,11 +1656,29 @@ def set_udp_over_tcp(enabled: bool) -> dict:
     cfg = _load_config()
     new_value = bool(enabled)
     if cfg.get("udp_over_tcp") == new_value:
+        if cfg.get("enabled") and cfg.get("uot_restart_failed"):
+            # R44-L5-F1: the stored value was never applied -- the
+            # flip that wrote it failed its restart. The R6-P2-2
+            # no-op must not swallow the retry: re-attempt the
+            # restart (raises honestly if it still fails; a success
+            # clears the marker inside enable()).
+            enable()
         return get_status()
     cfg["udp_over_tcp"] = new_value
+    cfg["uot_restart_failed"] = False
     _save_config(cfg)
     if cfg.get("enabled"):
-        enable()
+        try:
+            enable()
+        except Exception as exc:  # noqa: BLE001 -- any restart failure
+            # wedges the chain the same way: the new value is stored
+            # but never took effect (daemon down, old encapsulation).
+            # Record it durably so a same-value retry re-attempts
+            # the restart instead of returning a silent 200, then
+            # raise honestly like the flip path always did.
+            cfg["uot_restart_failed"] = True
+            _save_config(cfg)
+            raise
     return get_status()
 
 
