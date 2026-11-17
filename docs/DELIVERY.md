@@ -46,7 +46,7 @@ cd /root && curl -L -o ovpn-release-1.0.2.tar.gz https://raw.githubusercontent.c
 面板域名（留空则不设反代，直接用 https://<服务器 IP>:8443）:
 ```
 
-- 填域名：自动从官方 apt 源装 Caddy，写 `/etc/caddy/Caddyfile`（`<域名> { reverse_proxy https://localhost:8443 { transport http { tls_trusted_ca_certs /etc/caddy/panel-cert.pem } } }`，上游用面板自签证书校验，不跳过证书校验；该路径是安装器复制的公开证书副本，caddy 可读，`panel-key.pem` 从不复制），`caddy validate` 通过后才启用；开 80/443 端口（ufw 在用则 `ufw allow`，否则 live iptables 规则，重启不保留）；Let's Encrypt 自动办证（HTTP-01，需 80 端口可达且域名已解析到本机）。`panel.env` 追加 `OVPN_PANEL_DOMAIN=<域名>`、`OVPN_PANEL_HTTPS=1`（Secure cookie）、`OVPN_TRUSTED_PROXY=1`（ProxyFix，见 `docs/security.md`「域名反代」行）。面板之后用 `https://<域名>` 访问，`https://IP:8443` 仍可用；完成横幅同时印两个地址。
+- 填域名：自动从官方 apt 源装 Caddy，写 `/etc/caddy/Caddyfile`（`<域名> { reverse_proxy https://localhost:8443 { lb_try_duration 2s lb_try_interval 100ms transport http { tls_trusted_ca_certs /etc/caddy/panel-cert.pem } } }`，上游用面板自签证书校验，不跳过证书校验；`lb_try_duration` 只重试拨号失败（面板重启约 1 秒内请求照常成功，不再 502），面板返回的 5xx 不重试；该路径是安装器复制的公开证书副本，caddy 可读，`panel-key.pem` 从不复制），`caddy validate` 通过后才启用；开 80/443 端口（ufw 在用则 `ufw allow`，否则 live iptables 规则，重启不保留）；Let's Encrypt 自动办证（HTTP-01，需 80 端口可达且域名已解析到本机）。`panel.env` 追加 `OVPN_PANEL_DOMAIN=<域名>`、`OVPN_PANEL_HTTPS=1`（Secure cookie）、`OVPN_TRUSTED_PROXY=1`（ProxyFix，见 `docs/security.md`「域名反代」行）。面板之后用 `https://<域名>` 访问，`https://IP:8443` 仍可用；完成横幅同时印两个地址。
 - 留空：不设反代。**重装时留空表示“不改动”**，保留已配的域名与 Caddy 配置；只有全新安装留空才是“跳过”。
 - 非交互安装（脚本/自动化）：预设环境变量，`OVPN_PANEL_DOMAIN=panel.example.com bash install.sh`，不弹提示。
 - 域名须是裸域名（无 scheme/端口/路径；末尾一个点会被去掉）。输错格式只警告、不中断安装；解析未生效（查不到或指的不是本机）也只警告，Caddy 会在 DNS 生效后自动重试；装 Caddy 或 `caddy validate` 失败同样只警告、面板仍可用 IP 地址访问。

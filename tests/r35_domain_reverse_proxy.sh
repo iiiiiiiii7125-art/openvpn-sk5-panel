@@ -60,6 +60,8 @@ cat > "$TMP/expected" <<EOF
 # BEGIN openvpn-sk5-panel (managed by install.sh -- change the domain with OVPN_PANEL_DOMAIN, do not hand-edit this block)
 panel.example.com {
     reverse_proxy https://localhost:8443 {
+        lb_try_duration 2s
+        lb_try_interval 100ms
         transport http {
             tls_trusted_ca_certs $_CADDY_PANEL_CERT
         }
@@ -69,6 +71,13 @@ panel.example.com {
 EOF
 diff -u "$TMP/expected" "$_BUILD_OUT" >/dev/null
 cell "Caddyfile block exact (localhost, trusted CA cert, no insecure flag)" "$?"
+# R42-LIVE-1 (Fix-N): the retry lines are part of the pinned block --
+# the exact diff above already covers them; these cells name the
+# requirement so a future removal fails loudly, not silently.
+grep -qx "        lb_try_duration 2s" "$_BUILD_OUT"
+cell "lb_try_duration 2s present (R42-LIVE-1 retry)" "$?"
+grep -qx "        lb_try_interval 100ms" "$_BUILD_OUT"
+cell "lb_try_interval 100ms present (R42-LIVE-1 retry)" "$?"
 if grep -q "tls_insecure_skip_verify" "$_BUILD_OUT"; then r=1; else r=0; fi
 cell "no tls_insecure_skip_verify in generated block" "$r"
 if grep -q "127.0.0.1:8443" "$_BUILD_OUT"; then r=1; else r=0; fi

@@ -913,7 +913,12 @@ _caddy_block() { # _caddy_block <domain> -- print the managed Caddyfile block
     # the caddy unit runs as User=caddy. The installer re-copies the
     # public cert to that path on every run (see the domain section);
     # panel-key.pem is never copied.
-    printf '%s {\n    reverse_proxy https://localhost:8443 {\n        transport http {\n            tls_trusted_ca_certs %s\n        }\n    }\n}\n' "$1" "${_CADDY_PANEL_CERT:-/etc/caddy/panel-cert.pem}"
+    # R42-LIVE-1: retry the upstream dial while the panel restarts
+    # (~1 s). lb_try_duration retries ONLY dial/connection errors --
+    # a panel 500 still surfaces immediately (no retry on 5xx).
+    # 2 s covers the restart with margin; a genuinely dead panel
+    # still fails fast (bounded by the 2 s, not hidden).
+    printf '%s {\n    reverse_proxy https://localhost:8443 {\n        lb_try_duration 2s\n        lb_try_interval 100ms\n        transport http {\n            tls_trusted_ca_certs %s\n        }\n    }\n}\n' "$1" "${_CADDY_PANEL_CERT:-/etc/caddy/panel-cert.pem}"
 }
 
 _build_caddyfile() { # _build_caddyfile <domain> <existing-file-or--> <outfile>
