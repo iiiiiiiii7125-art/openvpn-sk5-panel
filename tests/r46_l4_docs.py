@@ -115,6 +115,8 @@ doc_m = re.search(r"（(\d+) 格，\n?\s*(\d+) 个探针文件", CF_README)
 # BH-03(c) flip (Fix-AG): the corpus grew from 19 files / 292 cells to
 # 23 files / 359 cells, so the anchor can no longer be the literal
 # "19 个探针文件" — find the count by regex instead.
+# R46 integration fixup: the fix round added 3 more files (r46_fix_af_
+# worker, r46_l5_worker, r46_l7_contract) — now 26 files / 406 cells.
 _m_files = re.search(r"(\d+) 个探针文件", CF_README)
 corpus_sec = CF_README[_m_files.start():]
 corpus_sec = corpus_sec[:corpus_sec.index("；其中")]

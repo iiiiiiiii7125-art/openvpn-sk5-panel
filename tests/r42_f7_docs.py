@@ -165,6 +165,11 @@ cell("D09 panel/README line citation points at the real note",
 # r45_fix_ad_worker, r45_l7_worker); the corpus is now all 23 tests/
 # .mjs files, 359 cells. docs/audit/l5-probes/r41_l5_worker.mjs is NOT
 # in the list: it lives with the R41 audit report, not in tests/.
+# R46 integration fixup: three more files joined in the fix round
+# (r46_fix_af_worker 7, r46_l5_worker 17, r46_l7_contract 23) — the
+# corpus is now 26 files, 406 cells. The parser also handles the
+# "TOTAL: PASS=N" shape (r46_l7_contract) alongside the three output
+# shapes below.
 # The parser also handles the three output shapes in the corpus:
 # "TOTAL N cells", "N/N PASS", "checks=N failures=M", and "ALL PASS"
 # (count the ^PASS lines).)
@@ -182,6 +187,8 @@ worker_files = [
     "tests/r43_j4_journey.mjs",
     "tests/r45_fix_ad_frontend.mjs", "tests/r45_fix_ad_worker.mjs",
     "tests/r45_l7_worker.mjs",
+    "tests/r46_fix_af_worker.mjs", "tests/r46_l5_worker.mjs",
+    "tests/r46_l7_contract.mjs",
 ]
 total, per = 0, {}
 for f in worker_files:
@@ -191,16 +198,20 @@ for f in worker_files:
     if m:
         n = int(m.group(1))
     else:
-        m = re.search(r"checks=(\d+) failures=", out)
+        m = re.search(r"PASS=(\d+)", out)
         if m:
             n = int(m.group(1))
         else:
-            m = re.search(r"(\d+)/(\d+)(?: (?:passed|PASS|fixed-behavior cells pass)|$)",
-                          out, re.M)
+            m = re.search(r"checks=(\d+) failures=", out)
             if m:
-                n = int(m.group(2))
-            elif "ALL PASS" in out:
-                n = len(re.findall(r"^PASS ", out, re.M))
+                n = int(m.group(1))
+            else:
+                m = re.search(r"(\d+)/(\d+)(?: (?:passed|PASS|fixed-behavior cells pass)|$)",
+                              out, re.M)
+                if m:
+                    n = int(m.group(2))
+                elif "ALL PASS" in out:
+                    n = len(re.findall(r"^PASS ", out, re.M))
     per[f] = n
     total += n or 0
 _crm = read("cloudflare/README.md")
