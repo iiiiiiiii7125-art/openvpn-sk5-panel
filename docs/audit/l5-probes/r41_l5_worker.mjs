@@ -5,6 +5,12 @@
 // FIX LANE Fix-D (R41): W02/W03 now assert the fixed behavior (were
 // OBSERVE cells in the audit); W13 flipped to assert the heartbeat
 // lands on the snapshot (R41-L5-P2-3 fixed) — BH-03(c) style, disclosed.
+// FIX LANE Fix-K (R42-F4-1): W13 flipped AGAIN — BH-03(c) style,
+// disclosed: the poll heartbeat still lands on the snapshot (L5-P2-3
+// intent preserved), but it no longer stamps `at`, so a poll-only node
+// has status_age_s === null until the first get_status report lands
+// (Flask R11-P1-1: 心跳不打 at). The old pin (status_age_s !== null
+// after poll-only) asserted the divergent behavior F42-F4-1 filed.
 // Usage: node docs/audit/l5-probes/r41_l5_worker.mjs (exit = FAIL count)
 // Import uses a relative path into the same tree's cloudflare/src/index.js.
 import worker from "../../../cloudflare/src/index.js";
@@ -164,13 +170,17 @@ async function main() {
     r.status === 200, `${r.status}`);
   r = await req("GET", "/api/nodes", { headers: { Cookie: adminCookie } });
   const wk2 = (r.json?.nodes || []).find((n) => n.name === "wk2") || {};
-  // R41-L5-P2-3 FIXED (probe expectation flipped from the audit's OBSERVE
-  // cell, BH-03(c) style — disclosed here, not silently rewritten):
-  // the poll heartbeat now lands on the node snapshot like Flask F46,
-  // so a poll-only node shows openvpn/sk5_enabled/status_age_s.
-  cell("W13 poll-only node shows heartbeat status (R41-L5-P2-3 fixed)",
+  // R42-F4-1 FIXED (probe expectation flipped a second time, BH-03(c)
+  // style — disclosed here, not silently rewritten): the poll heartbeat
+  // still lands on the node snapshot like Flask F46 (L5-P2-3 intent
+  // preserved — openvpn/sk5_enabled visible, last_seen set), but it no
+  // longer stamps `at`, so a poll-only node has status_age_s === null
+  // until the first get_status report lands (Flask R11-P1-1: 心跳不打
+  // at). The R41 pin (status_age_s !== null after poll-only) asserted
+  // the divergent behavior F42-F4-1 filed: age measured time-since-poll.
+  cell("W13 poll-only node shows heartbeat status but age null until get_status (R42-F4-1 fixed)",
     wk2.openvpn !== null && wk2.openvpn.running === true
-    && wk2.sk5_enabled === true && wk2.status_age_s !== null
+    && wk2.sk5_enabled === true && wk2.status_age_s === null
     && wk2.last_seen !== null,
     JSON.stringify(wk2));
 

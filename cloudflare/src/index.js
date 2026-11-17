@@ -482,9 +482,12 @@ async function enqueueCommand(env, nodeName, action, params) {
 //   online_users 是 Flask 现算的（clients 列表长度），agent 只给 clients 列表；
 //   proto/port/subnet/dns 不在 agent 结果里，由读快照时按 servercfg 补（见 cachedStatus）。
 // 密码字段绝不写入快照。
+// R42-F4-1：归一化结果本身不打 at —— at 只由 get_status 回执在
+// handleAgentReport 里落戳（Flask R11-P1-1：心跳不打 at）。旧版在
+// 这里落戳，导致任何命令回执都刷新快照年龄。
 function snapshotFromResult(result) {
   if (!result || typeof result !== "object") return null;
-  const snap = { at: nowMs() };
+  const snap = {};
   if (result.openvpn && typeof result.openvpn === "object") {
     const ov = result.openvpn;
     snap.openvpn = {
@@ -1022,7 +1025,9 @@ async function handleAgentPoll(request, env) {
   if (!claim.ok) return err(claim.error, 403);
   // R41-L5-P2-3：poll 心跳状态落快照（Flask agent_poll/_touch_node
   // 同款）：心跳键合并写，绝不覆盖全量 openvpn/sk5/egress/users
-  // 对象；at 按 Worker 快照惯例随写落戳。
+  // 对象；R42-F4-1：心跳不打 at（Flask R11-P1-1 同款）——at 只由
+  // get_status 回执落戳，否则 age_s 量的是“距上次 poll”而非
+  // “距上次实测”，poll-only 节点永远显示新鲜。
   if (body.status && typeof body.status === "object" && !Array.isArray(body.status)) {
     const prev = (await kvGetJson(env, `status:${node.name}`)) || {};
     const hb = {};
@@ -1030,7 +1035,7 @@ async function handleAgentPoll(request, env) {
     if (typeof body.status.hostname === "string") hb.hostname = body.status.hostname;
     if (typeof body.status.openvpn_running === "boolean") hb.openvpn_running = body.status.openvpn_running;
     if (typeof body.status.sk5_enabled === "boolean") hb.sk5_enabled = body.status.sk5_enabled;
-    await kvPutJson(env, `status:${node.name}`, { ...prev, ...hb, at: nowMs() });
+    await kvPutJson(env, `status:${node.name}`, { ...prev, ...hb });
   }
   const now = nowMs();
   let queue = kvArray(await kvGetJson(env, `queue:${node.name}`), `queue:${node.name}`);
@@ -1147,8 +1152,14 @@ async function handleAgentReport(request, env) {
   // 纯心跳：无命令 id，只有状态快照时只更新快照与 last_seen。
   if (!cmdId) {
     if (body.status_snapshot) {
+      // R42-F4-1：纯心跳回执按 Flask agent_report 同款合并写（不打
+      // at、不丢弃旧快照的其它键）；旧版整存替换且带 at，等同一次
+      // get_status 回执。
       const snap = snapshotFromResult(body.status_snapshot);
-      if (snap) await kvPutJson(env, `status:${node.name}`, snap);
+      if (snap) {
+        const prev = (await kvGetJson(env, `status:${node.name}`)) || {};
+        await kvPutJson(env, `status:${node.name}`, { ...prev, ...snap });
+      }
     }
     const rec = await kvGetJson(env, `node:${node.name}`);
     if (rec) {
@@ -1190,10 +1201,16 @@ async function handleAgentReport(request, env) {
     await kvPutJson(env, `sent:${node.name}`, kept, { expirationTtl: CMD_TTL_S });
   }
 
-  const snap = snapshotFromResult(body.result);
-  if (snap) {
-    const prev = (await kvGetJson(env, `status:${node.name}`)) || {};
-    await kvPutJson(env, `status:${node.name}`, { ...prev, ...snap, at: nowMs() });
+  // R42-F4-1（Flask R11-P1-1 同款）：快照只由 get_status 的成功回执
+  // 更新并打 at；其它动作的回执不碰快照——enable_sk5 等回执是扁平
+  // sk5-manager 结果（无 sk5 对象），旧版照单合并会刷新 age、覆盖
+  // egress，却不更新 sk5 段，面板显示“新鲜”数据说 SK5 仍关。
+  if (cmd.action === "get_status" && cmd.status === "done") {
+    const snap = snapshotFromResult(body.result);
+    if (snap) {
+      const prev = (await kvGetJson(env, `status:${node.name}`)) || {};
+      await kvPutJson(env, `status:${node.name}`, { ...prev, ...snap, at: nowMs() });
+    }
   }
   // 建服务成功：记下 proto/port，供快照补 proto/port/subnet/dns（P1-5）。
   if (cmd.action === "create_server" && cmd.status === "done") {
