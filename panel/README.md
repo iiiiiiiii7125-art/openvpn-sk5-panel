@@ -38,7 +38,7 @@ python3 app.py
 | POST `/api/openvpn/restart` | — | `result` |
 | GET `/api/openvpn/users` | — | `users: [{name, status: valid\|revoked\|expired, revoked: bool, online: bool, expires, serial, legacy}]`（`legacy: true` = 旧版 CN=OpenVPN-CA 存量证书，见下节迁移说明） |
 | POST `/api/openvpn/users` | `name: string（core 规则 `[a-zA-Z0-9_-]{1,32}`）` | `user{name, status: "valid"}, ovpn_url`（建完前端自动打开该地址下载 `.ovpn`） |
-| DELETE `/api/openvpn/users/<name>` | — | `result{name, status, crl}, needs_restart: true, note`（CRL 只在启动时读，吊销后须重启） |
+| DELETE `/api/openvpn/users/<name>` | — | `result{name, status, crl}, needs_restart: false, restarted: true`（面板在吊销成功后自动重启 OpenVPN 服务一次，CRL 立即生效，无须手动重启；重启失败时返回 500 + `needs_restart: true`） |
 | GET `/api/openvpn/users/<name>/ovpn` | — | `.ovpn` 文件下载（`Content-Disposition: attachment`），证书文件缺失返回 404 JSON |
 | GET `/api/sk5` | — | `sk5{host, port, username, has_password, enabled, fail_open, udp_over_tcp, singbox_running, policy_routing_active, vpn_net, egress_ip}`（不回显密码） |
 | POST `/api/sk5` | `host: string, port: int(1-65535), username: string, password: string, enabled: bool, fail_open?: bool, udp_over_tcp?: bool, clear_password?: bool` | `sk5`（`get_status()` 原样）；`enabled=true` 时立即应用（起 sing-box + 策略路由）。密码语义：`password` 缺失/空串 = 保留已有密码，只有非空才覆盖；清密码须同时传 `clear_password: true` |

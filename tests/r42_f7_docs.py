@@ -155,7 +155,11 @@ cell("D09 panel/README line citation points at the real note",
 # ---------- D10: cloudflare README Worker corpus == measured total ----------
 # (Audit R42-F7-3: the README said "56 格" while the measured corpus is
 # 246. The cell compares the number stated in the README against the
-# measured total, so it fails on the old doc and passes on the fixed one.)
+# measured total, so it fails on the old doc and passes on the fixed one.
+# R43-J4-1: r42_f4_age.mjs and r43_j4_journey.mjs joined the corpus
+# after the R42 fix; the list below is the corpus -- extend it in the
+# same commit whenever a Worker probe file is added, or D10 and the
+# README will silently go stale again.)
 worker_files = [
     "tests/bh_worker_poll_guard.mjs", "tests/bi_worker_malformed.mjs",
     "tests/bi_worker_queue_race.mjs", "tests/r17_worker.mjs",
@@ -166,6 +170,7 @@ worker_files = [
     "tests/r31_ctype.mjs", "tests/r31_edge.mjs",
     "tests/r41_l6_worker_parity.mjs", "docs/audit/l5-probes/r41_l5_worker.mjs",
     "tests/br_loginfail_array.mjs",
+    "tests/r42_f4_age.mjs", "tests/r43_j4_journey.mjs",
 ]
 total, per = 0, {}
 for f in worker_files:
