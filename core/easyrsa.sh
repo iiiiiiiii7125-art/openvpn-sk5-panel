@@ -149,11 +149,16 @@ easyrsa() {
 
 case "$CMD" in
 init)
-    # Fresh PKI + self-signed CA. Refuses to run twice: init-pki wipes
-    # the directory, so require an explicit empty/absent pki first --
-    # unless --force is given (CA rebuild, e.g. after a compromise;
-    # the caller must confirm separately -- see agent action_init_pki,
-    # which requires confirm=true alongside force).
+    # Fresh PKI + self-signed CA. Refuses to run twice when a CA
+    # exists, unless --force is given (CA rebuild, e.g. after a
+    # compromise; the caller must confirm separately -- see agent
+    # action_init_pki, which requires confirm=true alongside force).
+    # R42-F1-5: easyrsa init-pki deletes the whole directory contents
+    # first, so a non-empty pki WITHOUT a CA (operator files, a
+    # partial/foreign PKI) is moved aside to a timestamped sibling
+    # backup before init-pki runs -- never silently wiped. (Core
+    # init_pki does the same move first; this is the direct-call
+    # safety net.)
     FORCE=0
     [ "${3:-}" = "--force" ] && FORCE=1
     if [ -e "$EASYRSA_PKI/ca.crt" ] && [ "$FORCE" -eq 0 ]; then
@@ -162,6 +167,11 @@ init)
     fi
     if [ "$FORCE" -eq 1 ]; then
         rm -rf "$EASYRSA_PKI"
+    elif [ -d "$EASYRSA_PKI" ] && [ -n "$(ls -A "$EASYRSA_PKI" 2>/dev/null)" ]; then
+        _BK="$CA_DIR/.pki-backup-$(date -u +%Y%m%d%H%M%S)-$$"
+        mv "$EASYRSA_PKI" "$_BK" \
+            || { echo "easyrsa.sh: cannot move aside non-empty $EASYRSA_PKI" >&2; exit 1; }
+        echo "easyrsa.sh: moved non-empty pki aside to $_BK" >&2
     fi
     easyrsa init-pki
     EASYRSA_REQ_CN="OpenVPN-CA" easyrsa build-ca nopass
@@ -172,7 +182,16 @@ build-server)
     _repair_pki_layout
     EASYRSA_REQ_CN="server" easyrsa gen-req server nopass
     easyrsa sign-req server server
-    easyrsa gen-dh
+    # R42-F1-3: easyrsa gen-dh FAILS ("DH parameters file already
+    # exists") when dh.pem is present, so an unconditional call broke
+    # every rebuild of a complete/partial set that already had one
+    # (expired-cert renewal, renew_server_cert, or a partial set with
+    # dh.pem kept). DH params are independent of the server cert and
+    # need no rotation on renewal -- generate only when missing, the
+    # same conditional shape as ta.key below.
+    if [ ! -e "$EASYRSA_PKI/dh.pem" ]; then
+        easyrsa gen-dh
+    fi
     # tls-auth static key: --genkey secret on OpenVPN >= 2.5,
     # --genkey --secret on 2.4 (R41-L1-2).
     if [ ! -e "$EASYRSA_PKI/ta.key" ]; then

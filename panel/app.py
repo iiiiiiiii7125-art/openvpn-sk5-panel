@@ -1964,8 +1964,24 @@ def ovpn_users_revoke(name):
         return jsonify({"ok": False, "error": str(exc)}), 409
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(exc)}), 500
-    return jsonify({"ok": True, "result": result, "needs_restart": True,
-                    "note": "OpenVPN 只在启动时读 CRL,吊销后须重启服务才对新连接生效"})
+    # R42-F1-1: the CRL is only read at daemon start, so a revoke that
+    # returns without a restart leaves the ex-user able to connect.
+    # Restart now, the way the agent face does (agent
+    # action_revoke_user), so the revocation is in effect when this
+    # call returns. A failed restart is LOUD: the revoke is recorded
+    # but not yet enforced, and the response says so (needs_restart
+    # stays True) instead of reporting success.
+    try:
+        restart_server()
+    except Exception as exc:  # noqa: BLE001
+        _audit("openvpn_user_revoke", result="error",
+               detail="name=%s restart failed: %s" % (name, exc))
+        return jsonify({"ok": False,
+                        "error": "已吊销 %s，但重启 OpenVPN 服务失败：%s；吊销在手动重启后才对新连接生效" % (name, exc),
+                        "needs_restart": True}), 500
+    return jsonify({"ok": True, "result": result, "needs_restart": False,
+                    "restarted": True,
+                    "note": "已重启 OpenVPN 服务，吊销立即对新连接生效"})
 
 
 @app.route("/api/openvpn/users/<name>/ovpn", methods=["GET"])

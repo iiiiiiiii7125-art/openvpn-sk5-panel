@@ -28,6 +28,7 @@ from __future__ import annotations
 import base64
 import fcntl
 import ipaddress
+import json
 import os
 import re
 import socket
@@ -191,13 +192,36 @@ def init_pki(ca_dir: str | Path | None = None, force: bool = False) -> Path:
     With ``force=True`` the wipe is passed through to ``easyrsa.sh init
     --force`` (which removes the pki dir before re-running init-pki);
     without it the script still refuses when ca.crt exists.
+
+    R42-F1-5: a non-empty pki dir WITHOUT a CA is moved aside first
+    (sibling ``.pki-backup-<ts>-<pid>/`` dir, same filesystem so the
+    rename is atomic) instead of being wiped: easy-rsa ``init-pki``
+    deletes the whole directory contents, so operator files in such
+    a dir (a partial/foreign PKI, a custom cnf, a CA key without its
+    cert) were destroyed without warning. ``easyrsa.sh init`` does
+    the same move as a direct-call safety net.
     """
     ca_dir = _resolve_ca_dir(ca_dir)
-    ca_crt = ca_dir / "pki" / "ca.crt"
+    pki = _pki_dir(ca_dir)
+    ca_crt = pki / "ca.crt"
     if ca_crt.exists() and not force:
         raise OpenVPNError(
             "CA already exists at %s (pass force=True to wipe it)" % ca_crt
         )
+    if not force and pki.is_dir():
+        try:
+            leftover = any(pki.iterdir())
+        except OSError:
+            leftover = False
+        if leftover:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            backup = ca_dir / (".pki-backup-%s-%d" % (stamp, os.getpid()))
+            try:
+                os.rename(pki, backup)
+            except OSError as exc:
+                raise OpenVPNError(
+                    "cannot move aside non-empty pki dir %s: %s" % (pki, exc)
+                ) from exc
     args = ["init", str(ca_dir)]
     if force:
         args.append("--force")
@@ -207,9 +231,52 @@ def init_pki(ca_dir: str | Path | None = None, force: bool = False) -> Path:
     return ca_dir
 
 
+def _cert_is_expired(cert_path: Path) -> bool:
+    """True when *cert_path* is expired or cannot be verified.
+
+    ``openssl x509 -checkend 0`` exits 0 while the cert is still
+    valid, 1 once it has expired. Unparseable / unreadable / openssl
+    missing all return True (fail-safe): a cert nobody can verify is
+    useless to the daemon, so :func:`build_server_cert` rebuilds it
+    (with backup) instead of trusting it.
+    """
+    try:
+        proc = subprocess.run(
+            ["openssl", "x509", "-in", str(cert_path), "-noout",
+             "-checkend", "0"],
+            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return proc.returncode != 0
+
+
+def renew_server_cert(
+    ca_dir: str | Path | None = None,
+    server_dir: str | Path | None = None,
+) -> dict[str, str]:
+    """Regenerate ONLY the server cert/key (backup first).
+
+    Safe server-cert-only renewal path (R42-F1-3): forces
+    :func:`build_server_cert` to rebuild the server pair even when a
+    complete set already exists. The CA and every client certificate
+    are untouched -- unlike ``init_pki(force=True)``, which wipes the
+    whole CA. Use for an expired server cert, or to rotate before
+    expiry. Raises when no CA exists yet.
+    """
+    ca_dir = _resolve_ca_dir(ca_dir)
+    if not (_pki_dir(ca_dir) / "ca.crt").exists():
+        raise OpenVPNError(
+            "no CA at %s -- run init_pki() first" % _pki_dir(ca_dir)
+        )
+    return build_server_cert(ca_dir, server_dir, force=True)
+
+
 def build_server_cert(
     ca_dir: str | Path | None = None,
     server_dir: str | Path | None = None,
+    force: bool = False,
 ) -> dict[str, str]:
     """Build the server cert/key, DH params and tls-auth key, then copy the
     server-side files into *server_dir*.
@@ -230,6 +297,13 @@ def build_server_cert(
     timestamped ``pki/.server-key-backup-<ts>-<pid>/`` dir (mode 0700)
     and its path returned as ``"backup_dir"`` -- the triple may be
     operator key material this product did not create.
+
+    R42-F1-3: existence is not enough -- an EXPIRED server cert was
+    silently kept forever (no renewal path existed). A complete set
+    whose server cert is expired falls through to the rebuild branch
+    (backup + regenerate) and the result carries
+    ``"renewed_expired": "true"``. ``force=True`` rebuilds even a
+    valid set (see :func:`renew_server_cert`).
     """
     ca_dir = _resolve_ca_dir(ca_dir)
     server_dir = _resolve_server_dir(server_dir)
@@ -242,7 +316,9 @@ def build_server_cert(
         "ta.key": pki / "ta.key",
     }
     backup_dir: Path | None = None
-    if all(p.exists() for p in artifacts.values()):
+    complete = all(p.exists() for p in artifacts.values())
+    expired = complete and _cert_is_expired(artifacts["server.crt"])
+    if complete and not force and not expired:
         if not (pki / "crl.pem").exists():
             _run_easyrsa("gen-crl", str(ca_dir))
     else:
@@ -307,6 +383,8 @@ def build_server_cert(
         installed[name] = str(dest)
     if backup_dir is not None:
         installed["backup_dir"] = str(backup_dir)
+    if expired:
+        installed["renewed_expired"] = "true"
     return installed
 
 
@@ -443,6 +521,69 @@ def _index_expiry_is_past(expiry: str) -> bool:
     return when <= datetime.now(timezone.utc)
 
 
+_TOMBSTONE_FILE = ".revoked-tombstones.json"
+
+
+def _read_tombstones(pki: Path) -> dict:
+    """Revoked-name tombstones (R42-F1-4), or {} when none/corrupt.
+
+    A tombstone is ``{name: {serial, cn, legacy, revoked_at}}``,
+    written at revoke time (see :func:`_revoke_cert`) and cleared on
+    re-issue. A corrupt file is treated as empty -- a tombstone is
+    display state, never security state (the CRL is authoritative).
+    """
+    try:
+        raw = (pki / _TOMBSTONE_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_tombstones(pki: Path, data: dict) -> None:
+    """Atomically replace the tombstone file (0600)."""
+    tmp = pki / (_TOMBSTONE_FILE + ".tmp")
+    tmp.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+    try:
+        tmp.chmod(0o600)
+    except OSError:
+        pass
+    os.replace(tmp, pki / _TOMBSTONE_FILE)
+
+
+def _record_tombstone(pki: Path, name: str, entry: dict | None) -> None:
+    """Record *name* as revoked (best-effort: never fail the revoke)."""
+    if entry is None:
+        return
+    try:
+        data = _read_tombstones(pki)
+        data[name] = {
+            "serial": entry.get("serial", ""),
+            "cn": entry.get("cn"),
+            "legacy": bool(entry.get("legacy")),
+            "revoked_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        }
+        _write_tombstones(pki, data)
+    except OSError:
+        pass
+
+
+def _clear_tombstone(pki: Path, name: str) -> None:
+    """Drop *name*'s tombstone after a successful re-issue (best-effort)."""
+    try:
+        data = _read_tombstones(pki)
+        if name in data:
+            del data[name]
+            _write_tombstones(pki, data)
+    except OSError:
+        pass
+
+
 def _parse_index_txt(index_path: Path) -> list[dict]:
     """Parse Easy-RSA ``pki/index.txt``.
 
@@ -525,6 +666,23 @@ def _parse_index_txt(index_path: Path) -> list[dict]:
             "serial": serial.strip(),
             "cn": cn,
             "legacy": bool(cn) and cn != name,
+        }
+    # R42-F1-4: revoke moves issued/<name>.crt into
+    # revoked/certs_by_serial/, so a revoked LEGACY user (CN=OpenVPN-CA)
+    # loses its only name record and vanishes from the list instead of
+    # showing as revoked. A tombstone written at revoke time keeps the
+    # name visible as revoked. Tombstones only fill gaps: a live index
+    # entry for the name always wins.
+    for tname, tomb in _read_tombstones(index_path.parent).items():
+        if tname in by_name:
+            continue
+        by_name[tname] = {
+            "name": tname,
+            "status": "revoked",
+            "expires": "",
+            "serial": tomb.get("serial", ""),
+            "cn": tomb.get("cn"),
+            "legacy": bool(tomb.get("legacy")),
         }
     users = sorted(by_name.values(), key=lambda u: u["name"])
     return users
@@ -743,14 +901,16 @@ def build_client_config(
 
 @contextmanager
 def _create_user_lock(pki: Path):
-    """Exclusive advisory lock for :func:`create_user`'s check-then-build.
+    """Exclusive advisory lock for user mutations (create + revoke).
 
     R8-P2-3: two concurrent creates for one name both passed the
     duplicate check (``_user_status``) before either ran
     ``easyrsa build-client``, so both got 200 and index.txt kept two
     ``V`` records for one CN. The lock makes the whole sequence --
     sweep, duplicate check, stale-file cleanup, build -- one atomic
-    step.
+    step. R42-F1-6: ``revoke_user`` takes the same lock -- a revoke
+    racing a create could otherwise interleave writes to the same
+    index.txt (``openssl ca`` takes no lock of its own).
 
     Why flock in core and not a threading.Lock in the panel: the agent
     executes the same function from a *different process* (it polls
@@ -964,6 +1124,9 @@ def create_user(
                     pass
 
         _run_easyrsa("build-client", str(ca_dir), name)
+        # R42-F1-4: a re-issued name drops its revoke tombstone -- the
+        # live index entry now carries the name again.
+        _clear_tombstone(pki, name)
 
     ca = _read_if_exists(pki / "ca.crt")
     cert = _read_if_exists(pki / "issued" / ("%s.crt" % name))
@@ -984,8 +1147,15 @@ def _revoke_cert(
     the server dir. Shared core for :func:`revoke_user` and the
     legacy-CN migration in :func:`create_user` (a pre-BUG-7 cert is
     revoked before it is re-issued with a correct CN). Returns
-    ``{name, status, crl}``."""
+    ``{name, status, crl}``.
+
+    R42-F1-4: the pre-revoke index entry is recorded as a tombstone
+    after the revoke succeeds, so a revoked user whose issued cert
+    file is gone (easy-rsa moves it to revoked/certs_by_serial/)
+    still lists as revoked instead of vanishing. ``create_user``
+    clears the tombstone on re-issue."""
     pki = _pki_dir(ca_dir)
+    entry = _user_entry(name, ca_dir)
     _run_easyrsa("revoke", str(ca_dir), name)
     crl_src = pki / "crl.pem"
     if not crl_src.exists():
@@ -993,6 +1163,7 @@ def _revoke_cert(
     dest = Path(server_dir) / "crl.pem"
     dest.write_bytes(crl_src.read_bytes())
     dest.chmod(0o644)
+    _record_tombstone(pki, name, entry)
     return {"name": name, "status": "revoked", "crl": str(dest)}
 
 
@@ -1009,22 +1180,31 @@ def revoke_user(
     NOTE: OpenVPN reads the CRL at daemon start, so the revocation only
     takes effect for *new* connections after ``restart_server()`` (an
     already-connected client is not kicked by a CRL refresh alone).
+    The agent and the panel restart the daemon after calling this;
+    the CLI leaves the restart to the operator.
 
     R9-P1-2: an *expired* certificate can still be revoked through
     this path -- real ``openssl ca -revoke`` accepts an already-expired
     cert (verified against OpenSSL 3.0.13, rc=0), so no special case
     is needed; the CRL entry is harmless and OpenVPN already rejects
     the cert on expiry alone.
+
+    R42-F1-6: the status check and the revoke run under the same
+    exclusive flock as :func:`create_user` (see
+    :func:`_create_user_lock`), so a revoke racing a create cannot
+    interleave writes to index.txt.
     """
     validate_username(name)
     ca_dir = _resolve_ca_dir(ca_dir)
     server_dir = _resolve_server_dir(server_dir)
-    status = _user_status(name, ca_dir)
-    if status is None:
-        raise UserNotFoundError("user %r does not exist" % name)
-    if status == "revoked":
-        raise UserAlreadyRevokedError("user %r is already revoked" % name)
-    return _revoke_cert(name, ca_dir, server_dir)
+    pki = _pki_dir(ca_dir)
+    with _create_user_lock(pki):
+        status = _user_status(name, ca_dir)
+        if status is None:
+            raise UserNotFoundError("user %r does not exist" % name)
+        if status == "revoked":
+            raise UserAlreadyRevokedError("user %r is already revoked" % name)
+        return _revoke_cert(name, ca_dir, server_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -1603,6 +1783,9 @@ class OpenVPNManager:
     def build_server_cert(self) -> dict[str, str]:
         return build_server_cert(self.ca_dir, self.server_dir)
 
+    def renew_server_cert(self) -> dict[str, str]:
+        return renew_server_cert(self.ca_dir, self.server_dir)
+
     def render_server_conf(
         self, proto: str = "udp", port: int | None = None,
         dns: str | None = None, allow_port_change: bool = False,
@@ -1642,6 +1825,7 @@ if __name__ == "__main__":
 
     # Tiny CLI for smoke tests: python3 -m core.openvpn_manager <cmd> [args]
     #   status | list | create <name> | revoke <name> | start | stop | restart
+    #   | renew-server-cert
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     mgr = OpenVPNManager()
     if cmd == "status":
@@ -1652,6 +1836,8 @@ if __name__ == "__main__":
         print(mgr.create_user(sys.argv[2]))
     elif cmd == "revoke" and len(sys.argv) > 2:
         print(json.dumps(mgr.revoke_user(sys.argv[2]), indent=2, ensure_ascii=False))
+    elif cmd == "renew-server-cert":
+        print(json.dumps(mgr.renew_server_cert(), indent=2, ensure_ascii=False))
     elif cmd == "start":
         print(json.dumps(mgr.start_server(), indent=2, ensure_ascii=False))
     elif cmd == "stop":
@@ -1659,4 +1845,4 @@ if __name__ == "__main__":
     elif cmd == "restart":
         print(json.dumps(mgr.restart_server(), indent=2, ensure_ascii=False))
     else:
-        raise SystemExit("usage: openvpn_manager.py status|list|create <name>|revoke <name>|start|stop|restart")
+        raise SystemExit("usage: openvpn_manager.py status|list|create <name>|revoke <name>|renew-server-cert|start|stop|restart")
