@@ -19,6 +19,7 @@ import re
 import secrets
 import socket
 import sqlite3
+import subprocess
 import sys
 import tarfile
 import threading
@@ -27,6 +28,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlparse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
@@ -2545,6 +2547,101 @@ def nodes_list():
     return jsonify({"ok": True, "nodes": nodes})
 
 
+def _panel_cert_sans():
+    """面板 TLS 证书的 SAN，返回 (ips, dns_names) 两个集合（DNS 小写），
+    证书读不到或解析失败时返回 None，由调用方按安装时的构造规则回退。
+    R42-F5-4：install.sh 生成的证书 SAN 固定是
+    IP:$SERVER_IP,IP:127.0.0.1,DNS:localhost。证书路径可用
+    OVPN_PANEL_CERT_PATH 覆盖（测试用），默认 /etc/openvpn-sk5-panel/
+    panel-cert.pem。"""
+    import ipaddress as _ip  # 仅本函数用，风格同 _valid_server_ip
+    cert = os.environ.get("OVPN_PANEL_CERT_PATH",
+                          "/etc/openvpn-sk5-panel/panel-cert.pem")
+    text = ""
+    for args in (["openssl", "x509", "-in", cert, "-noout", "-ext",
+                  "subjectAltName"],
+                 ["openssl", "x509", "-in", cert, "-noout", "-text"]):
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True,
+                                  timeout=10, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        text = proc.stdout or ""
+        if proc.returncode == 0 and "Subject Alternative Name" in text:
+            break
+    else:
+        return None
+    ips, dns_names = set(), set()
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines)
+                  if "Subject Alternative Name" in ln), None)
+    if start is None:
+        return None
+    for ln in lines[start + 1:]:
+        if "X509v3" in ln:
+            break
+        for m in re.finditer(r"IP Address:([0-9A-Fa-f:.]+)", ln):
+            try:
+                ips.add(str(_ip.ip_address(m.group(1))))
+            except ValueError:
+                continue
+        for m in re.finditer(r"DNS:([A-Za-z0-9._*-]+)", ln):
+            dns_names.add(m.group(1).lower())
+        if "IP Address:" not in ln and "DNS:" not in ln:
+            break
+    if not ips and not dns_names:
+        return None
+    return ips, dns_names
+
+
+def _panel_url_san_warning(panel_url, defaulted):
+    """panel_url 的 host 不在面板证书 SAN 中时返回警告文本，否则 None。
+    R42-F5-4：空 panel_url 静默默认成 request.host_url 后，若该地址不在
+    证书 SAN 里，agent 以 HTTPS 连接时证书验证永远失败，节点只显示
+    “从未上报”且无任何提示。证书可读时以实测 SAN 为准；读不到时按安装
+    时的构造规则回退（127.0.0.1/localhost/已存 server_ip）。"""
+    import ipaddress as _ip
+    try:
+        host = (urlparse(panel_url).hostname or "").strip()
+    except (ValueError, AttributeError):
+        return None
+    if not host:
+        return None
+    sans = _panel_cert_sans()
+    if sans is not None:
+        ips, dns_names = sans
+        sans_text = "证书 SAN：" + ", ".join(
+            ["IP:%s" % ip for ip in sorted(ips)] +
+            ["DNS:%s" % d for d in sorted(dns_names)])
+    else:
+        ips, dns_names = set(), set()
+        stored = _stored_server_ip()
+        if stored:
+            try:
+                ips.add(str(_ip.ip_address(stored)))
+            except ValueError:
+                dns_names.add(stored.lower())
+        ips.add("127.0.0.1")
+        dns_names.add("localhost")
+        sans_text = ("未能读取面板证书，按安装规则推定 SAN 为 "
+                     + ", ".join(["IP:%s" % ip for ip in sorted(ips)] +
+                                 ["DNS:%s" % d for d in sorted(dns_names)]))
+    try:
+        covered = str(_ip.ip_address(host)) in ips
+    except ValueError:
+        covered = host.lower() in dns_names
+    if covered:
+        return None
+    if defaulted:
+        return ("面板地址 %s 由当前访问地址默认得到，但不在面板证书 SAN 中"
+                "（%s），agent 以 HTTPS 连接时无法验证证书，节点将一直"
+                "无法上报；请改用证书中的地址注册节点。"
+                % (panel_url, sans_text))
+    return ("面板地址 %s 不在面板证书 SAN 中（%s），agent 以 HTTPS 连接时"
+            "无法验证证书，节点将一直无法上报；请改用证书中的地址注册节点。"
+            % (panel_url, sans_text))
+
+
 @app.route("/api/nodes", methods=["POST"])
 @login_required
 def nodes_register():
@@ -2557,7 +2654,8 @@ def nodes_register():
     panel_url = str(data.get("panel_url", "") or "").strip().rstrip("/")
     if panel_url and not panel_url.startswith(("http://", "https://")):
         return jsonify({"ok": False, "error": "panel_url 须以 http:// 或 https:// 开头"}), 400
-    if not panel_url:
+    defaulted = not panel_url
+    if defaulted:
         panel_url = request.host_url.rstrip("/")
     if _get_node(name):
         return jsonify({"ok": False, "error": "节点已存在：%s" % name}), 409
@@ -2575,11 +2673,17 @@ def nodes_register():
         _save_queue(state)
     _audit("node_register", result="ok",
            detail="name=%s panel_url=%s" % (name, panel_url))
-    return jsonify({"ok": True,
-                    "node": {"name": name, "panel_url": panel_url},
-                    "token": token,
-                    "note": "token 只返回这一次，请当场记下并传给装机命令；"
-                            "丢失只能轮换，不可找回"}), 201
+    resp = {"ok": True,
+            "node": {"name": name, "panel_url": panel_url},
+            "token": token,
+            "note": "token 只返回这一次，请当场记下并传给装机命令；"
+                    "丢失只能轮换，不可找回"}
+    # R42-F5-4：panel_url 的 host 不在面板证书 SAN 中时当场警告——
+    # 否则 agent 永远验证不过，节点只显示“从未上报”且无从查起。
+    warning = _panel_url_san_warning(panel_url, defaulted)
+    if warning:
+        resp["warning"] = warning
+    return jsonify(resp), 201
 
 
 @app.route("/api/nodes/<name>", methods=["DELETE"])
