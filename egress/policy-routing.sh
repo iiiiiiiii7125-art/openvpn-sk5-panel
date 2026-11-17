@@ -182,7 +182,12 @@ rule_exists() {
     # (dedup_rule removes it), not our rule: treating it as
     # "present" would make add_rule skip the add and then leave
     # the kernel with no rule at all after the dedup.
-    ip rule show 2>/dev/null | grep "^$RULE_PRIO:.*from $VPN_NET lookup $TABLE" >/dev/null
+    # R45-L6-3: terminate the table number -- a bare `lookup $TABLE`
+    # also matches `lookup 1000` (same family as R42-F3-4 /
+    # R41-L4-P2-1, missed in the shell). Same shape as _rule_present()
+    # in sk5_manager.py: priority, our selector, table 100, on one
+    # line, with the table number word-terminated.
+    ip rule show 2>/dev/null | grep -E "^$RULE_PRIO:.*from $VPN_NET lookup $TABLE([^0-9]|$)" >/dev/null
 }
 
 add_rule() {
@@ -257,7 +262,11 @@ dedup_rule() {
     # and exits 1; under `set -o pipefail` that would make this whole
     # pipeline fail and `set -e` would kill the caller mid-enable /
     # mid-disable (a "no duplicates" result is success, not failure).
-    ip rule show 2>/dev/null | grep "from $VPN_NET lookup $TABLE" | while read -r _prio _rest; do
+    # R45-L6-3 (same mechanism as rule_exists above): terminate the
+    # table number, or a same-selector rule for another table
+    # (e.g. `lookup 1000`) matches and is "deduped" -- the comment
+    # above promises exact selector+table matches only.
+    ip rule show 2>/dev/null | grep -E "from $VPN_NET lookup $TABLE([^0-9]|$)" | while read -r _prio _rest; do
         _prio="${_prio%:}"
         case "$_prio" in
             ''|*[!0-9]*) continue ;;

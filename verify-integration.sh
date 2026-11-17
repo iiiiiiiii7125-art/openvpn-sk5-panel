@@ -275,7 +275,7 @@ fi
 # ---------- 3. 面板 UI 与未登录 ----------
 CODE="$(curl -s -o "$TESTDIR/index.html" -w "%{http_code}" --max-time 5 "$PANEL_URL/")"
 [ "$CODE" = "200" ] && ok "GET / 200" || bad "GET / 返回 $CODE（期望 200）"
-grep -q "入站卡" "$TESTDIR/index.html" \
+grep -qF "<!-- 入站卡：OpenVPN 服务 -->" "$TESTDIR/index.html" \
     && ok "UI 含入站卡标记（<!-- 入站卡：OpenVPN 服务 -->）" \
     || bad "UI 缺入站卡标记"
 grep -q "链式出站卡" "$TESTDIR/index.html" \
@@ -504,12 +504,21 @@ printf 'nounit\n' > "$TESTDIR/sysctl-state/mode"
     || bad "R4-BUG-1 收尾 disable 返回 $CODE"
 
 # agent 配置（0600，nobody 所有；面板地址须与注册时逐字一致，否则认领守卫 403）。
+# R45-L3-2: the 0600 is asserted, not assumed -- a bare ok() here let a
+# chmod-644 mutant pass the whole gate. Stat the mode AND the owner
+# before ok, else bad.
 AGENT_CFG="$TESTDIR/agent-config.json"
 printf '{"panel_url": "%s", "node_token": "%s", "node_name": "int-test"}' \
     "$PANEL_URL" "$TOKEN" > "$AGENT_CFG"
 chmod 600 "$AGENT_CFG"
 chown nobody:nogroup "$AGENT_CFG"
-ok "agent 配置已写 $AGENT_CFG（0600）"
+_CFG_MODE="$(stat -c %a "$AGENT_CFG" 2>/dev/null || echo "?")"
+_CFG_OWNER="$(stat -c %U "$AGENT_CFG" 2>/dev/null || echo "?")"
+if [ "$_CFG_MODE" = "600" ] && [ "$_CFG_OWNER" = "nobody" ]; then
+    ok "agent 配置已写 $AGENT_CFG（0600，nobody 所有）"
+else
+    bad "agent 配置已写失败：$AGENT_CFG mode=$_CFG_MODE owner=$_CFG_OWNER（期望 0600/nobody）"
+fi
 
 # ---------- 5. 下发 get_status -> agent --once -> 回执 done ----------
 cmd_json() { # cmd_json <action> [params-json] -> 打印 cmd_id
@@ -575,8 +584,18 @@ assert '-----BEGIN' not in json.dumps(r), '回执含私钥材料'
 print('error:', r['error'][:120])
 " && ok "create_user 回执 error 非空、无私钥材料泄露" \
         || bad "create_user 回执检查失败（见 $TESTDIR/cmd2.json）"
-    if grep -qF "$TOKEN" "$TESTDIR/cmd2.json" 2>/dev/null; then
-        bad "回执 JSON 里出现节点 token（泄露）"
+    # R45-L3-5: grep EVERY receipt the gate fetched, not only the failed
+    # one. The succeeded get_status receipt (cmd1.json) carries a dict
+    # result; a mutant agent injecting the node token into dict results
+    # leaks it there while the failed create_user receipt (cmd2.json,
+    # result None) stays clean -- grepping cmd2 alone passed 30/30 on
+    # the leak.
+    _LEAK_IN=""
+    for _rcpt in "$TESTDIR/cmd1.json" "$TESTDIR/cmd2.json"; do
+        if grep -qF "$TOKEN" "$_rcpt" 2>/dev/null; then _LEAK_IN="$_rcpt"; break; fi
+    done
+    if [ -n "$_LEAK_IN" ]; then
+        bad "回执 JSON 里出现节点 token（泄露：$_LEAK_IN）"
     else
         ok "回执 JSON 里无节点 token（无凭据泄露）"
     fi
