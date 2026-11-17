@@ -159,6 +159,9 @@ init)
     # backup before init-pki runs -- never silently wiped. (Core
     # init_pki does the same move first; this is the direct-call
     # safety net.)
+    # R43-J7-4: the same move-aside covers a FILE (or symlink) at the
+    # pki path -- the F1-5 guard was dir-only, so init-pki's rm -rf
+    # of the path silently destroyed the file.
     FORCE=0
     [ "${3:-}" = "--force" ] && FORCE=1
     if [ -e "$EASYRSA_PKI/ca.crt" ] && [ "$FORCE" -eq 0 ]; then
@@ -172,6 +175,11 @@ init)
         mv "$EASYRSA_PKI" "$_BK" \
             || { echo "easyrsa.sh: cannot move aside non-empty $EASYRSA_PKI" >&2; exit 1; }
         echo "easyrsa.sh: moved non-empty pki aside to $_BK" >&2
+    elif [ -e "$EASYRSA_PKI" ] || [ -L "$EASYRSA_PKI" ]; then
+        _BK="$CA_DIR/.pki-backup-$(date -u +%Y%m%d%H%M%S)-$$"
+        mv "$EASYRSA_PKI" "$_BK" \
+            || { echo "easyrsa.sh: cannot move aside $EASYRSA_PKI" >&2; exit 1; }
+        echo "easyrsa.sh: moved pki file aside to $_BK" >&2
     fi
     easyrsa init-pki
     EASYRSA_REQ_CN="OpenVPN-CA" easyrsa build-ca nopass
