@@ -870,6 +870,14 @@ if __name__ == "__main__":
     _ensure = getattr(panel_app, "_ensure_admin_password", None)
     if callable(_ensure):
         _ensure()
+    # R46 Fix-AH: record a panel-CA rotation at the moment this start
+    # first serves the new CA (the panel's own log, not the installer's
+    # generation time -- see panel/app.py). Defensive getattr, same as
+    # _ensure above: an older app.py without the hook must not break
+    # the launcher.
+    _record = getattr(panel_app, "_record_panel_ca_rotation_if_changed", None)
+    if callable(_record):
+        _record()
     panel_app.app.run(host="0.0.0.0", port=$PANEL_PORT, ssl_context=(CERT, KEY))
 EOF
 chmod 755 "$INSTALL_ROOT/run-panel-tls.py"
