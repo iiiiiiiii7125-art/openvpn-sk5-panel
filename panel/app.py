@@ -128,7 +128,20 @@ def _secret_path():
 
 
 SECRET_PATH = _secret_path()
-ADMIN_PASS_PATH = "/etc/openvpn-sk5-panel/admin.pass"
+# LIVE-R46-1: the admin password file has its own env override
+# (OVPN_PANEL_ADMIN_PASS_PATH); the default stays the installed
+# location /etc/openvpn-sk5-panel/admin.pass, which the installer
+# health gate and the docs read. It deliberately does NOT follow
+# OVPN_PANEL_DATA_DIR: in production DATA_DIR is
+# $INSTALL_ROOT/panel/data while the password file lives in /etc --
+# following DATA_DIR would move the live file and break the health
+# gate. Any probe/harness that redirects the data dir MUST set this
+# var to the redirected dir's admin.pass, or a root-run import will
+# overwrite the live password file while the hash lands in the
+# throwaway DB (the 2026-11-18 live incident: admin login 401 until
+# the file was restored from backup).
+ADMIN_PASS_PATH = os.environ.get("OVPN_PANEL_ADMIN_PASS_PATH",
+                                 "/etc/openvpn-sk5-panel/admin.pass")
 ADMIN_PASS_FALLBACK = os.path.join(DATA_DIR, "admin.pass")
 
 # core 子网/DNS 由 server.conf.template 固定,面板不提供修改入口
