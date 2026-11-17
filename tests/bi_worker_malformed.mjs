@@ -4,6 +4,9 @@
 // sent_at 的超时路径保持工作；吊销也能救畸形记录。
 // 与 R18 复现探针不同：本探针断言修复后行为（PASS = 正确），R18 的
 // r18_worker_malformed.mjs 断言缺陷复现（修复后 M-01/02/03/06 翻红属预期）。
+// R41 Fix-D 注：M-03b 在此轮翻转为 R41-L6-P2-2 的修复后行为——安全动作
+// 的 sent_at 非数值也不再重投（Flask R13-P2-1：缺失／不可解析一律直接
+// 标 failed），BH-03(c) 式明示翻转，见 M-03b 处注释。
 // Usage: node tests/bi_worker_malformed.mjs  (exit code = FAIL count)
 // Import 用相对路径，指向同树 cloudflare/src/index.js，不依赖 /tmp 副本。
 import worker from "../cloudflare/src/index.js";
@@ -119,7 +122,11 @@ cell("BI-M-03 non-numeric sent_at (non-safe): marked failed after poll (NaN trea
 cell("BI-M-03 non-numeric sent_at (non-safe): NOT redispatched",
   !(p3.json?.commands || []).some((x) => x.id === id3));
 
-// M-03b: sent_at 非数值（SAFE 动作）—— 超时路径触发，重投＋重发，retries=1
+// M-03b: sent_at 非数值（SAFE 动作）——R41-L6-P2-2 修复后行为（BH-03(c)
+// 式明示翻转）：Flask R13-P2-1 要求缺失／不可解析的 sent_at 一律直接
+// 标 failed、绝不重发，不分动作是否幂等；旧行为（toMs() 把非数值映
+// 为 0 → 当超时重投＋重发，retries=1）是本轮修复的缺陷本身。L6-15
+// 同款断言见 tests/r41_l6_worker_parity.mjs。
 const id3b = await enqueue("wk1", "get_status");
 await poll(); // dispatch -> sent
 const sent3b = await kv.get("sent:wk1", "json");
@@ -130,9 +137,9 @@ await kv.put("sent:wk1", JSON.stringify(sent3b));
 await kv.put("cmd:" + id3b, JSON.stringify(rec3b));
 const p3b = await poll();
 const after3b = await getCmd(id3b);
-cell("BI-M-03b non-numeric sent_at (safe): requeued+redispatched, retries=1",
-  after3b && after3b.status === "sent" && after3b.retries === 1 &&
-  (p3b.json?.commands || []).some((x) => x.id === id3b),
+cell("BI-M-03b non-numeric sent_at (safe): failed immediately, never requeued (R41-L6-P2-2 / Flask R13-P2-1)",
+  after3b && after3b.status === "failed" && (after3b.retries || 0) === 0 &&
+  !(p3b.json?.commands || []).some((x) => x.id === id3b),
   `status=${after3b?.status} retries=${after3b?.retries}`);
 
 // M-04 对照：数值型过期 sent_at（SAFE 动作）—— 同轮 poll 重投＋重发
