@@ -54,15 +54,20 @@ try:
                                  UserNotFoundError, build_client_config,
                                  create_user, detect_public_ip,
                                  ip_is_private, list_users,
-                                 render_server_conf, restart_server,
-                                 revoke_user, server_status, start_server,
-                                 stop_server, validate_username)
+                                 pki_disagreements, render_server_conf,
+                                 renew_server_cert, repair_pki,
+                                 restart_server, revoke_user,
+                                 server_cert_info, server_status,
+                                 start_server, stop_server,
+                                 validate_username)
 except Exception as exc:  # noqa: BLE001 - core 尚未落盘时记录,接口报 503
     _IMPORT_ERRORS["openvpn_manager"] = str(exc)
     build_client_config = create_user = list_users = None
     render_server_conf = restart_server = revoke_user = None
     server_status = start_server = stop_server = validate_username = None
     detect_public_ip = ip_is_private = None
+    pki_disagreements = repair_pki = renew_server_cert = None
+    server_cert_info = None
     UserAlreadyExistsError = UserAlreadyRevokedError = None
     UserNotFoundError = None
 
@@ -978,6 +983,13 @@ def _remote_status_payload(node):
     ovpn = {"running": bool(ov.get("running")), "online_users": len(clients),
             "unit_active": ov.get("unit_active"), "pid": ov.get("pid"),
             "error": ov.get("error")}
+    # R47-L4-4: remote nodes report their server cert expiry in the
+    # get_status snapshot (agent action_get_status); pass it through
+    # so the frontend warning works in Worker/remote mode too.
+    if isinstance(ov.get("server_cert"), dict):
+        ovpn["server_cert"] = ov["server_cert"]
+    if isinstance(ov.get("status_error"), str):
+        ovpn["status_error"] = ov["status_error"]
     for key in ("proto", "port", "subnet", "dns"):
         if ov.get(key) is not None:
             ovpn[key] = ov[key]
@@ -1731,7 +1743,22 @@ def status():
                          if ip_is_private is not None else None,
                          "remote_warning": _remote_warning(remote_ip),
                          "error": raw.get("error"),
+                         # R47-L4-2: a corrupt status log leaves
+                         # running=True with clients=[]; surface the
+                         # note so the empty online list is explained.
+                         "status_error": raw.get("status_error"),
                          "detail": raw})
+            # R47-L4-4: server cert expiry (30-day warning) -- the
+            # panel must never show running=True with 0 users and no
+            # explanation when the cert dies at 825 days.
+            if server_cert_info is not None:
+                try:
+                    ovpn["server_cert"] = server_cert_info()
+                except Exception as exc:  # noqa: BLE001 - 状态接口不因单源失败而挂
+                    ovpn["server_cert"] = {"exists": False, "expires": None,
+                                           "days_left": None, "expired": False,
+                                           "warning": False,
+                                           "error": str(exc)}
         except Exception as exc:  # noqa: BLE001 - 状态接口不因单源失败而挂
             ovpn["error"] = str(exc)
     else:
@@ -1960,6 +1987,97 @@ def ovpn_restart():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.route("/api/openvpn/renew-server-cert", methods=["POST"])
+@login_required
+def ovpn_renew_server_cert():
+    """只更新服务端证书/密钥（R47-L4-4）。
+
+    服务端证书寿命 825 天，到期后新客户端握手失败、面板却仍显示
+    running=True 且 0 用户、无任何解释；此前唯一的修复是 SSH +
+    重跑安装器或未写进文档的 CLI。只换服务端证书：CA 与全部用户
+    证书不动。换证后须重启服务新证书才生效——服务在跑才重启（与
+    吊销路径同款 was_running 守卫，R44-L5-F4/R47-L3-2：绝不因续期
+    把一个特意停掉的服务拉起来）；服务未运行时新证书在下次启动
+    时生效。远程节点走命令链入队 agent 执行。
+    """
+    node, err = _resolve_compat_node()
+    if err:
+        return err
+    if node is not None:
+        return _enqueue_compat(node["name"], "renew_server_cert", {},
+                               "openvpn_server_cert_renew")
+    missing = _require_module("openvpn_manager")
+    if missing:
+        return missing
+    try:
+        renewed = renew_server_cert()
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    was_running = True
+    try:
+        st = server_status() if server_status is not None else None
+        was_running = bool(st and st.get("running"))
+    except Exception:  # noqa: BLE001 - unknown state: keep old behavior
+        was_running = True
+    restarted = False
+    if was_running:
+        try:
+            restart_server()
+            restarted = True
+        except Exception as exc:  # noqa: BLE001
+            _audit("openvpn_server_cert_renew", result="error",
+                   detail="restart failed: %s" % exc)
+            return jsonify({"ok": False,
+                            "error": "服务端证书已更新，但重启 OpenVPN 服务失败：%s；新证书在手动重启后才生效" % exc,
+                            "needs_restart": True}), 500
+    cert = None
+    if server_cert_info is not None:
+        try:
+            cert = server_cert_info()
+        except Exception:  # noqa: BLE001
+            cert = None
+    _audit("openvpn_server_cert_renew", result="ok",
+           detail="restarted=%s expires=%s"
+                  % (restarted, (cert or {}).get("expires")))
+    return jsonify({"ok": True, "renewed": renewed, "restarted": restarted,
+                    "server_cert": cert,
+                    "note": "服务端证书已更新%s"
+                            % ("并重启服务生效" if restarted
+                              else "；服务未运行，新证书在下次启动时生效")})
+
+
+@app.route("/api/openvpn/pki/repair", methods=["POST"])
+@login_required
+def ovpn_pki_repair():
+    """对账 index.txt 与 issued/ 并修复不一致（R47-L4-3）。
+
+    两种卡死形态此前只能 SSH 手动修 PKI：① index 说 valid 但证书
+    文件没了——吊销报“无证书”、新建报 409；② issued 里有孤儿证书
+    但 index 无记录——新建报“证书已存在”，名单里却看不到这个人。
+    本接口一并修复（前者按序列号吊销进 CRL，后者孤儿证书清掉，
+    序列号未被 index 记录时先记 R 项进 CRL 再清），修复报告进
+    audit_log。单个吊销/新建操作本身也已 inline 修好，不等本接口
+    也不会卡死。远程节点走命令链入队 agent 执行。
+    """
+    node, err = _resolve_compat_node()
+    if err:
+        return err
+    if node is not None:
+        return _enqueue_compat(node["name"], "repair_pki", {},
+                               "openvpn_pki_repair")
+    missing = _require_module("openvpn_manager")
+    if missing:
+        return missing
+    try:
+        report = repair_pki()
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    _audit("openvpn_pki_repair", result="ok",
+           detail="repaired=%s" % json.dumps(report.get("repaired", []),
+                                             ensure_ascii=False))
+    return jsonify({"ok": True, "report": report})
+
+
 @app.route("/api/openvpn/init-pki", methods=["POST"])
 @login_required
 def ovpn_init_pki():
@@ -2069,6 +2187,23 @@ def ovpn_users_create():
         return _enqueue_compat(node["name"], "create_user", {"name": name},
                                "openvpn_user_create")
     try:
+        # R47-L4-3b: 这个名字若有孤儿证书（issued 有文件、index 无
+        # 记录），core.create_user 会 inline 清掉再签发；先显式修
+        # 一次，让修复进 audit_log 有据可查（扫描失败不阻塞新建，
+        # inline 路径仍会处理）。
+        if pki_disagreements is not None and repair_pki is not None:
+            try:
+                strays = [d for d in pki_disagreements()
+                          if d.get("name") == name
+                          and d.get("kind") == "stray-cert"]
+            except Exception:  # noqa: BLE001 - 扫描失败不阻塞新建
+                strays = []
+            if strays:
+                report = repair_pki()
+                _audit("openvpn_pki_repair", result="ok",
+                       detail="before create name=%s repaired=%s"
+                              % (name, json.dumps(report.get("repaired", []),
+                                                  ensure_ascii=False)))
         # 观察-1：建用户时把已保存的对外地址传给 core，否则新签发的
         # .ovpn 仍按旧逻辑解析 remote（内网地址）。
         create_user(name, server_ip=_stored_server_ip())
@@ -2104,7 +2239,12 @@ def ovpn_users_revoke(name):
                                "openvpn_user_revoke")
     try:
         result = revoke_user(name)
-        _audit("openvpn_user_revoke", result="ok", detail="name=%s" % name)
+        # R47-L4-3a: 证书文件已丢的吊销走 index 修复路径，result 带
+        # repaired=True；审计行写明，避免“吊销成功”却看不出修过。
+        detail = "name=%s" % name
+        if isinstance(result, dict) and result.get("repaired"):
+            detail += " repaired: %s" % result.get("repair", "")
+        _audit("openvpn_user_revoke", result="ok", detail=detail)
     except UserNotFoundError as exc:
         # R5-P2-1: predictable client error, not a server failure.
         return jsonify({"ok": False, "error": str(exc)}), 404

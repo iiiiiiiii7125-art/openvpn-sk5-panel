@@ -33,6 +33,7 @@ import os
 import re
 import socket
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -500,6 +501,56 @@ def _cert_serial_hex(cert_path: Path) -> str | None:
     return hexs
 
 
+def _cert_subject_cn(cert_path: Path) -> str | None:
+    """The subject CN of a PEM certificate, or None.
+
+    ``openssl x509 -subject`` prints e.g. ``subject=CN = alice``.
+    Unparseable / missing / openssl-absent all return None (callers
+    treat that as "unknown CN", never raise).
+    """
+    try:
+        proc = subprocess.run(
+            ["openssl", "x509", "-in", str(cert_path), "-noout",
+             "-subject"],
+            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    match = re.search(r"CN\s*=\s*([^,/]+)", proc.stdout or "")
+    return match.group(1).strip() if match else None
+
+
+def _index_entry_owns_cert(pki: Path, name: str, serial: str) -> bool:
+    """Does an index.txt line record *name*'s cert with this serial?
+
+    Ownership needs the serial AND a matching CN: the line's CN is
+    the name itself, or the legacy CN (``OpenVPN-CA``) for pre-BUG-7
+    certs. A stray copy of another user's cert matches on serial but
+    carries the donor's CN, so it never owns -- this test is
+    independent of the serial map, so it still works when the donor's
+    own file is gone and only the copy remains (R47-L4-3b).
+    """
+    try:
+        raw = (pki / "index.txt").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    want = _norm_serial(serial)
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 6:
+            continue
+        if _norm_serial(parts[3]) != want:
+            continue
+        match = re.search(r"CN=([^,/]+)", parts[5])
+        line_cn = match.group(1) if match else None
+        if line_cn == name or line_cn == "OpenVPN-CA":
+            return True
+    return False
+
+
 def _serial_to_name(pki: Path) -> dict[str, str]:
     """Serial (uppercase hex) -> username stem, from ``pki/issued/*.crt``.
 
@@ -515,13 +566,34 @@ def _serial_to_name(pki: Path) -> dict[str, str]:
         certs = sorted(issued.glob("*.crt"))
     except OSError:
         return mapping
+    dupes: dict[str, list[str]] = {}
     for cert in certs:
         stem = cert.stem
         if stem.lower() in RESERVED_NAMES:
             continue
         serial = _cert_serial_hex(cert)
-        if serial:
-            mapping[serial.upper()] = stem
+        if not serial:
+            continue
+        key = serial.upper()
+        if key in mapping:
+            dupes.setdefault(key, [mapping[key]]).append(stem)
+        else:
+            mapping[key] = stem
+    # R47-L4-3b: two files can share one serial when a cert was
+    # copied under another name (a stray). Last-wins would let the
+    # copy hijack the mapping, so the donor's index line resolves
+    # to the stray name -- list/revoke/create then all mis-resolve
+    # the owner, and create_user's legacy migration revokes the
+    # donor. Prefer the file whose stem matches the cert's own CN
+    # (the canonical file Easy-RSA wrote); a copy under another
+    # name never wins. When no file matches its own CN (legacy
+    # certs, CN=OpenVPN-CA for everyone), keep the first sorted --
+    # the pre-existing behavior.
+    for key, stems in dupes.items():
+        for stem in stems:
+            if _cert_subject_cn(issued / ("%s.crt" % stem)) == stem:
+                mapping[key] = stem
+                break
     return mapping
 
 
@@ -1181,6 +1253,23 @@ def create_user(
     pki.mkdir(parents=True, exist_ok=True)
     with _create_user_lock(pki):
         _sweep_orphan_index_entries(pki)
+        # R47-L4-3b: clear a stray issued cert for this name BEFORE
+        # the status check. A stray copy of another user's cert
+        # shares the donor's serial, so the serial map resolves the
+        # donor's index line to this name and the status check would
+        # see a phantom "valid" user -- and the legacy migration
+        # below would revoke the donor. The ownership test is
+        # map-independent (serial + CN), so a stray is cleared even
+        # when the donor's own file is gone and only the copy
+        # remains. A real cert (CN == name, or the legacy
+        # CN=OpenVPN-CA) is never cleared here.
+        cert_file = pki / "issued" / ("%s.crt" % name)
+        if cert_file.is_file():
+            serial = _cert_serial_hex(cert_file)
+            if serial is not None and not _index_entry_owns_cert(
+                pki, name, serial
+            ):
+                _clear_stray_cert(name, ca_dir, server_dir)
         status = _user_status(name, ca_dir)
         if status == "valid":
             entry = _user_entry(name, ca_dir)
@@ -1217,6 +1306,302 @@ def create_user(
     return build_client_config(name, ca, cert, key, ta_key, ip, resolved_proto, resolved_port)
 
 
+def _norm_serial(serial: str) -> str:
+    """Normalise a hex serial for comparison (upper, no leading zeros).
+
+    index.txt serials (``openssl ca`` form, e.g. ``ABCDEF``) and DER
+    serials (``_cert_serial_hex``, even-padded, e.g. ``00ABCDEF`` ->
+    ``ABCDEF``) are the same number in different clothes -- compare
+    by value, never by string. Unparseable input normalises to
+    itself, uppercased.
+    """
+    try:
+        return format(int(str(serial).strip(), 16), "X")
+    except (ValueError, TypeError):
+        return str(serial).strip().upper()
+
+
+def _index_serials(pki: Path) -> set[str]:
+    """All serials recorded in index.txt (normalised), any status."""
+    serials: set[str] = set()
+    try:
+        raw = (pki / "index.txt").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return serials
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 4 and parts[3].strip():
+            serials.add(_norm_serial(parts[3]))
+    return serials
+
+
+def _cert_notafter(cert_path: Path) -> datetime | None:
+    """The notAfter of *cert_path* as an aware UTC datetime, or None.
+
+    ``openssl x509 -enddate`` prints e.g. ``notAfter=Nov 12 02:05:09
+    2028 GMT``. Unparseable / missing / openssl-absent all return
+    None (callers treat that as "unknown expiry", never raise).
+    """
+    try:
+        proc = subprocess.run(
+            ["openssl", "x509", "-in", str(cert_path), "-noout",
+             "-enddate"],
+            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    text = (proc.stdout or "").strip()
+    if text.startswith("notAfter="):
+        text = text[len("notAfter="):]
+    if text.endswith(" GMT"):
+        text = text[:-4]
+    try:
+        return datetime.strptime(text, "%b %d %H:%M:%S %Y").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def _sync_crl(ca_dir: str | Path, server_dir: str | Path) -> str:
+    """Regenerate the CRL from index.txt and sync it to the server dir.
+
+    Shared by the repair paths (R47-L4-3): after an index.txt edit
+    (a flip or an appended R line) the CRL must be regenerated, or
+    the revocation never reaches the daemon. Returns the synced
+    ``crl.pem`` path.
+    """
+    ca_dir = _resolve_ca_dir(ca_dir)
+    server_dir = _resolve_server_dir(server_dir)
+    pki = _pki_dir(ca_dir)
+    _run_easyrsa("gen-crl", str(ca_dir))
+    crl_src = pki / "crl.pem"
+    if not crl_src.exists():
+        raise OpenVPNError("gen-crl did not produce %s" % crl_src)
+    dest = Path(server_dir) / "crl.pem"
+    dest.write_bytes(crl_src.read_bytes())
+    dest.chmod(0o644)
+    return str(dest)
+
+
+def _delete_user_files(pki: Path, name: str) -> None:
+    """Remove a user's issued cert / req / private key (best-effort)."""
+    for stale in (
+        pki / "issued" / ("%s.crt" % name),
+        pki / "reqs" / ("%s.req" % name),
+        pki / "private" / ("%s.key" % name),
+    ):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def _flip_index_entry_to_revoked(pki: Path, name: str) -> str | None:
+    """Flip the latest V/E index.txt line for *name* to R, in place.
+
+    The revocation date is now (UTC, ``YYMMDDHHMMSSZ``). Lines that
+    do not resolve to *name* (CA/server, malformed, other users) are
+    preserved byte-for-byte; the file is rewritten atomically (temp +
+    ``os.replace``, original mode preserved), the same pattern as
+    :func:`_sweep_orphan_index_entries`. Returns the flipped serial
+    (normalised), or None when no V/E line for *name* exists.
+    Callers must hold :func:`_create_user_lock`.
+    """
+    index = pki / "index.txt"
+    try:
+        raw = index.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise OpenVPNError(
+            "cannot read %s: not valid UTF-8 (%s)" % (index, exc)
+        ) from exc
+    lines = raw.splitlines()
+    serial_map = _serial_to_name(pki)
+    target: int | None = None
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 6 or parts[0] not in ("V", "E"):
+            continue
+        if _index_line_name(parts, serial_map) == name:
+            target = i
+    if target is None:
+        return None
+    parts = lines[target].split("\t")
+    serial = _norm_serial(parts[3])
+    now = datetime.now(timezone.utc).strftime("%y%m%d%H%M%SZ")
+    parts[0] = "R"
+    parts[2] = now
+    lines[target] = "\t".join(parts)
+    tmp = index.with_name("index.txt.tmp")
+    tmp.write_text("\n".join(lines) + ("\n" if lines else ""),
+                   encoding="utf-8")
+    try:
+        tmp.chmod(index.stat().st_mode)
+    except OSError:
+        pass
+    os.replace(tmp, index)
+    return serial
+
+
+def _revoke_missing_cert(
+    name: str,
+    ca_dir: str | Path,
+    server_dir: str | Path,
+) -> dict:
+    """Revoke a user whose issued cert file is gone (R47-L4-3a).
+
+    ``easyrsa.sh revoke`` refuses without the cert file, and the
+    index still says valid, so the user can neither be revoked nor
+    re-created. The cert's serial is recorded in index.txt, so the
+    revocation does not need the file: flip the index entry to R,
+    regenerate + sync the CRL (the client's copy of the cert stops
+    working for new connections after the daemon restarts), record
+    the tombstone. Returns the :func:`_revoke_cert` shape plus
+    ``"repaired": True``. Callers must hold :func:`_create_user_lock`.
+    """
+    pki = _pki_dir(ca_dir)
+    entry = _user_entry(name, ca_dir)
+    serial = _flip_index_entry_to_revoked(pki, name)
+    if serial is None:
+        raise OpenVPNError(
+            "cannot revoke %r: no valid index entry (cert file also missing)"
+            % name
+        )
+    crl = _sync_crl(ca_dir, server_dir)
+    _record_tombstone(pki, name, entry)
+    return {"name": name, "status": "revoked", "crl": crl,
+            "repaired": True,
+            "repair": "cert file missing; index entry revoked by serial %s"
+                      % serial}
+
+
+def _clear_stray_cert(
+    name: str,
+    ca_dir: str | Path,
+    server_dir: str | Path,
+) -> dict:
+    """Clear a stray issued cert with no index entry (R47-L4-3b).
+
+    A ``issued/<name>.crt`` with no index.txt entry for *name* blocks
+    ``build-client`` ("cert already exists") while ``list_users()``
+    never shows the name -- the user cannot be created and the file
+    cannot be revoked by name. If the cert's serial is already
+    tracked under another name (a copy of an existing user's cert),
+    the files are simply dropped: the credential is already tracked
+    and revocable under its real name. Otherwise the serial is
+    appended as an R entry first, so the orphaned cert lands on the
+    CRL and stops working -- dropping the file alone would leave a
+    valid cert in the wild. Then the stray files are deleted and the
+    name is free to create. Returns ``{name, repair, crl}``.
+    Callers must hold :func:`_create_user_lock`.
+    """
+    pki = _pki_dir(ca_dir)
+    cert_file = pki / "issued" / ("%s.crt" % name)
+    serial = _cert_serial_hex(cert_file)
+    crl: str | None = None
+    if serial is not None and _norm_serial(serial) not in _index_serials(pki):
+        expires = _cert_notafter(cert_file)
+        if expires is not None:
+            now = datetime.now(timezone.utc).strftime("%y%m%d%H%M%SZ")
+            line = "R\t%s\t%s\t%s\tunknown\t/CN=%s\n" % (
+                expires.strftime("%y%m%d%H%M%SZ"), now,
+                _norm_serial(serial), name)
+            with open(pki / "index.txt", "a", encoding="utf-8") as fh:
+                fh.write(line)
+            crl = _sync_crl(ca_dir, server_dir)
+    _delete_user_files(pki, name)
+    return {"name": name,
+            "repair": "stray issued cert cleared%s"
+                      % ("; serial %s added to CRL" % _norm_serial(serial)
+                         if crl else "; serial already tracked, files dropped"),
+            "crl": crl}
+
+
+def pki_disagreements(
+    ca_dir: str | Path | None = None,
+    server_dir: str | Path | None = None,
+) -> list[dict]:
+    """Scan index.txt against issued/ for wedged users (read-only).
+
+    Returns one dict per disagreement: ``{name, kind, serial}``
+    where kind is ``"missing-cert"`` (index says valid but
+    ``issued/<name>.crt`` is gone -- revoke and create both fail)
+    or ``"stray-cert"`` (an issued cert with no index entry at all
+    -- create fails, the name never lists). The server cert is never
+    a user and is excluded. Used by the panel repair endpoint (and
+    its pre-create check) to see the wedge before repairing it.
+    """
+    ca_dir = _resolve_ca_dir(ca_dir)
+    pki = _pki_dir(ca_dir)
+    found: list[dict] = []
+    for user in list_users(ca_dir):
+        if user.get("status") != "valid":
+            continue
+        name = user["name"]
+        if not (pki / "issued" / ("%s.crt" % name)).is_file():
+            found.append({"name": name, "kind": "missing-cert",
+                          "serial": user.get("serial", "")})
+    indexed = {u["name"] for u in list_users(ca_dir)}
+    try:
+        issued = sorted((pki / "issued").glob("*.crt"))
+    except OSError:
+        issued = []
+    for cert_file in issued:
+        stem = cert_file.stem
+        if stem.lower() in RESERVED_NAMES:
+            continue
+        if stem not in indexed:
+            found.append({"name": stem, "kind": "stray-cert",
+                          "serial": _cert_serial_hex(cert_file) or ""})
+    return sorted(found, key=lambda d: d["name"])
+
+
+def repair_pki(
+    ca_dir: str | Path | None = None,
+    server_dir: str | Path | None = None,
+) -> dict:
+    """Reconcile index.txt with issued/ and repair every wedge (R47-L4-3).
+
+    Same family as the R45-L5-8 revoke/CRL wedge repair, extended to
+    the two index/file disagreements that had no in-product repair:
+    a valid user whose cert file is gone is revoked by serial (the
+    index flip + CRL sync in :func:`_revoke_missing_cert`, so the
+    name can be re-created afterwards), and a stray issued cert with
+    no index entry is cleared (:func:`_clear_stray_cert`, CRL-backed
+    when its serial is untracked). Returns ``{repaired: [...],
+    checked: <n>}``; ``repaired`` is empty when nothing was wrong.
+    The panel repair endpoint audits this report; the individual
+    create/revoke paths repair their own wedge inline, so a wedged
+    user is never stuck waiting for this endpoint.
+    """
+    ca_dir = _resolve_ca_dir(ca_dir)
+    server_dir = _resolve_server_dir(server_dir)
+    pki = _pki_dir(ca_dir)
+    with _create_user_lock(pki):
+        problems = pki_disagreements(ca_dir, server_dir)
+        repaired: list[dict] = []
+        for problem in problems:
+            name = problem["name"]
+            if problem["kind"] == "missing-cert":
+                result = _revoke_missing_cert(name, ca_dir, server_dir)
+                repaired.append({"name": name, "kind": "missing-cert",
+                                 "action": "revoked by serial",
+                                 "detail": result.get("repair", "")})
+            else:
+                result = _clear_stray_cert(name, ca_dir, server_dir)
+                repaired.append({"name": name, "kind": "stray-cert",
+                                 "action": "stray cert cleared",
+                                 "detail": result.get("repair", "")})
+        return {"repaired": repaired, "checked": len(problems)}
+
+
 def _revoke_cert(
     name: str,
     ca_dir: str | Path,
@@ -1232,9 +1617,16 @@ def _revoke_cert(
     after the revoke succeeds, so a revoked user whose issued cert
     file is gone (easy-rsa moves it to revoked/certs_by_serial/)
     still lists as revoked instead of vanishing. ``create_user``
-    clears the tombstone on re-issue."""
+    clears the tombstone on re-issue.
+
+    R47-L4-3a: when the issued cert file is already gone *before*
+    the revoke (index says valid, file missing), ``easyrsa.sh
+    revoke`` refuses -- repair instead: revoke by serial from the
+    index entry (see :func:`_revoke_missing_cert`)."""
     pki = _pki_dir(ca_dir)
     entry = _user_entry(name, ca_dir)
+    if not (pki / "issued" / ("%s.crt" % name)).is_file():
+        return _revoke_missing_cert(name, ca_dir, server_dir)
     _run_easyrsa("revoke", str(ca_dir), name)
     crl_src = pki / "crl.pem"
     if not crl_src.exists():
@@ -1797,6 +2189,45 @@ def _pid_is_openvpn(pid: int) -> bool:
     return False
 
 
+CERT_EXPIRY_WARNING_DAYS = 30
+
+
+def server_cert_info(server_dir: str | Path | None = None) -> dict:
+    """Report the server certificate's expiry (R47-L4-4).
+
+    Returns ``{exists, expires, days_left, expired, warning,
+    error}``. ``expires`` is the notAfter as ISO 8601 UTC (or None
+    when unknown); ``days_left`` is whole days until expiry (negative
+    when expired); ``warning`` is True when the cert expires within
+    :data:`CERT_EXPIRY_WARNING_DAYS` days or is already expired.
+    Never raises: a missing/unreadable cert reports ``exists=False``
+    with an ``error`` note, so the panel can say so instead of
+    showing ``running=True`` with 0 users and no explanation when the
+    cert dies at 825 days. The server cert is rebuilt by
+    :func:`build_server_cert` (expiry fail-safe) or
+    :func:`renew_server_cert` (explicit renewal).
+    """
+    server_dir = _resolve_server_dir(server_dir)
+    cert_path = server_dir / "server.crt"
+    info: dict = {"exists": False, "expires": None, "days_left": None,
+                  "expired": False, "warning": False, "error": None}
+    if not _exists(cert_path):
+        info["error"] = "no server cert at %s" % cert_path
+        return info
+    info["exists"] = True
+    expires = _cert_notafter(cert_path)
+    if expires is None:
+        info["error"] = "cannot read expiry of %s" % cert_path
+        info["warning"] = True
+        return info
+    now = datetime.now(timezone.utc)
+    info["expires"] = expires.strftime("%Y-%m-%dT%H:%M:%SZ")
+    info["days_left"] = (expires - now).days
+    info["expired"] = expires <= now
+    info["warning"] = info["expired"] or info["days_left"] <= CERT_EXPIRY_WARNING_DAYS
+    return info
+
+
 def server_status(server_dir: str | Path | None = None) -> dict:
     """Report the server daemon state.
 
@@ -1868,7 +2299,16 @@ def server_status(server_dir: str | Path | None = None) -> dict:
         # R5-P2-3: same bare-exists() trap as the PID file above.
         if _exists(candidate):
             result["status_log"] = str(candidate)
-            result["clients"] = _parse_status_log(candidate)
+            try:
+                result["clients"] = _parse_status_log(candidate)
+            except OpenVPNError as exc:
+                # R47-L4-2: a corrupt/undecodable status file must not
+                # flip the whole running verdict -- the daemon is up,
+                # the log is unreadable. Treat it as "no clients"
+                # (with a note) instead of raising out of a status
+                # call that promises never to raise for a live daemon.
+                result["clients"] = []
+                result["status_error"] = str(exc)
             break
     return result
 
@@ -1930,25 +2370,66 @@ def start_server(server_dir: str | Path | None = None) -> dict:
 
 def stop_server(server_dir: str | Path | None = None) -> dict:
     """Stop the daemon (systemd, else SIGTERM to the PID file). Idempotent:
-    stopping an already-stopped server succeeds. Returns server_status()."""
+    stopping an already-stopped server succeeds. Returns server_status().
+
+    R47-L4-1: ``systemctl stop`` returning 0 is NOT proof the daemon
+    died -- stopping an inactive unit returns 0 while a daemon started
+    through the direct fallback (``start_server``'s ``openvpn
+    --config ... --daemon`` branch, or hand-started) keeps running on
+    the same PID file. After the systemctl call, verify with
+    :func:`server_status` and SIGTERM the identity-checked PID-file
+    daemon if it is still alive (same ``_pid_is_openvpn`` guard the
+    fallback path already uses); only then report the status.
+    """
     server_dir = _resolve_server_dir(server_dir)
-    if _systemctl("stop"):
-        return server_status(server_dir)
+    _systemctl("stop")
+    status = server_status(server_dir)
+    if status["running"] and status.get("pid"):
+        pid = status["pid"]
+        if _pid_is_openvpn(pid):
+            try:
+                os.kill(pid, 15)
+            except (ProcessLookupError, OSError):
+                pass
+            # A live daemon shuts down gracefully on SIGTERM, not
+            # instantly -- poll briefly before declaring the stop.
+            # If it still will not die, escalate once to SIGKILL:
+            # stop_server() promised the daemon stopped, and a
+            # lingering daemon is worse than a forceful kill.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.1)
+            else:
+                try:
+                    os.kill(pid, 9)
+                except (ProcessLookupError, OSError):
+                    pass
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        break
+                    time.sleep(0.1)
+            status = server_status(server_dir)
     if PID_FILE.exists():
+        # Drop a stale PID file (daemon gone, file left behind) so a
+        # later status call does not re-test a dead pid. Never unlink
+        # while the daemon is still alive -- a live daemon owns it.
         try:
             pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-            # R44-L5-F3: only SIGTERM a pid we have identified as
-            # our daemon -- a stale file pointing at an innocent
-            # pid reuser must never be killed. The stale file is
-            # still unlinked below.
-            if _pid_is_openvpn(pid):
-                os.kill(pid, 15)
-        except (ValueError, ProcessLookupError, OSError):
-            pass
-        try:
-            PID_FILE.unlink()
-        except OSError:
-            pass
+            alive = _pid_is_openvpn(pid)
+        except (ValueError, OSError):
+            alive = False
+        if not alive:
+            try:
+                PID_FILE.unlink()
+            except OSError:
+                pass
     return server_status(server_dir)
 
 
@@ -1998,6 +2479,15 @@ class OpenVPNManager:
     def revoke_user(self, name: str) -> dict:
         return revoke_user(name, self.ca_dir, self.server_dir)
 
+    def repair_pki(self) -> dict:
+        return repair_pki(self.ca_dir, self.server_dir)
+
+    def pki_disagreements(self) -> list[dict]:
+        return pki_disagreements(self.ca_dir, self.server_dir)
+
+    def server_cert_info(self) -> dict:
+        return server_cert_info(self.server_dir)
+
     def list_users(self) -> list[dict]:
         return list_users(self.ca_dir)
 
@@ -2020,7 +2510,7 @@ if __name__ == "__main__":
 
     # Tiny CLI for smoke tests: python3 -m core.openvpn_manager <cmd> [args]
     #   status | list | create <name> | revoke <name> | start | stop | restart
-    #   | renew-server-cert
+    #   | renew-server-cert | repair-pki | server-cert
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     mgr = OpenVPNManager()
     if cmd == "status":
@@ -2033,6 +2523,10 @@ if __name__ == "__main__":
         print(json.dumps(mgr.revoke_user(sys.argv[2]), indent=2, ensure_ascii=False))
     elif cmd == "renew-server-cert":
         print(json.dumps(mgr.renew_server_cert(), indent=2, ensure_ascii=False))
+    elif cmd == "repair-pki":
+        print(json.dumps(mgr.repair_pki(), indent=2, ensure_ascii=False))
+    elif cmd == "server-cert":
+        print(json.dumps(mgr.server_cert_info(), indent=2, ensure_ascii=False))
     elif cmd == "start":
         print(json.dumps(mgr.start_server(), indent=2, ensure_ascii=False))
     elif cmd == "stop":
@@ -2040,4 +2534,4 @@ if __name__ == "__main__":
     elif cmd == "restart":
         print(json.dumps(mgr.restart_server(), indent=2, ensure_ascii=False))
     else:
-        raise SystemExit("usage: openvpn_manager.py status|list|create <name>|revoke <name>|renew-server-cert|start|stop|restart")
+        raise SystemExit("usage: openvpn_manager.py status|list|create <name>|revoke <name>|renew-server-cert|repair-pki|server-cert|start|stop|restart")
