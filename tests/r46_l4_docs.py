@@ -117,6 +117,8 @@ doc_m = re.search(r"（(\d+) 格，\n?\s*(\d+) 个探针文件", CF_README)
 # "19 个探针文件" — find the count by regex instead.
 # R46 integration fixup: the fix round added 3 more files (r46_fix_af_
 # worker, r46_l5_worker, r46_l7_contract) — now 26 files / 406 cells.
+# R47 Fix-BE: r47_l7_worker_capin.mjs joined (7 cells) — now 27 files
+# / 413 cells.
 _m_files = re.search(r"(\d+) 个探针文件", CF_README)
 corpus_sec = CF_README[_m_files.start():]
 corpus_sec = corpus_sec[:corpus_sec.index("；其中")]

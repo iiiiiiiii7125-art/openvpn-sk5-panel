@@ -3370,7 +3370,10 @@ def agent_panel_ca():
     装机时先取本端点再试握手；CA 证书是公开的密钥材料（叶证书本来就
     对任何连接者公开），无鉴权下发与 /api/agent/bundle 同理。CA 文件
     不存在时（CA 之前的面板、或用户自带证书）回 404，安装器回退到钉
-    叶证书的老行为。路径可用 OVPN_PANEL_CA_CERT_PATH 覆盖（测试用），
+    叶证书的老行为——但那回退只对自签 CA:TRUE 叶证书有效（旧版面板）；
+    用户自带 CA 签发证书时叶证书无 CA:TRUE、无法自锚，试握手失败、装机
+    报错，唯一出路是 --ca-cert 传签发 CA（R47-L5-3）。路径可用
+    OVPN_PANEL_CA_CERT_PATH 覆盖（测试用），
     默认 /etc/openvpn-sk5-panel/panel-ca.crt。"""
     ca_path = os.environ.get("OVPN_PANEL_CA_CERT_PATH",
                              "/etc/openvpn-sk5-panel/panel-ca.crt")

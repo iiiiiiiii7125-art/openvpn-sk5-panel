@@ -52,13 +52,19 @@ BUG-6：重装换了 panel-url/token 后，脚本会重启已运行的 agent（�
 agent、命令链全断。安装器在装 agent 时自动建立信任：
 
 1. 先试系统信任库直接验证（公网 CA 面板，如 Cloudflare 前端，
-   什么都不用做）；
-2. 验证失败时把面板 CA 证书从面板的 `/api/agent/panel-ca` 取回、
+   本机 CA 证书库够新时什么都不用做）；
+2. （服务器模式）验证失败时把面板 CA 证书从面板的 `/api/agent/panel-ca` 取回、
    TOFU 钉到 `/etc/ovpn-agent/panel-ca.pem`（0600），并写进
    `/etc/ovpn-agent/config.json` 的 `ca_cert`；钉的是 CA 不是叶证书，
    面板叶证书轮换不断连；
 3. 只有面板 CA 本身轮换后才须重跑安装器 `--force` 重新钉，否则
-   poll 会再次报证书错（面板会把这类节点标为“证书已轮换”）。
+   poll 会再次报证书错（服务器模式面板会把这类节点标为“证书已轮换”；
+   Cloudflare 模式不发该标记）。
+
+Cloudflare 模式没有面板 CA：库太旧验证失败时安装器直接报错
+（`/api/agent/panel-ca` 回 501），不静默钉叶证书——边缘叶证书会
+轮换，钉它下次轮换就断连；出路是更新本机 CA 证书库，或
+`--ca-cert <签发 CA>`。
 
 也可显式控制：`--ca-cert <panel.pem>` 直接钉该 PEM；
 `--insecure` 跳过校验（**仅调试用**：token 与用户 .ovpn 可被

@@ -230,7 +230,7 @@ bash /opt/openvpn-sk5-panel/verify.sh
 sing-box 与 tun2socks 的版本写死在 `install.sh`（1.11.15 / 2.7.0），不跟 `latest`。校验顺序（fail-closed，无校验来源即停，不只告警）：
 
 1. 环境变量 `SINGBOX_SHA256` / `TUN2SOCKS_SHA256`（若设置，严格 64-hex 校验，优先于钉死值）；
-2. 否则用钉死在脚本里的哈希（`install.sh:63-66` 与 `agent/agent.py:122-132` 逐键相等，amd64/arm64 各一；哈希由双锚核验取回：release 下载 URL 与 API asset 下载两路一致，tarball 二进制与同 release `.deb` 包内二进制逐字节一致，二进制自报版本核对 1.11.15 / 2.7.0）；
+2. 否则用钉死在脚本里的哈希（`install.sh:63-66` 与 `agent/agent.py:123-134` 逐键相等，amd64/arm64 各一；哈希由双锚核验取回：release 下载 URL 与 API asset 下载两路一致，tarball 二进制与同 release `.deb` 包内二进制逐字节一致，二进制自报版本核对 1.11.15 / 2.7.0）；
 3. 否则用该 release 自带的校验清单（`checksums.txt`，其次 `SHA256SUMS.txt`）校验；
 4. 三者都没有 —— **安装直接失败退出**，并打印取哈希重跑的命令。
 

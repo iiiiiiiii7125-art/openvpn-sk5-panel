@@ -2,7 +2,7 @@
 
 不用 MongoDB。用 Easy-RSA 做 PKI + OpenVPN 原生守护进程，面板层
 （`panel/`）只调这里的函数。目标平台：Debian 12 / Ubuntu 22.04 / 24.04，
-OpenVPN 2.6，Python 3.10+，只用标准库 + subprocess。
+OpenVPN 2.4+，Python 3.10+，只用标准库 + subprocess。
 
 ## 文件
 

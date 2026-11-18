@@ -7,7 +7,7 @@
 
 ## 0. 这是什么
 
-一台服务器作 OpenVPN 中转，面板点几下建协议、发用户，再一键把全部 VPN 用户的出口切到购买的 SOCKS5（SK5）。架构：面板（控制面，二选一部署）→ 命令队列 → 中转机上的 agent（每 5 秒 poll 拉取）→ core/（OpenVPN 本体）+ egress/（sing-box + 策略路由表 100）。OpenVPN UDP 1194 主、TCP 443 备，子网固定 `10.8.0.0/24`；SK5 死则流量黑洞，默认不断网回落（fail-closed）。
+一台服务器作 OpenVPN 中转，面板点几下建协议、发用户，再一键把全部 VPN 用户的出口切到购买的 SOCKS5（SK5）。架构：面板（控制面，二选一部署）→ 命令队列 → 中转机上的 agent（每 5 秒 poll 拉取）→ core/（OpenVPN 本体）+ egress/（sing-box + 策略路由表 100）。OpenVPN UDP 1194 主、TCP 443 备，子网固定 `10.8.0.0/24`；SK5 死则流量黑洞，默认断网保护、不回落直连（fail-closed）。
 
 ## 1. 服务器模式部署（面板 + 中转机同一台服务器）
 
@@ -98,7 +98,7 @@ wrangler deploy
 
 - 改密：Worker 的 `/api/change-password` 返回 **501**（面板按钮在 Cloudflare 模式下不可用）。轮换密码须 `wrangler secret put ADMIN_PASSWORD` 后重新 `wrangler deploy`。
 - agent 安装依赖 `AGENT_BUNDLE_ORIGIN` 源站面板：源站须提供 `/install-agent.sh(.sha256)` 与 `/api/agent/bundle(.sha256)`；源站不可达或不提供时安装走不通（503/502 明示）。
-- 面板证书信任：Cloudflare 前端是公网 CA，agent 直接信任，无须 TOFU 钉证书（服务器模式面板用面板 CA 签发的证书，agent 钉 CA，见 §3）。
+- 面板证书信任：Cloudflare 前端是公网 CA，本机 CA 证书库够新时 agent 直接信任，无须 TOFU 钉证书；库太旧验证失败时安装器不再静默钉叶证书——Worker 的 `/api/agent/panel-ca` 回 501，安装直接报错（边缘叶证书会轮换，钉它下次轮换就断连；出路是更新 CA 证书库，或显式 `--ca-cert <签发 CA>` / `--insecure`）。服务器模式面板用面板 CA 签发的证书，agent 钉 CA，见 §3。
 
 ### 2.3 部署验活（必做，不要只看 deploy 成功回显）
 
@@ -123,7 +123,7 @@ bash /tmp/install-agent.sh --panel-url https://<面板> --token '<节点TOKEN>' 
 
 **agent 代码更新（R45-LIVE-2）**：面板升级不动已部署的 agent；agent 每次 poll 上报安装包哈希（装机时记在 `/opt/ovpn-agent/bundle.sha256`），面板比对后在节点表给过期的 agent 打 “agent 代码过期” 标记。更新时在 agent 机器上重跑安装命令（节点表 “更新 agent” 按钮可复制），**不用 token、带 `--force`**：重跑沿用已有 token 与配置，只刷新代码并重启 agent。
 
-面板证书信任：服务器模式面板用面板 CA 签发的 TLS 证书，安装器在装 agent 时自动建立信任：先试系统信任库能直接验证的握手（公网 CA 面板什么都不用做）；验证失败时把面板 CA 证书从 `/api/agent/panel-ca` 取回、TOFU 钉到 `/etc/ovpn-agent/panel-ca.pem`，并写进 `config.json` 的 `ca_cert`。钉的是 CA 不是叶证书，面板叶证书轮换不断连；只有面板 CA 本身轮换后才须重跑安装器 `--force` 重新钉（面板把这类节点标为“证书已轮换”）。也可显式给 `--ca-cert <panel.pem>`（直接钉该 PEM）或 `--insecure`（跳过校验，**仅调试用**：token 与用户 .ovpn 可被中间人截获，面板 UI 与 agent 日志都会告警）。
+面板证书信任：服务器模式面板用面板 CA 签发的 TLS 证书，安装器在装 agent 时自动建立信任：先试系统信任库能直接验证的握手（公网 CA 面板什么都不用做）；验证失败时把面板 CA 证书从 `/api/agent/panel-ca` 取回、TOFU 钉到 `/etc/ovpn-agent/panel-ca.pem`，并写进 `config.json` 的 `ca_cert`。钉的是 CA 不是叶证书，面板叶证书轮换不断连；只有面板 CA 本身轮换后才须重跑安装器 `--force` 重新钉（服务器模式面板把这类节点标为“证书已轮换”；Cloudflare 模式不发该标记，见 §2.2）。也可显式给 `--ca-cert <panel.pem>`（直接钉该 PEM）或 `--insecure`（跳过校验，**仅调试用**：token 与用户 .ovpn 可被中间人截获，面板 UI 与 agent 日志都会告警）。
 
 本机离线装法：从包内直接跑 `bash agent/install-agent.sh --panel-url ... --token ...`，脚本检测到身边的 `agent.py` + `core/` 后走本地复制，不下载。
 
@@ -152,7 +152,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 |---|---|---|
 | 1 | ufw 机 NAT/FORWARD 规则 live-only | ufw 机器上安装器加的 NAT MASQUERADE 与 FORWARD 规则只在内存里，不 survive 重启；重启后重跑 `bash install.sh` 补回（install.log 有明文提示，README:90）。SK5 数据面不受影响（tun0↔tun1 规则由策略路由 enable 时加）。 |
 | 2 | DNS 默认走直连 | sing-box 模板规则 `protocol dns / port 53 → direct`：VPN 用户的 DNS 查询走中转机直连 IP，不经 SK5；只有 TCP/UDP 业务流量走 SK5。面板 SK5 卡片上已写明。 |
-| 3 | fail-open 单向 | SK5/sing-box 死后流量黑洞（不断网回落）；fail-open 须显式开启，且一旦 fail-over，enabled 保持 False，须手动重开。 |
+| 3 | fail-open 单向 | SK5/sing-box 死后流量黑洞（默认断网保护，不回落直连）；fail-open 须显式开启，且一旦 fail-over，enabled 保持 False，须手动重开。 |
 | 4 | 5 秒窗口（O-R25-2） | `enable()` 等 LIVE tun1，只等 5 秒：sing-box 启动慢于 5 秒时 enable 大声失败（`sing-box did not create a live tun1 within 5 s`），不建占位符、不改策略状态、enabled 保持 False，重试即可。本机（512MB）暖启动 0.84 秒，充足；若某机 sing-box 恒慢于 5 秒（持续过载或极慢磁盘），每次 enable 均会失败、永不收敛——这是 5 秒硬截止的设计取舍。 |
 | 5 | 面板客户端列表约 60 秒滞后 | OpenVPN 状态文件刷新周期所致，新连接后须等一档才出现在面板列表；在线数以状态文件为准。 |
 | 6 | arm64 未在真机验过 | 本机 x86_64，无 arm64 机；门禁 §7 的 arm64 绑定只在沙箱变异树上验过。 |
@@ -177,7 +177,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 | 客户端能连隧道但数据全死（curl 超时） | 链路在黑洞态或 restore 损坏态：先看面板 SK5 卡片与 `ip rule` / `ip route show table 100`；sk5.json 损坏时 restore 单元 exit 1 且策略状态字节不变，须手工修文件后重开。 |
 | 客户端列表为空但刚连上 | 状态文件约 60 秒滞后，等一档再看（§6-5）。 |
 | agent poll 恒 401 | `--node-name` 与注册名不一致，或 token 已轮换：重跑安装器并带正确 `--node-name` 与新 `--token`。 |
-| agent 日志 `CERTIFICATE_VERIFY_FAILED` | 面板证书信任未建立：重跑安装器（TOFU 钉面板 CA，见 §3）；只有面板 CA 本身轮换后才须重跑 `--force`（面板把这类节点标为“证书已轮换”），叶证书轮换不断连。 |
+| agent 日志 `CERTIFICATE_VERIFY_FAILED` | 面板证书信任未建立：重跑安装器（服务器模式：TOFU 钉面板 CA，见 §3）；只有面板 CA 本身轮换后才须重跑 `--force`（服务器模式面板把这类节点标为“证书已轮换”），叶证书轮换不断连。 |
 
 ## 9. 发布包清单与校验
 
@@ -191,9 +191,9 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 - `egress/`：`sk5_manager.py`、`policy-routing.sh`、`sing-box.json.template`、`test-egress.sh`、`README.md`
 - `systemd/`：5 个单元（`openvpn-sk5-panel`、`openvpn-sk5-singbox`、`openvpn-sk5-policy`、`openvpn-sk5-healthcheck` 服务＋定时器）
 - `cloudflare/`：`src/index.js`、`wrangler.toml`、`README.md`、`server-mode.md`
-- `docs/`：本文件、`security.md`、`flmx-reference.md`、live-verify 报告 21 份、`audit/` 审计报告 45 份（AUDIT-R1–R39、R41–R46）＋ `l5-probes/` 探针 1 个
+- `docs/`：本文件、`security.md`、`flmx-reference.md`、live-verify 报告 22 份（21 份编号报告＋`docs/live-verify.md`）、`audit/` 审计报告 45 份（AUDIT-R1–R39、R41–R46）＋ `l5-probes/` 探针 1 个
 
-关键文件 sha256（前 12 位；与 live-21 §0 的树版本逐项一致）：
+关键文件 sha256（前 12 位；与 1.0.3 发布树逐项一致）：
 
 | 文件 | sha256（前 12 位） |
 |---|---|

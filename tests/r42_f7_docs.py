@@ -170,6 +170,8 @@ cell("D09 panel/README line citation points at the real note",
 # corpus is now 26 files, 406 cells. The parser also handles the
 # "TOTAL: PASS=N" shape (r46_l7_contract) alongside the three output
 # shapes below.
+# R47 Fix-BE: r47_l7_worker_capin.mjs joined (Worker panel-ca 501 +
+# cert_pin_stale key, 7 cells) — the corpus is now 27 files, 413 cells.
 # The parser also handles the three output shapes in the corpus:
 # "TOTAL N cells", "N/N PASS", "checks=N failures=M", and "ALL PASS"
 # (count the ^PASS lines).)
@@ -189,6 +191,7 @@ worker_files = [
     "tests/r45_l7_worker.mjs",
     "tests/r46_fix_af_worker.mjs", "tests/r46_l5_worker.mjs",
     "tests/r46_l7_contract.mjs",
+    "tests/r47_l7_worker_capin.mjs",
 ]
 total, per = 0, {}
 for f in worker_files:
