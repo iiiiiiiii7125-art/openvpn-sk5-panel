@@ -75,7 +75,7 @@ cd /root/openvpn-sk5-panel && bash install.sh
 
 ```bash
 # 或在目标机上直接下载发布包安装：
-cd /root && curl -L -o ovpn-release-1.0.2.tar.gz https://raw.githubusercontent.com/iiiiiiiii7125-art/openvpn-sk5-panel/1.0.2/releases/ovpn-release-1.0.2.tar.gz && tar xzf ovpn-release-1.0.2.tar.gz && cd openvpn-sk5-panel && bash install.sh
+cd /root && curl -L -o ovpn-release-1.0.3.tar.gz https://raw.githubusercontent.com/iiiiiiiii7125-art/openvpn-sk5-panel/1.0.3/releases/ovpn-release-1.0.3.tar.gz && tar xzf ovpn-release-1.0.3.tar.gz && cd openvpn-sk5-panel && bash install.sh
 ```
 
 安装完打印面板地址 `https://<服务器 IP>:8443` + 初始管理员密码（仅显示一次，也写在 `/etc/openvpn-sk5-panel/admin.pass`，0600）。**首次打开浏览器会提示“不安全 / 证书不受信任”，属预期**（面板证书是自签的）：点「高级」→「继续前往」即可；安装时填域名（Caddy + Let's Encrypt）可彻底消除该提示。重装不会轮换密码、CA、面板会话密钥与服务端证书。装完自检：`bash /opt/openvpn-sk5-panel/verify.sh`（24 项检查，逐项 PASS/FAIL/SKIP）。
