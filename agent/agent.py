@@ -778,6 +778,16 @@ def action_set_sk5(params: dict) -> dict:
             raise ValueError("invalid SK5 host: must be a string")
         if not _HOST_RE.match(host):
             raise ValueError("invalid SK5 host %r" % host)
+        # R47-L6-3: _HOST_RE allows ':' for IPv6 literals, so the most
+        # likely user typo -- pasting `host:port` into the host field
+        # -- passed this face too and rendered into sing-box.json as
+        # an unresolvable server. The shared shape check (same rule
+        # the panel-local save path and the Worker use) rejects it
+        # while still accepting real IPv6 literals such as `::1`.
+        if not sk5_manager.valid_sk5_host(host):
+            raise ValueError(
+                "invalid SK5 host %r: must be a hostname or IP "
+                "address (no port -- use the port field)" % host)
     port = _as_int(params["port"], "port") if params.get("port") is not None else None
     username = params.get("username")
     if username is not None and not isinstance(username, str):

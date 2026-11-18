@@ -721,16 +721,21 @@ route_checks() { # route_checks <expect: on|off> -- returns 0/1, prints detail
         echo "SKIP: ip rule not permitted in this environment"; return 2
     fi
     local rule route vpn_route host_route
-    rule="$(ip rule show 2>&1 | grep -c 'from 10.8.0.0/24 lookup 100' || true)"
+    # R47-L6-1: terminate the table number in every matcher here -- a
+    # bare `lookup 100` / `table 100` also matches `lookup 1000` /
+    # `table 1000` (same family as R41-L4-P2-1 / R45-L6-3). With a
+    # foreign `lookup 1000` rule the bare count read 1 while the real
+    # table-100 rule count was 0, false-failing the off branch.
+    rule="$(ip rule show 2>&1 | grep -cE 'from 10.8.0.0/24 lookup 100([^0-9]|$)' || true)"
     route="$(ip route show table 100 2>&1 | grep -c 'default via 10.9.0.1 dev tun1' || true)"
     vpn_route="$(ip route get 1.1.1.1 from 10.8.0.1 2>&1 || true)"
     host_route="$(ip route get 1.1.1.1 2>&1 || true)"
     detail="rule=$rule table100=$route | vpn: $vpn_route | host: $host_route"
     if [ "$expect" = "on" ]; then
         if [ "$rule" -ge 1 ] && [ "$route" -ge 1 ] \
-            && printf '%s' "$vpn_route" | grep -q "table 100" \
+            && printf '%s' "$vpn_route" | grep -qE "table 100([^0-9]|$)" \
             && printf '%s' "$vpn_route" | grep -q "dev tun1" \
-            && ! printf '%s' "$host_route" | grep -q "table 100"; then
+            && ! printf '%s' "$host_route" | grep -qE "table 100([^0-9]|$)"; then
             echo "PASS: $detail"; return 0
         fi
         echo "FAIL: $detail"; return 1
@@ -896,13 +901,13 @@ if [ "$LOGGED_IN" -eq 1 ] && [ "$OVPN_RUNNING" -eq 1 ]; then
             # SK5 on: VPN source must resolve via table 100 (dev tun1);
             # same expectation as route_checks on (R4-BUG-4: no "via"
             # in a point-to-point tun route-get).
-            if printf '%s' "$FWD_ROUTE" | grep -q "dev tun1" && printf '%s' "$FWD_ROUTE" | grep -q "table 100"; then
+            if printf '%s' "$FWD_ROUTE" | grep -q "dev tun1" && printf '%s' "$FWD_ROUTE" | grep -qE "table 100([^0-9]|$)"; then
                 ok "direct-forwarding" "FORWARD rules present; SK5 enabled: VPN source 10.8.0.1 routes via table 100 ($FWD_ROUTE)"
             else
                 bad "direct-forwarding" "FORWARD rules present but SK5 enabled and VPN source route lookup wrong: $FWD_ROUTE"
             fi
         elif [ "$SK5_MODE" = "false" ]; then
-            if printf '%s' "$FWD_ROUTE" | grep -q "dev $FWD_WAN" && ! printf '%s' "$FWD_ROUTE" | grep -q "table 100"; then
+            if printf '%s' "$FWD_ROUTE" | grep -q "dev $FWD_WAN" && ! printf '%s' "$FWD_ROUTE" | grep -qE "table 100([^0-9]|$)"; then
                 ok "direct-forwarding" "FORWARD rules present; VPN source 10.8.0.1 routes via $FWD_WAN ($FWD_ROUTE)"
             else
                 bad "direct-forwarding" "FORWARD rules present but VPN source route lookup wrong: $FWD_ROUTE"

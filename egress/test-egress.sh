@@ -78,11 +78,16 @@ echo "$ROUTE_VPN"
 # route-get match alone green-lights a dead chain. The route must
 # also be live in table 100 (same check as §2, same rejection as
 # _policy_active()).
-if echo "$ROUTE_VPN" | grep -q "table 100" && \
+# R47-L6-1: terminate the table number -- a bare `grep "table 100"`
+# also matches `table 1000` (same family as R41-L4-P2-1 / R45-L6-3,
+# fixed in §1 above). A foreign `lookup 1000` route used to pass
+# this §3 check and, in the elif, misdiagnose as "linkdown, dead
+# tun1" when the foreign route was via tun1.
+if echo "$ROUTE_VPN" | grep -qE "table 100([^0-9]|$)" && \
    echo "$ROUTE_VPN" | grep -q "dev tun1" && \
    ip route show table 100 2>/dev/null | grep "default via 10.9.0.1 dev tun1" | grep -v "linkdown" >/dev/null; then
     ok "VPN source takes table 100 via dev tun1"
-elif echo "$ROUTE_VPN" | grep -q "table 100" && \
+elif echo "$ROUTE_VPN" | grep -qE "table 100([^0-9]|$)" && \
      echo "$ROUTE_VPN" | grep -q "dev tun1"; then
     bad "VPN source takes table 100 via dev tun1 but the route is linkdown (dead tun1 -- carries nothing)"
 else
@@ -92,7 +97,7 @@ fi
 echo "=== 4. route-get from host (contrast: must stay main) ==="
 ROUTE_HOST="$(ip route get 1.1.1.1 2>&1 || true)"
 echo "$ROUTE_HOST"
-if echo "$ROUTE_HOST" | grep -qv "table 100"; then
+if echo "$ROUTE_HOST" | grep -qvE "table 100([^0-9]|$)"; then
     ok "host source stays out of table 100 (sing-box SK5 leg unaffected)"
 else
     bad "host source is in table 100 -- sing-box would loop into tun1"
