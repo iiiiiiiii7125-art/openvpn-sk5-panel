@@ -731,6 +731,17 @@ def action_create_user(params: dict) -> dict:
     server_ip = params.get("server_ip") or None
     if server_ip is not None:
         openvpn_manager._validate_server_ip(server_ip)
+    # R47-L4-3b: a stray issued cert for this name (no index entry)
+    # is cleared inline by core.create_user below; log it loudly so
+    # the repair is visible in the agent log (the panel face audits
+    # the same repair via pki_disagreements + repair_pki).
+    try:
+        strays = [d for d in openvpn_manager.pki_disagreements()
+                  if d.get("name") == name and d.get("kind") == "stray-cert"]
+    except Exception:  # noqa: BLE001 - scan failure must not block create
+        strays = []
+    if strays:
+        log.warning("repairing stray issued cert for %r (no index entry)", name)
     ovpn = openvpn_manager.create_user(
         name,
         server_ip=server_ip,
@@ -754,8 +765,50 @@ def action_revoke_user(params: dict) -> dict:
     revoked = openvpn_manager.revoke_user(name)
     # CRL is only read at daemon start -- restart so the revocation
     # takes effect for new connections immediately.
+    # R47-L3-2 (the Flask face's R44-L5-F4 guard, mirrored here):
+    # restart only when the daemon is actually running --
+    # restart_server() falls back to start_server(), so an
+    # unconditional restart STARTS a server the operator deliberately
+    # stopped. A stopped server reads the CRL on its next start, so
+    # the recorded revoke is already effective then.
+    try:
+        was_running = bool(openvpn_manager.server_status().get("running"))
+    except Exception:  # noqa: BLE001 - unknown state: keep old behavior
+        was_running = True
+    if not was_running:
+        return {"revoked": revoked,
+                "server": openvpn_manager.server_status(),
+                "restarted": False,
+                "note": "server not running; revocation takes effect at next start"}
     status = openvpn_manager.restart_server()
-    return {"revoked": revoked, "server": status}
+    return {"revoked": revoked, "server": status, "restarted": True}
+
+
+def action_renew_server_cert(_params: dict) -> dict:
+    # R47-L4-4: regenerate only the server cert/key (CA and every
+    # client cert untouched), then restart the daemon so the new cert
+    # takes effect -- but only when it was running (same was_running
+    # guard as action_revoke_user above: never start a deliberately
+    # stopped server as a side effect).
+    renewed = openvpn_manager.renew_server_cert()
+    try:
+        was_running = bool(openvpn_manager.server_status().get("running"))
+    except Exception:  # noqa: BLE001 - unknown state: keep old behavior
+        was_running = True
+    if not was_running:
+        return {"renewed": renewed,
+                "server": openvpn_manager.server_status(),
+                "restarted": False,
+                "note": "server not running; new cert takes effect at next start"}
+    status = openvpn_manager.restart_server()
+    return {"renewed": renewed, "server": status, "restarted": True}
+
+
+def action_repair_pki(_params: dict) -> dict:
+    # R47-L4-3: reconcile index.txt with issued/ (revoke-by-serial
+    # for a valid user whose cert file is gone; clear a stray issued
+    # cert with no index entry). Panel repair endpoint's remote face.
+    return openvpn_manager.repair_pki()
 
 
 def action_set_sk5(params: dict) -> dict:
@@ -841,8 +894,12 @@ def action_get_status(_params: dict) -> dict:
     sk5 = sk5_manager.get_status(probe_egress=False)
     ip = _egress_ip_cached()
     sk5["egress_ip"] = ip
+    ovpn = openvpn_manager.server_status()
+    # R47-L4-4: the panel's /api/status shows the server cert expiry
+    # for remote nodes too (the snapshot carries this dict through).
+    ovpn["server_cert"] = openvpn_manager.server_cert_info()
     return {
-        "openvpn": openvpn_manager.server_status(),
+        "openvpn": ovpn,
         "users": openvpn_manager.list_users(),
         "sk5": sk5,
         "egress_ip": ip,
@@ -912,6 +969,8 @@ ACTIONS = {
     "restart_openvpn": action_restart_openvpn,
     "create_user": action_create_user,
     "revoke_user": action_revoke_user,
+    "renew_server_cert": action_renew_server_cert,
+    "repair_pki": action_repair_pki,
     "set_sk5": action_set_sk5,
     "test_sk5": action_test_sk5,
     "enable_sk5": action_enable_sk5,

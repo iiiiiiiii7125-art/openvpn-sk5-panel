@@ -18,10 +18,14 @@ OpenVPN 2.6，Python 3.10+，只用标准库 + subprocess。
 ```python
 init_pki(ca_dir=None, force=False) -> Path
 build_server_cert(ca_dir=None, server_dir=None) -> dict[str, str]  # 装好的 6 个文件路径
+renew_server_cert(ca_dir=None, server_dir=None) -> dict[str, str]  # 只换服务端证书（见“服务端证书续期”）
 render_server_conf(proto="udp", port=None, server_dir=None, ca_dir=None, dns=None, allow_port_change=False) -> Path
 create_user(name, ca_dir=None, server_dir=None,
             server_ip=None, proto=None, port=None) -> str  # 返回 .ovpn 文本
 revoke_user(name, ca_dir=None, server_dir=None) -> dict   # {name, status, crl}
+repair_pki(ca_dir=None, server_dir=None) -> dict          # 对账 index.txt 与 issued/，见“证书库修复”
+pki_disagreements(ca_dir=None, server_dir=None) -> list[dict]  # 只扫描不修：[{name, kind, serial}]
+server_cert_info(server_dir=None) -> dict                 # {exists, expires, days_left, expired, warning, error}
 list_users(ca_dir=None) -> list[dict]                     # [{name, status, expires, serial}]
 server_status(server_dir=None) -> dict                    # {running, unit_active, pid, clients, ...}
 start_server(server_dir=None) -> dict
@@ -32,7 +36,7 @@ build_client_config(name, ca, cert, key, ta_key, server_ip, proto="udp", port=11
 ```
 
 同名方法也挂在 `OpenVPNManager(ca_dir, server_dir)` 实例上。另有极简 CLI
-供冒烟测试：`python3 -m core.openvpn_manager status|list|create <name>|revoke <name>|start|stop|restart`。
+供冒烟测试：`python3 -m core.openvpn_manager status|list|create <name>|revoke <name>|renew-server-cert|repair-pki|server-cert|start|stop|restart`。
 
 ## 规则
 
@@ -47,7 +51,45 @@ build_client_config(name, ca, cert, key, ta_key, server_ip, proto="udp", port=11
 - `.ovpn`：`ca/cert/key/ta.key` 全部内嵌，客户端只需一个文件。
 - 启停：优先 `systemctl openvpn-server@server`；无 systemd 时回退到
   `openvpn --config ... --daemon` + PID 文件。`server_status()` 在守护进程
-  未运行时不抛异常，用 `error` 字段说明原因。
+  未运行时不抛异常，用 `error` 字段说明原因。`stop_server()` 不信任
+  `systemctl stop` 的返回码：停完复查，PID 文件后还有活着的守护进程
+  就按身份核对后 SIGTERM（R47-L4-1）。
+- 状态日志损坏（非 UTF-8）时 `server_status()` 不抛异常：在线列表
+  为空并带 `status_error` 说明（R47-L4-2），守护进程在跑的结论不变。
+
+## 服务端证书续期（R47-L4-4）
+
+服务端证书寿命 825 天（`EASYRSA_CERT_EXPIRE=825`）。到期后新客户端
+TLS 握手失败，而面板此前只显示“运行中 0 人”、没有任何解释；修复
+只走 SSH + 重跑安装器或未写进文档的 CLI。现在：
+
+- `/api/status` 的 `openvpn.server_cert` 报有效期（`expires` /
+  `days_left` / `expired` / `warning`），到期前 30 天起警告，过期
+  后明说；面板状态栏直接显示。
+- 面板“续期服务端证书”按钮（`POST /api/openvpn/renew-server-cert`，
+  远程节点走命令链）只换服务端证书/密钥，CA 与全部用户证书不动；
+  服务在跑才重启生效（未运行不拉起来），新证书在下次启动时生效。
+- CLI：`python3 -m core.openvpn_manager renew-server-cert`；
+  查看有效期：`python3 -m core.openvpn_manager server-cert`。
+  过期证书的重建机制（备份 + 重建，CA 与用户不动）与
+  `build_server_cert` 的 fail-safe 续期同一条路。
+
+## 证书库修复（R47-L4-3）
+
+`pki/index.txt` 与 `pki/issued/` 不一致时会把用户卡死，之前只能
+SSH 手动改 PKI。两种形态与修复：
+
+- index 说 valid、证书文件没了：吊销报“无证书”、新建报 409。
+  `revoke_user()` 按 index 里的序列号吊销（index 条目翻为 R +
+  重新生成并同步 CRL，返回带 `repaired: True`），之后可重新建用户。
+- issued 里有孤儿证书、index 无记录：新建报“证书已存在”，名单
+  里却看不到这个人。`create_user()` 清掉孤儿文件再签发；孤儿证书
+  的序列号若未被 index 记录，先记 R 项进 CRL 再清（只清文件会让
+  一张有效证书留在外面）；若序列号已在别的用户名下（别人证书的
+  复制品），直接清文件。
+- 面板“修复证书库”按钮（`POST /api/openvpn/pki/repair`，远程节点
+  走命令链）一次性对账并修复全部不一致，报告进审计日志；
+  `pki_disagreements()` 只扫描不修；CLI：`python3 -m core.openvpn_manager repair-pki`。
 - 服务端子网固定 `10.8.0.0/24`（`topology subnet`），`tun-mtu 1400` /
   `mssfix 1360`，`redirect-gateway def1` 全量走隧道。SK5 出口由另一层
   （策略路由 + tun2socks/sing-box）接管，不在本模块。

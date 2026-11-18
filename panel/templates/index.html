@@ -418,6 +418,7 @@
           <button id="saveServerBtn" type="button" class="btn">保存服务配置</button>
           <button id="startBtn" type="button" class="btn">启动</button>
           <button id="restartBtn" type="button" class="btn secondary">重启</button>
+          <button id="renewCertBtn" type="button" class="btn secondary">续期服务端证书</button>
           <button id="stopBtn" type="button" class="btn danger">停止</button>
           <button id="rebuildCaBtn" type="button" class="btn danger">重建 CA</button>
         </div>
@@ -438,6 +439,7 @@
         <div class="btn-row">
           <button id="createUserBtn" type="button" class="btn">新建用户</button>
           <button id="refreshUsersBtn" type="button" class="btn secondary">刷新列表</button>
+          <button id="repairPkiBtn" type="button" class="btn secondary">修复证书库</button>
         </div>
         <table>
           <thead>
@@ -653,6 +655,17 @@ function setBadge(id, text, kind) {
   el.appendChild(dot);
   el.appendChild(document.createTextNode(text));
 }
+/* R47-L4-4 服务端证书有效期文案：825 天寿命，到期前 30 天警告、
+   过期后明说——面板绝不只显示“运行中 0 人”却不解释原因。 */
+function certNote(sc) {
+  if (!sc) return "";
+  if (!sc.exists) return " · 服务端证书缺失";
+  if (!sc.expires) return " · 服务端证书有效期未知";
+  var date = sc.expires.slice(0, 10);
+  if (sc.expired) return " · 服务端证书已于 " + date + " 过期（新客户端无法握手，点“续期服务端证书”）";
+  if (sc.warning) return " · 服务端证书 " + date + " 到期（" + sc.days_left + " 天后过期）";
+  return " · 服务端证书有效期至 " + date + "（剩余 " + sc.days_left + " 天）";
+}
 async function loadStatus() {
   var d = await api("/api/status");
   var ovpn = d.openvpn || {};
@@ -666,7 +679,9 @@ async function loadStatus() {
   document.getElementById("ovpnSub").textContent =
     "在线用户 " + (ovpn.online_users || 0) + " 人" +
     (ovpn.port ? " · " + ovpn.proto + "/" + ovpn.port : "") +
-    (ovpn.subnet ? " · " + ovpn.subnet : "") + (ovpn.error ? " · " + ovpn.error : "");
+    (ovpn.subnet ? " · " + ovpn.subnet : "") + (ovpn.error ? " · " + ovpn.error : "") +
+    certNote(ovpn.server_cert) +
+    (ovpn.status_error ? " · 在线列表读取失败：" + ovpn.status_error : "");
   document.getElementById("egressIp").textContent = eg.ip || "—";
   document.getElementById("egressSub").textContent =
     (eg.via_sk5 ? "经 SK5 出口" : eg.via_sk5 === false ? "直连出口" : "") +
@@ -1238,6 +1253,17 @@ document.getElementById("stopBtn").onclick = async function () {
   try { await apiWait("/api/openvpn/stop", "POST", {}, "serverMsg", "已下发停止，等待 agent 执行…"); showMsg("serverMsg", "OpenVPN 已停止", true); addLog("停止 OpenVPN", true); loadStatus(); }
   catch (e) { showMsg("serverMsg", e.message, false); }
 };
+/* R47-L4-4 续期服务端证书：只换服务端证书，CA 与用户证书不动；
+   服务在跑才重启生效（后端 was_running 守卫），走 apiWait（远程
+   节点 202 + cmd_id 同款）。 */
+document.getElementById("renewCertBtn").onclick = async function () {
+  if (!confirm("只更新服务端证书（CA 与全部用户证书不动）；服务在跑时会重启一次使新证书生效，确定续期吗？")) return;
+  try {
+    var d = await apiWait("/api/openvpn/renew-server-cert", "POST", {}, "serverMsg", "已下发续期，等待 agent 执行…");
+    showMsg("serverMsg", (d.note || "服务端证书已更新") + (d.server_cert && d.server_cert.expires ? "，有效期至 " + d.server_cert.expires.slice(0, 10) : ""), true);
+    addLog("续期服务端证书", true); loadStatus();
+  } catch (e) { showMsg("serverMsg", e.message, false); }
+};
 /* R7-P2-9 重建 CA：两次确认才发 force=true + confirm=true，
    走 /api/openvpn/init-pki 入队 agent 执行（POST /api/cmd 同款
    202 + cmd_id，apiWait 轮询等真实结果）。 */
@@ -1280,6 +1306,16 @@ document.getElementById("createUserBtn").onclick = async function () {
   } catch (e) { showMsg("userMsg", e.message, false); addLog("新建用户失败：" + e.message, false); }
 };
 document.getElementById("refreshUsersBtn").onclick = loadUsers;
+/* R47-L4-3 修复证书库：对账 index.txt 与 issued/，修好卡死的用户
+   （证书文件丢了的按序列号吊销进 CRL、孤儿证书清掉），报告进审计日志。 */
+document.getElementById("repairPkiBtn").onclick = async function () {
+  try {
+    var d = await apiWait("/api/openvpn/pki/repair", "POST", {}, "userMsg", "已下发修复，等待 agent 执行…");
+    var rep = (d.report && d.report.repaired) || [];
+    showMsg("userMsg", rep.length ? "证书库已修复 " + rep.length + " 处：" + rep.map(function (r) { return r.name + "（" + r.action + "）"; }).join("；") : "证书库无不一致，无需修复", true);
+    addLog("修复证书库", true); loadUsers();
+  } catch (e) { showMsg("userMsg", e.message, false); }
+};
 /* 密码框留空即不覆盖已存密码：两端后端收到空串都按“保留旧密码”处理
    （Worker 读 sk5cfg 补、Flask sk5_save 同款），前端照常发空串即可。 */
 function sk5Body() {
