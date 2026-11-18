@@ -612,6 +612,29 @@ function isValidServerIp(value) {
   return /^[A-Za-z0-9._:-]{1,253}$/.test(value) && !value.includes("..");
 }
 
+// R47-L6-3: SK5 host 形状校验（与 egress/sk5_manager.py 的
+// valid_sk5_host 同口径）：域名、IPv4 或不带括号的 IPv6 字面量。
+// 冒号只许出现在合法 IPv6 字面量里——最常见的用户笔误是把
+// `host:port` 粘进 host 字段（`proxy.iproyal.net:1080`），它在旧
+// 口径下处处放行，渲染进 sing-box.json 后成为无法解析的 server，
+// 链路呈 enabled-but-dead。`::1` 仍须通过。IPv4 段不许前导 0
+// （与 Python inet_pton 同款严格）。
+function isValidSk5Host(value) {
+  if (typeof value !== "string" || !value || value.length > 253) return false;
+  if (value.includes(":")) return parseIpv6(value) !== null;
+  const v4 = value.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    return v4.slice(1).every((n) => n === "0" || (/^[1-9][0-9]*$/.test(n) && Number(n) <= 255));
+  }
+  const name = value.endsWith(".") ? value.slice(0, -1) : value;
+  if (!name) return false;
+  return name.split(".").every((label) => {
+    if (!label || label.length > 63) return false;
+    if (label.startsWith("-") || label.endsWith("-")) return false;
+    return /^[A-Za-z0-9-]+$/.test(label);
+  });
+}
+
 // 读快照时把建服务配置合并进 openvpn 段（Flask 是现算这四个字段的）。
 async function mergeServerCfg(env, nodeName, openvpn) {
   const cfg = await kvGetJson(env, `servercfg:${nodeName}`);
@@ -1705,6 +1728,14 @@ async function handleCompatSk5Save(request, env) {
   const host = typeof b.host === "string" ? b.host.trim() : "";
   const port = b.port;
   if (!host) return err("host 不能为空", 400);
+  // R47-L6-3: 形状在保存时校验（与 Flask 本机/远程分支同款）——
+  // 旧代码只查非空，`host:port` 笔误会入队并在 agent 侧才失败。
+  if (!isValidSk5Host(host)) {
+    return err(
+      "host 格式无效：须为域名或 IP 地址，端口请填 port 字段（不要把 host:port 粘进 host）",
+      400,
+    );
+  }
   // R30-P2-1: the port token must be a plain integer literal.
   // Number.isInteger(1001.0) is true in JS, but Flask's
   // `type(value) is int` rejects 1001.0 — check the raw token.

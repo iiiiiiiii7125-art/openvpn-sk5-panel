@@ -93,6 +93,17 @@ try:
 except (TypeError, ValueError):
     _SK5_ACCEPTS_CLEAR = False
 
+# R47-L6-3: the SK5 host shape check lives in egress (single source of
+# truth, shared with the agent face and mirrored by the Worker). It is
+# imported separately so an old egress without the function cannot take
+# down the whole SK5 interface above; when it is missing the panel-side
+# pre-check is skipped and set_sk5's _validate stays the enforcement
+# point (its ValueError surfaces as a 500 there, not a 400 here).
+try:
+    from sk5_manager import valid_sk5_host as _sk5_valid_host
+except Exception:  # noqa: BLE001 - old egress without the validator
+    _sk5_valid_host = None
+
 # R2-P2-2: the data directory (DB, admin.pass, secret, agent queue,
 # server settings) is overridable with OVPN_PANEL_DATA_DIR; unset, it
 # stays panel/data as before. install.sh writes the variable into
@@ -2284,6 +2295,14 @@ def _sk5_save_remote(node, data):
                                       % ",".join(sorted(params)))
     if not host:
         return jsonify({"ok": False, "error": "host 不能为空"}), 400
+    # R47-L6-3: shape at save time, not just non-empty -- a malformed
+    # host used to be enqueued and only failed at the agent, late and
+    # confusing. Same rule as the local branch and the Worker.
+    if _sk5_valid_host is not None and not _sk5_valid_host(host):
+        return jsonify({"ok": False,
+                        "error": "host 格式无效：须为域名或 IP 地址，"
+                                 "端口请填 port 字段（不要把 host:port "
+                                 "粘进 host）"}), 400
     if not _valid_port(port):
         return jsonify({"ok": False, "error": "port 须为 1-65535 的整数"}), 400
     enabled, err = _strict_bool(data, "enabled", False)
@@ -2436,6 +2455,15 @@ def sk5_save():
         return jsonify({"ok": True, "sk5": result})
     if not host:
         return jsonify({"ok": False, "error": "host 不能为空"}), 400
+    # R47-L6-3: shape at save time -- the same check as the remote
+    # branch and the Worker. A malformed host used to be stored
+    # verbatim here and only failed at enable time with a sing-box
+    # error that never named the host.
+    if _sk5_valid_host is not None and not _sk5_valid_host(host):
+        return jsonify({"ok": False,
+                        "error": "host 格式无效：须为域名或 IP 地址，"
+                                 "端口请填 port 字段（不要把 host:port "
+                                 "粘进 host）"}), 400
     if not _valid_port(port):
         return jsonify({"ok": False, "error": "port 须为 1-65535 的整数"}), 400
     # R12-P2-1：fail_open/udp_over_tcp 在触碰状态前严格解析。

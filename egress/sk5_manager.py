@@ -254,9 +254,60 @@ def _redact(cfg: dict) -> dict:
     }
 
 
+def valid_sk5_host(host: str) -> bool:
+    """Is `host` a usable SK5 server address -- a hostname, an IPv4
+    address, or an unbracketed IPv6 literal?
+
+    R47-L6-3: the most likely user typo -- pasting `host:port` into
+    the host field -- used to pass every face (the agent's _HOST_RE
+    allows `:` for IPv6 literals, the panel-local face checked only
+    non-empty). A colon is only legal inside a real IPv6 literal:
+    `proxy.iproyal.net:1080` is rejected, `::1` is accepted. A
+    garbage host stored here renders into sing-box.json as an
+    unresolvable server and the chain comes up enabled-but-dead
+    while the panel reports SK5 enabled. Single source of truth:
+    the panel-local save path and the agent both call this.
+    """
+    if not isinstance(host, str) or not host or len(host) > 253:
+        return False
+    if ":" in host:
+        # Colon only inside a real IPv6 literal (incl. embedded IPv4
+        # such as ::ffff:192.0.2.1). Anything else with a colon is a
+        # host:port typo (or brackets/zone id, both unusable here).
+        try:
+            socket.inet_pton(socket.AF_INET6, host)
+        except OSError:
+            return False
+        return True
+    try:
+        socket.inet_pton(socket.AF_INET, host)
+        return True
+    except OSError:
+        pass
+    # Hostname: dot-separated labels, alnum/hyphen, 1-63 chars each,
+    # no leading/trailing hyphen, no empty labels. One trailing dot
+    # (FQDN root) is tolerated.
+    name = host[:-1] if host.endswith(".") else host
+    if not name:
+        return False
+    for label in name.split("."):
+        if not label or len(label) > 63:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+        if not re.fullmatch(r"[A-Za-z0-9-]+", label):
+            return False
+    return True
+
+
 def _validate(host: str, port: int) -> None:
-    if not host or not isinstance(host, str) or len(host) > 253:
-        raise ValueError("host must be a non-empty hostname or IP")
+    # R47-L6-3: shape, not just non-empty -- a garbage host used to
+    # be stored verbatim and only failed at enable time with a
+    # sing-box error that never named the host.
+    if not valid_sk5_host(host):
+        raise ValueError(
+            "host must be a valid hostname or IP address "
+            "(no port -- use the port field)")
     if not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("port must be an integer 1-65535")
 
@@ -669,9 +720,7 @@ def _socks5_udp_associate_dns(
         # Inside try on purpose: an unreachable/refused proxy must
         # return (False, ms, note), never raise into the caller.
         tcp = socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout)
-        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         tcp.settimeout(timeout)
-        udp.settimeout(timeout)
         methods = b"\x02" if username else b"\x00"
         tcp.sendall(b"\x05\x01" + methods)
         resp = tcp.recv(2)
@@ -702,6 +751,22 @@ def _socks5_udp_associate_dns(
         else:
             return False, (time.monotonic() - start) * 1000.0, \
                 "UDP ASSOCIATE returned unknown ATYP"
+        # R47-L6-4: create the UDP socket with the RELAY's address
+        # family, now that the ASSOCIATE reply has revealed it. The
+        # socket used to be created up front as AF_INET, so a
+        # sendto to an IPv6 relay (ATYP 0x04) raised EAFNOSUPPORT
+        # before any packet existed and the probe reported a live
+        # relay as dead UDP. A domain relay (ATYP 0x03) is resolved
+        # first so the socket family and the sendto target agree.
+        try:
+            infos = socket.getaddrinfo(relay[0], relay[1],
+                                       type=socket.SOCK_DGRAM)
+        except socket.gaierror:
+            return False, (time.monotonic() - start) * 1000.0, \
+                "UDP ASSOCIATE relay %s unresolvable" % relay[0]
+        relay = (infos[0][4][0], relay[1])
+        udp = socket.socket(infos[0][0], socket.SOCK_DGRAM)
+        udp.settimeout(timeout)
         # Two attempts, one sendto/recvfrom call site each inside the
         # loop: (example.com, 1.1.1.1) then the depth retry
         # (cloudflare.com, 8.8.8.8). A timeout or a non-matching reply
@@ -920,7 +985,19 @@ def set_sk5(host: str | None = None, port: int | None = None,
         # stays correct-as-intent even if the restart fails (the
         # failure raises, and singbox_running / policy flags in the
         # next status report the broken effective state honestly).
-        return enable()
+        # R47-L6-2: same marker protocol as set_udp_over_tcp's own
+        # flip path (R44-L5-F1) -- the new values are stored but
+        # never applied when enable() raises here. Record it
+        # durably before re-raising, so a later same-value
+        # set_udp_over_tcp() re-attempts the restart instead of
+        # taking the R6-P2-2 no-op short-circuit and returning a
+        # silent 200 on a dead chain.
+        try:
+            return enable()
+        except Exception:
+            cfg["uot_restart_failed"] = True
+            _save_config(cfg)
+            raise
     if now_enabled:
         # Still enabled, no chain-affecting change: normally a pure
         # save (fail_open-only change needs no restart). First check

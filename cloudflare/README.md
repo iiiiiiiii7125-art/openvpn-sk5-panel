@@ -250,8 +250,8 @@ SQLite `nodes` 表，与 KV 键一一对应），服务器模式可直接接远�
 
 ## 未解决的风险
 
-- 本路只在沙箱里做了 `node --check` 与带 mock KV 的全路由测试（406 格，
-  26 个探针文件：bh_worker_poll_guard 20、bi_worker_malformed 18、
+- 本路只在沙箱里做了 `node --check` 与带 mock KV 的全路由测试（414 格，
+  27 个探针文件：bh_worker_poll_guard 20、bi_worker_malformed 18、
   bi_worker_queue_race 15、br_loginfail_array 11、r17_worker 35、
   r18_worker_malformed 13、r18_worker_queue_race 9、
   r19_worker_nonlist_container 12、r19_worker_ovpn_download 8、
@@ -260,7 +260,7 @@ SQLite `nodes` 表，与 KV 键一一对应），服务器模式可直接接远�
   r41_l6_worker_parity 19、r42_f4_age 21、r42_f5_frontend 12、
   r43_j4_journey 25、r45_fix_ad_frontend 8、r45_fix_ad_worker 12、
   r45_l7_worker 29、r46_fix_af_worker 7、r46_l5_worker 17、
-  r46_l7_contract 23；其中 8 格是钉死缺陷行为的预期红格：r17
+  r46_l7_contract 23、r47_bd_worker_host 8；其中 8 格是钉死缺陷行为的预期红格：r17
   W5-05/W5-06a、r18_malformed 4 格、r18_queue_race 2 格），语料即
   `tests/` 下的全部 `.mjs` 探针（R41-L5 的 Worker 探针随审计报告放在
   `docs/audit/l5-probes/`，不计入本数），

@@ -1816,7 +1816,14 @@ if [ -n "${WAN_IF:-}" ]; then
         fi
     fi
     if [ "$_SK5_ON" = "1" ]; then
-        if ! printf '%s' "$FWD_ROUTE" | grep -q "table 100"; then
+        # R47-L6-1: terminate the table number -- a bare `grep "table 100"`
+        # also matches `table 1000` (same family as R41-L4-P2-1 /
+        # R45-L6-3, fixed in policy-routing.sh rule_exists and
+        # sk5_manager._rule_present). A foreign `lookup 1000` rule +
+        # populated table 1000 used to false-pass this gate (silent
+        # direct egress blessed as SK5) and false-fail the direct
+        # gate below.
+        if ! printf '%s' "$FWD_ROUTE" | grep -qE "table 100([^0-9]|$)"; then
             die "health gate: SK5 is enabled but VPN source 10.8.0.1 does not route via table 100 ($FWD_ROUTE)"
         fi
         log "forwarding gate passed (SK5 mode; VPN source routes via table 100: $FWD_ROUTE)"
@@ -1824,7 +1831,7 @@ if [ -n "${WAN_IF:-}" ]; then
         if ! printf '%s' "$FWD_ROUTE" | grep -q "dev $WAN_IF"; then
             die "health gate: route lookup for VPN source 10.8.0.1 does not resolve via $WAN_IF ($FWD_ROUTE)"
         fi
-        if printf '%s' "$FWD_ROUTE" | grep -q "table 100"; then
+        if printf '%s' "$FWD_ROUTE" | grep -qE "table 100([^0-9]|$)"; then
             die "health gate: route lookup for VPN source unexpectedly hits table 100 in direct mode ($FWD_ROUTE)"
         fi
         log "forwarding gate passed (FORWARD rules present; VPN source routes via $WAN_IF: $FWD_ROUTE)"
