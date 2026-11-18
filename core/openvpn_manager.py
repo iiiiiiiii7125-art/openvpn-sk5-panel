@@ -1600,6 +1600,46 @@ def repair_pki(
                                  "action": "stray cert cleared",
                                  "detail": result.get("repair", "")})
         return {"repaired": repaired, "checked": len(problems)}
+def get_user_ovpn(
+    name: str,
+    ca_dir: str | Path | None = None,
+    server_dir: str | Path | None = None,
+    server_ip: str | None = None,
+    proto: str | None = None,
+    port: int | None = None,
+) -> str:
+    """Render the ``.ovpn`` for an already-existing *valid* user.
+
+    Same render as :func:`create_user`'s tail (same files, same
+    endpoint resolution), but it creates nothing: a re-delivered
+    agent command (R47-L5-1) must be able to recover the .ovpn of a
+    user whose first create already landed but whose report was lost
+    -- re-creating 409s (``UserAlreadyExistsError``) and the name
+    would be poisoned with no downloadable .ovpn. Raises
+    :class:`UserNotFoundError` when the user was never issued, and
+    :class:`OpenVPNError` when the user is revoked/expired or a file
+    is missing (those states are what create_user's re-issue path is
+    for, not this one).
+    """
+    validate_username(name)
+    ca_dir = _resolve_ca_dir(ca_dir)
+    server_dir = _resolve_server_dir(server_dir)
+    pki = _pki_dir(ca_dir)
+    if _user_status(name, ca_dir) != "valid":
+        entry = _user_entry(name, ca_dir)
+        if entry is None:
+            raise UserNotFoundError("user %r does not exist" % name)
+        raise OpenVPNError(
+            "user %r is %s, no usable .ovpn to rebuild"
+            % (name, entry.get("status")))
+    ca = _read_if_exists(pki / "ca.crt")
+    cert = _read_if_exists(pki / "issued" / ("%s.crt" % name))
+    key = _read_if_exists(pki / "private" / ("%s.key" % name))
+    ta_key = _read_if_exists(server_dir / "ta.key") or _read_if_exists(pki / "ta.key")
+    if not (ca and cert and key and ta_key):
+        raise OpenVPNError("rebuild .ovpn did not find all files for %r" % name)
+    ip, resolved_proto, resolved_port = _server_endpoint(server_dir, server_ip, proto, port)
+    return build_client_config(name, ca, cert, key, ta_key, ip, resolved_proto, resolved_port)
 
 
 def _revoke_cert(
@@ -2472,6 +2512,9 @@ class OpenVPNManager:
 
     def create_user(self, name: str, **kwargs) -> str:
         return create_user(name, self.ca_dir, self.server_dir, **kwargs)
+
+    def get_user_ovpn(self, name: str, **kwargs) -> str:
+        return get_user_ovpn(name, self.ca_dir, self.server_dir, **kwargs)
 
     def server_endpoint_info(self, **kwargs) -> dict:
         return server_endpoint_info(self.server_dir, **kwargs)
