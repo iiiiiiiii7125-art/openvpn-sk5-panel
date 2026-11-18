@@ -304,23 +304,40 @@ report → 回执 done、下发 `create_user`（无 CA）→ 回执 failed 且 e
 ```bash
 read -r -p "确认卸载 OpenVPN + SK5 面板并删除 CA 与全部用户证书？[y/N] " ans
 [ "$ans" = y ] || [ "$ans" = Y ] || exit 1
+# Caddy 是否安装器装的（R47-L1-4）：先记下来，后面删 /etc/openvpn-sk5-panel 之前要用
+# （/etc/openvpn-sk5-panel/caddy-installed 是安装器装 Caddy 时写的标记；没有它说明 Caddy
+# 早已存在、可能还在给别的站点反代——只删下面那段反代配置，别停服务。老版本装的机没有这个
+# 标记：装机日志里写了 "installing Caddy" 就是安装器装的，手动把 _CADDY_OURS 置 1）。
+[ -f /etc/openvpn-sk5-panel/caddy-installed ] && _CADDY_OURS=1 || _CADDY_OURS=0
+# 同机 agent 先卸（R47-L1-4/L5-4）：只卸面板不卸 agent，agent 会每 5 秒 poll 已死的面板、
+# 次次失败；脚本在面板树里，卸树之前先跑它（--yes 跳过它自己的确认，上面已确认过一次）。
+[ -f /opt/openvpn-sk5-panel/agent/uninstall-agent.sh ] && bash /opt/openvpn-sk5-panel/agent/uninstall-agent.sh --yes
 systemctl disable --now openvpn-sk5-panel openvpn-sk5-singbox openvpn-server@server
 systemctl disable --now openvpn-sk5-policy.service openvpn-sk5-healthcheck.timer
-systemctl disable --now caddy
 # Caddy 反代配置：删 /etc/caddy/Caddyfile 里的 # BEGIN openvpn-sk5-panel … # END openvpn-sk5-panel 段；若 Caddyfile 只有这一段，直接删文件：rm -f /etc/caddy/Caddyfile
+# Caddy 本体只在安装器装了它时才停 + 删 apt 源与 keyring：
+[ "$_CADDY_OURS" -eq 1 ] && systemctl disable --now caddy
+[ "$_CADDY_OURS" -eq 1 ] && rm -f /etc/apt/sources.list.d/caddy-stable.list /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 rm -rf /opt/openvpn-sk5-panel /etc/openvpn-sk5-panel
 rm -rf /etc/openvpn/server          # 含 CA 与全部用户证书，删前确认
 rm -f /usr/local/bin/sing-box /usr/local/bin/tun2socks
 rm -rf /usr/local/share/easy-rsa   # 安装器在发行版 easy-rsa < 3.1.0 时装的 3.1.7
 rm -f /etc/caddy/panel-cert.pem    # Caddy 用的面板证书公开副本（非私钥）
+rm -rf /var/log/openvpn /var/log/openvpn-status.log  # openvpn 日志（状态日志与 openvpn.log）
 rm -f /etc/sysctl.d/99-openvpn-sk5.conf   # net.ipv4.ip_forward=1；删文件后重启恢复默认，需立即恢复则另跑 sysctl -w net.ipv4.ip_forward=0（先确认没有别的服务需要转发）
 rm -f /etc/systemd/system/openvpn-sk5-panel.service /etc/systemd/system/openvpn-sk5-singbox.service
 rm -f /etc/systemd/system/openvpn-sk5-policy.service /etc/systemd/system/openvpn-sk5-healthcheck.service /etc/systemd/system/openvpn-sk5-healthcheck.timer
 systemctl daemon-reload
-# NAT 规则：iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o <网卡> -j MASQUERADE
-# FORWARD 规则（安装器写入的两条，须一并删，否则残留 ACCEPT 规则）：
-iptables -D FORWARD -i tun0 -s 10.8.0.0/24 -o <网卡> -j ACCEPT
-iptables -D FORWARD -i <网卡> -d 10.8.0.0/24 -o tun0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+# NAT 与 FORWARD 规则（安装器写入的，须一并删，否则残留规则）：出口网卡从默认路由实时取；
+# 无默认路由时跳过（待路由恢复后按下面三行手工删——-C 先查存在再 -D，不存在不报错）。
+WAN_IF="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
+if [ -n "$WAN_IF" ]; then
+  iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null && iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o "$WAN_IF" -j MASQUERADE
+  iptables -C FORWARD -i tun0 -s 10.8.0.0/24 -o "$WAN_IF" -j ACCEPT 2>/dev/null && iptables -D FORWARD -i tun0 -s 10.8.0.0/24 -o "$WAN_IF" -j ACCEPT
+  iptables -C FORWARD -i "$WAN_IF" -d 10.8.0.0/24 -o tun0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null && iptables -D FORWARD -i "$WAN_IF" -d 10.8.0.0/24 -o tun0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+else
+  echo "无默认路由，跳过 NAT/FORWARD 清理"
+fi
 # ufw 放行（仅 ufw 机上有；端口按实际 OVPN_PORT/PANEL_PORT，默认 1194/udp 与 8443/tcp）：
 ufw delete allow 1194/udp
 ufw delete allow 8443/tcp
