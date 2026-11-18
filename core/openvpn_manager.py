@@ -2232,6 +2232,40 @@ def _pid_is_openvpn(pid: int) -> bool:
 CERT_EXPIRY_WARNING_DAYS = 30
 
 
+def server_dns(server_dir: str | Path | None = None) -> str | None:
+    """The DNS server the rendered server.conf pushes, or None.
+
+    Reads the ``push "dhcp-option DNS X"`` line from
+    ``<server_dir>/server.conf`` and returns X (first token: a bare
+    hostname passes through, same as the Flask copy). None when the
+    conf is missing, unreadable, undecodable, or carries no DNS push
+    line. Never raises.
+
+    Twin rule: panel/app.py ``_parse_server_dns`` (Flask face,
+    LIVE-R47-1) reads the same line for the local /api/status. The
+    agent face needs it too -- the get_status snapshot carries the
+    pushed DNS so the Worker (and Flask remote) status stops
+    reporting the hardcoded 1.1.1.1 after a DNS change. The two
+    copies are deliberately small and independent: the panel copy
+    lives in the panel process, this one in core (imported by the
+    agent); keep their parse rule identical.
+    """
+    server_dir = _resolve_server_dir(server_dir)
+    try:
+        text = (server_dir / SERVER_CONF_NAME).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('push "dhcp-option DNS '):
+            value = line[len('push "dhcp-option DNS '):].strip()
+            if value.endswith('"'):
+                value = value[:-1].strip()
+            if value:
+                return value.split(None, 1)[0]
+    return None
+
+
 def server_cert_info(server_dir: str | Path | None = None) -> dict:
     """Report the server certificate's expiry (R47-L4-4).
 
@@ -2527,6 +2561,9 @@ class OpenVPNManager:
 
     def pki_disagreements(self) -> list[dict]:
         return pki_disagreements(self.ca_dir, self.server_dir)
+
+    def server_dns(self) -> str | None:
+        return server_dns(self.server_dir)
 
     def server_cert_info(self) -> dict:
         return server_cert_info(self.server_dir)

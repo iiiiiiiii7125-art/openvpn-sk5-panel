@@ -489,7 +489,9 @@ async function enqueueCommand(env, nodeName, action, params) {
 // 把 agent 上报的 get_status 原始结果归一化成 Flask /api/status 同形快照：
 //   agent 给的是扁平 egress_ip（字符串），不是 egress 对象；
 //   online_users 是 Flask 现算的（clients 列表长度），agent 只给 clients 列表；
-//   proto/port/subnet/dns 不在 agent 结果里，由读快照时按 servercfg 补（见 cachedStatus）。
+//   proto/port/subnet 不在 agent 结果里，由读快照时按 servercfg 补（见 cachedStatus）；
+//   dns 在 agent 结果里（R47 Worker-face LIVE-R47-1：快照带 server.conf 实际推的 DNS），
+//   读快照时优先用它，servercfg 只作回落（见 mergeServerCfg）。
 // 密码字段绝不写入快照。
 // R42-F4-1：归一化结果本身不打 at —— at 只由 get_status 回执在
 // handleAgentReport 里落戳（Flask R11-P1-1：心跳不打 at）。旧版在
@@ -508,6 +510,10 @@ function snapshotFromResult(result) {
         ? ov.clients.length
         : ov.online_users || 0,
       error: ov.error !== undefined ? ov.error : null,
+      // R47 Worker-face LIVE-R47-1: the pushed DNS rides the snapshot
+      // (agent action_get_status reads server.conf); non-string / absent
+      // stays null so mergeServerCfg falls back to servercfg / FIXED_DNS.
+      dns: typeof ov.dns === "string" && ov.dns ? ov.dns : null,
     };
   }
   if (typeof result.egress_ip === "string" && result.egress_ip) {
@@ -652,8 +658,18 @@ async function mergeServerCfg(env, nodeName, openvpn) {
     ovpn.proto = cfg.proto || null;
     ovpn.port = cfg.port !== undefined ? cfg.port : null;
     ovpn.subnet = cfg.subnet || FIXED_SUBNET;
-    ovpn.dns = cfg.dns || FIXED_DNS;
   }
+  // R47 Worker-face LIVE-R47-1: the snapshot's dns is the live value
+  // (agent reads server.conf); servercfg is only the fallback for
+  // snapshots from old agents that carry no dns, FIXED_DNS last.
+  // A non-string snapshot dns never lands here (snapshotFromResult
+  // validates), but the typeof guard keeps a hand-written snapshot
+  // from smuggling one in. The fallback applies with no servercfg
+  // too -- otherwise the status would report dns null instead of
+  // the default (D4).
+  ovpn.dns = (typeof ovpn.dns === "string" && ovpn.dns)
+    || (cfg && cfg.dns)
+    || FIXED_DNS;
   return ovpn;
 }
 
@@ -1390,6 +1406,9 @@ async function handleAgentReport(request, env) {
   // R45-L7-2：同时记下对外地址，供建用户时补发给 agent（server_ip 键
   // 在场即设定/清空，缺键即保持旧值；非字符串一律不存——/api/cmd 直发
   // 的命令不经 validateCreateServer，脏值绝不能进 servercfg）。
+  // R47 Worker-face LIVE-R47-1：同时记下 agent 回执里实际推的 DNS
+  // （create_server 结果的 dns 键）；旧版 agent 不回该键时回落到
+  // FIXED_DNS，非字符串同样不存。
   if (cmd.action === "create_server" && cmd.status === "done") {
     const params = cmd.params || {};
     const prev = (await kvGetJson(env, `servercfg:${node.name}`)) || {};
@@ -1397,7 +1416,9 @@ async function handleAgentReport(request, env) {
       proto: params.proto || "udp",
       port: params.port !== undefined ? params.port : 1194,
       subnet: FIXED_SUBNET,
-      dns: FIXED_DNS,
+      dns: (body.result && typeof body.result.dns === "string" && body.result.dns)
+        ? body.result.dns
+        : FIXED_DNS,
       server_ip:
         typeof params.server_ip === "string"
           ? params.server_ip || null
