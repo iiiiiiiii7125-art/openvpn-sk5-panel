@@ -160,7 +160,9 @@ ADMIN_PASS_PATH = os.environ.get("OVPN_PANEL_ADMIN_PASS_PATH",
                                  "/etc/openvpn-sk5-panel/admin.pass")
 ADMIN_PASS_FALLBACK = os.path.join(DATA_DIR, "admin.pass")
 
-# core 子网/DNS 由 server.conf.template 固定,面板不提供修改入口
+# core 子网固定、DNS 取 $OVPN_DNS(默认 1.1.1.1)写入 server.conf,面板
+# 不提供修改入口;状态接口报的 dns 须读 server.conf 实际推送值
+# (LIVE-R47-1),绝不能直接报 FIXED_DNS
 FIXED_SUBNET = "10.8.0.0/24"
 FIXED_DNS = "1.1.1.1"
 CA_DIR = Path(os.environ.get("OPENVPN_CA_DIR", "/etc/openvpn/server/easy-rsa"))
@@ -1285,6 +1287,29 @@ def _parse_server_conf():
     return proto, port
 
 
+def _parse_server_dns():
+    """从渲染好的 server.conf 读推送 DNS,读不到返回 FIXED_DNS.
+
+    LIVE-R47-1: status() 曾直接报 FIXED_DNS,而 server.conf 实际推
+    的是 $OVPN_DNS —— DNS 改过之后面板状态撒谎(实测 server.conf 推
+    8.8.8.8,状态仍报 1.1.1.1)。读不到/读坏/推的不是有效值时回落到
+    FIXED_DNS,绝不让状态接口因此 500。
+    """
+    try:
+        for line in (SERVER_DIR / "server.conf").read_text(
+                encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith('push "dhcp-option DNS '):
+                value = line[len('push "dhcp-option DNS '):].strip()
+                if value.endswith('"'):
+                    value = value[:-1].strip()
+                if value:
+                    return value.split(None, 1)[0]
+    except (OSError, UnicodeDecodeError):
+        pass
+    return FIXED_DNS
+
+
 # 观察-1：.ovpn 的 remote 地址（对外地址）。默认自动探测公网 IP；
 # 管理员也可在面板上显式填一个（域名或 IP），存在
 # DATA_DIR/server.json；留空即恢复自动探测。Cloudflare 模式的
@@ -1787,7 +1812,8 @@ def status():
     if node is not None:
         return jsonify(_remote_status_payload(node))
     ovpn = {"running": False, "online_users": 0,
-            "subnet": FIXED_SUBNET, "dns": FIXED_DNS, "error": None}
+            "subnet": FIXED_SUBNET, "dns": _parse_server_dns(),
+            "error": None}
     if server_status is not None:
         try:
             raw = server_status()
@@ -1946,10 +1972,11 @@ def ovpn_server():
                   % (proto, port, allow_port_change, remote_ip))
     return jsonify({"ok": True, "server": {
         "proto": proto, "port": port, "conf_path": str(conf_path),
-        "subnet": FIXED_SUBNET, "dns": FIXED_DNS,
+        "subnet": FIXED_SUBNET, "dns": _parse_server_dns(),
         "server_ip": remote_ip,
         "remote_warning": _remote_warning(remote_ip),
-        "note": "子网/DNS 由 core 固定为 %s / %s,改配置后需重启服务才生效"
+        "note": "子网由 core 固定为 %s；DNS 为 server.conf 实际推送值"
+                "（$OVPN_DNS，默认 %s），改配置后需重启服务才生效"
                 % (FIXED_SUBNET, FIXED_DNS)}})
 
 

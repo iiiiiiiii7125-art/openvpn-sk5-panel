@@ -39,8 +39,8 @@ python3 app.py
 | POST `/api/cmd` | `node: string, action: string, params?: object` | `cmd_id, node, action`（命令入队，agent 下次 poll 拉取） |
 | GET `/api/cmd/<cmd_id>` | — | 命令记录 `{id, node, action, params, status, result?, ...}`（agent 上报后 status 变 done/failed） |
 | GET `/api/audit` | `limit?: int（默认 100）` | `audit: [{...}]`（操作审计行，最新在前） |
-| GET `/api/status` | — | `openvpn{running, online_users, port, proto, subnet: "10.8.0.0/24", dns: "1.1.1.1", unit_active, pid, error?, server_cert{exists, expires, days_left, expired, warning}, status_error?, detail}, sk5{enabled, host, port, error?}, egress{ip, latency_ms, via_sk5, error?}, modules_missing[]`（`server_cert`：服务端证书有效期，到期前 30 天 `warning: true`；`status_error`：状态日志损坏时在线列表为空的原因，守护进程在跑的结论不变） |
-| POST `/api/openvpn/server` | `port: int(1-65535)（可省，UDP 默认 1194 / TCP 默认 443）, proto: "udp"\|"tcp", server_ip?: string（.ovpn 的 remote，留空=自动探测公网 IP；填了须为 IP 或主机名，否则 400）` | `server{proto, port, conf_path, subnet, dns, server_ip, remote_warning, note}`；server_ip 为生效值（已存值或自动探测）；子网/DNS 由 core 固定，改配置后需重启服务生效 |
+| GET `/api/status` | — | `openvpn{running, online_users, port, proto, subnet: "10.8.0.0/24", dns, unit_active, pid, error?, server_cert{exists, expires, days_left, expired, warning}, status_error?, detail}, sk5{enabled, host, port, error?}, egress{ip, latency_ms, via_sk5, error?}, modules_missing[]`（`dns`：server.conf 实际推送的 DNS（$OVPN_DNS，默认 `1.1.1.1`）；`server_cert`：服务端证书有效期，到期前 30 天 `warning: true`；`status_error`：状态日志损坏时在线列表为空的原因，守护进程在跑的结论不变） |
+| POST `/api/openvpn/server` | `port: int(1-65535)（可省，UDP 默认 1194 / TCP 默认 443）, proto: "udp"\|"tcp", server_ip?: string（.ovpn 的 remote，留空=自动探测公网 IP；填了须为 IP 或主机名，否则 400）` | `server{proto, port, conf_path, subnet, dns, server_ip, remote_warning, note}`；server_ip 为生效值（已存值或自动探测）；子网由 core 固定，DNS 为 server.conf 实际推送值（$OVPN_DNS，默认 `1.1.1.1`），改配置后需重启服务生效 |
 | POST `/api/openvpn/start` | — | `result`（`server_status()` 返回值原样） |
 | POST `/api/openvpn/stop` | — | `result` |
 | POST `/api/openvpn/restart` | — | `result` |
@@ -65,7 +65,7 @@ python3 app.py
 
 `core/openvpn_manager.py`（已核对实物；行数见 `wc -l`）：
 - `server_status() -> dict`：`{running, unit_active, pid, clients: [{name, real_address, ...}], status_log, error?}`
-- `render_server_conf(proto="udp", port=None, server_dir=None, ca_dir=None, dns=None, allow_port_change=False) -> Path`：认 proto/port/server_dir/ca_dir/dns/allow_port_change；子网固定 `10.8.0.0/24`（`OVPN_SUBNET` 设为其他值时安装器直接拒绝——NAT 规则与已服务子网错位会使出口断流）、DNS 固定 `1.1.1.1`（见 `server.conf.template`）。入口端口铁律 P01：已建服务改端口无 `allow_port_change=True` 即 500 拒绝，带上才改写（面板 `POST /api/openvpn/server` 透传该字段）
+- `render_server_conf(proto="udp", port=None, server_dir=None, ca_dir=None, dns=None, allow_port_change=False) -> Path`：认 proto/port/server_dir/ca_dir/dns/allow_port_change；子网固定 `10.8.0.0/24`（`OVPN_SUBNET` 设为其他值时安装器直接拒绝——NAT 规则与已服务子网错位会使出口断流）、DNS 取 `$OVPN_DNS`（默认 `1.1.1.1`），写入 server.conf 的 `push "dhcp-option DNS …"`；面板 `/api/status` 报的 `dns` 即该实际推送值（见 `server.conf.template`）。入口端口铁律 P01：已建服务改端口无 `allow_port_change=True` 即 500 拒绝，带上才改写（面板 `POST /api/openvpn/server` 透传该字段）
 - `start_server() / stop_server() / restart_server() -> dict`：返回 `server_status()`
 - `list_users() -> list[dict]`：`[{name, status: valid|revoked|expired, expires, serial, cn, legacy}]`
 - `create_user(name) -> str`：返回 `.ovpn` 文本；重名有效证书会抛错，**但 CN=OpenVPN-CA 的旧存量证书（`legacy`）除外：重建同名先吊销旧证再重签，返回新证书的 `.ovpn`**
