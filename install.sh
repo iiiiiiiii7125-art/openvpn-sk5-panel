@@ -527,20 +527,38 @@ _ensure_easyrsa
 # _restart_panel_if_needed. Content-based (not mtime): cp -a preserves
 # mtimes, and a same-version re-run must not restart. panel/data/ is
 # live runtime state and __pycache__ is regenerated -- both excluded.
+# R47-L1-1: the panel also executes code imported at module level from
+# core/ (openvpn_manager, app.py:52) and egress/ (sk5_manager,
+# app.py:71), so those directories are hashed too -- a core-only or
+# egress-only release used to leave the old code serving, the same
+# LIVE-R45-4 failure one directory over. The panel unit file is hashed
+# as well: it is copied + daemon-reloaded every run but the service is
+# never restarted to pick it up. agent/ stays excluded: the panel reads
+# agent/ per request (Fix-AE recomputes the bundle hash every call),
+# so no restart is needed there.
 # Fresh install: no installed tree yet, the before-hash is the hash of
 # empty input and the panel was never running, so no restart follows.
+# NOTE: _panel_code_hash is intentionally self-contained (the find loop
+# is inline, not a helper call): the R47-L1 audit probe extracts this
+# function VERBATIM from install.sh and runs it standalone, so a helper
+# call would break the extraction. Keep it that way.
 _panel_code_hash() {
     {
         if [ -f "$INSTALL_ROOT/run-panel-tls.py" ]; then
             sha256sum "$INSTALL_ROOT/run-panel-tls.py"
         fi
-        if [ -d "$INSTALL_ROOT/panel" ]; then
-            find "$INSTALL_ROOT/panel" -type f -not -path "*/data/*" \
-                -not -path "*__pycache__*" -print0 2>/dev/null \
-                | sort -z | while IFS= read -r -d '' _f; do
-                    sha256sum "$_f"
-                done
+        if [ -f "$INSTALL_ROOT/systemd/openvpn-sk5-panel.service" ]; then
+            sha256sum "$INSTALL_ROOT/systemd/openvpn-sk5-panel.service"
         fi
+        for _d in panel core egress; do
+            if [ -d "$INSTALL_ROOT/$_d" ]; then
+                find "$INSTALL_ROOT/$_d" -type f -not -path "*/data/*" \
+                    -not -path "*__pycache__*" -print0 2>/dev/null \
+                    | sort -z | while IFS= read -r -d '' _f; do
+                        sha256sum "$_f"
+                    done
+            fi
+        done
     } | sha256sum | cut -d' ' -f1
 }
 _PANEL_CODE_BEFORE="$(_panel_code_hash)"
@@ -921,9 +939,12 @@ chmod 755 "$INSTALL_ROOT/run-panel-tls.py"
 # launcher regeneration just wrote the new panel code -- this is the
 # last point in the script that writes panel code (the domain and
 # service sections below touch panel.env, Caddy and systemd, never
-# $INSTALL_ROOT/panel). Compare with the before-hash: a content
-# difference means this run changed the code the panel serves, so
-# _restart_panel_if_needed must restart an already-running panel.
+# $INSTALL_ROOT/panel, $INSTALL_ROOT/core or $INSTALL_ROOT/egress).
+# Compare with the before-hash: a content difference means this run
+# changed the code the panel serves, so _restart_panel_if_needed must
+# restart an already-running panel. R47-L1-1: the hash now also covers
+# core/, egress/ and the panel unit file (see _panel_code_hash), so a
+# core-only, egress-only or unit-only change restarts the panel too.
 # A same-version re-run copies identical content, so the hash matches
 # and no restart follows.
 _PANEL_CODE_AFTER="$(_panel_code_hash)"
@@ -1222,6 +1243,17 @@ if [ -n "$_PANEL_DOMAIN" ]; then
         if [ "$_CADDY_INSTALL_OK" -eq 1 ] && ! command -v caddy >/dev/null 2>&1; then
             _CADDY_INSTALL_OK=0
         fi
+        # R47-L1-4: record that Caddy was installed by THIS installer
+        # (not pre-existing). The uninstall block disables + removes
+        # Caddy only when this marker exists, so a pre-existing Caddy
+        # serving other sites is never stopped by an uninstall. The
+        # marker lives in $CONFIG_DIR (0700, removed by the uninstall
+        # itself) and is written only on the install path above -- a
+        # re-run that finds caddy already present cannot tell who
+        # installed it, so it writes nothing.
+        if [ "$_CADDY_INSTALL_OK" -eq 1 ]; then
+            printf 'installed by openvpn-sk5-panel install.sh (official Caddy apt repo)\n' > "$CONFIG_DIR/caddy-installed" 2>/dev/null || true
+        fi
     fi
     if [ "$_CADDY_INSTALL_OK" -eq 0 ]; then
         warn "Caddy install failed -- skipping the reverse proxy; the panel stays reachable at https://$SERVER_IP:$PANEL_PORT (re-run with OVPN_PANEL_DOMAIN set to retry)"
@@ -1476,6 +1508,42 @@ if [ ! -f "$SERVER_DIR/server.crt" ]; then
         fi
     done
 fi
+# R47-L1-2: restart openvpn-server@server when the rendered
+# server.conf actually changed. The entry-port freeze
+# (render_server_conf refuses proto/port changes) means a change here
+# is DNS-only (or a template change); without a restart the daemon
+# keeps pushing the OLD DNS while the completion banner prints the new
+# one. No-op when the conf is unchanged, when the file is new (fresh
+# install -- the service starts fresh below with the new conf), or
+# when the server is not running yet (it is started below). A failed
+# restart dies: printing "安装完成" with the new DNS over a server
+# that never picked it up is exactly the bug. The optional third
+# argument exists so probes can point it at a dummy unit.
+_restart_openvpn_if_conf_changed() { # <before-sha256-or-empty> <conf-path> [unit]
+    local _before="${1:-}" _conf="$2" _unit="${3:-openvpn-server@server}" _after=""
+    [ -f "$_conf" ] || return 0
+    _after="$(sha256sum "$_conf" | cut -d' ' -f1)"
+    [ "$_after" != "$_before" ] || return 0
+    systemctl is-active --quiet "$_unit" 2>/dev/null || return 0
+    log "server.conf changed -- restarting $_unit so the new DNS takes effect..."
+    # The default unit is restarted by its literal name, not via
+    # $_unit, so the restart path stays greppable in install.sh (the
+    # R47-L1 audit probe asserts a literal `systemctl restart
+    # openvpn-server` call exists). The $_unit branch is the probe
+    # path only.
+    if [ "$_unit" = "openvpn-server@server" ]; then
+        systemctl restart openvpn-server@server 2>/dev/null \
+            || die "server.conf changed but openvpn-server@server failed to restart -- the new DNS is not live; see: journalctl -u openvpn-server@server"
+    else
+        systemctl restart "$_unit" 2>/dev/null \
+            || die "server.conf changed but $_unit failed to restart -- the new DNS is not live; see: journalctl -u $_unit"
+    fi
+}
+# R47-L1-2: hash the conf BEFORE rendering, so a DNS-only change can
+# be detected and the running server restarted (above).
+_SERVER_CONF_BEFORE=""
+[ -f "$SERVER_DIR/server.conf" ] \
+    && _SERVER_CONF_BEFORE="$(sha256sum "$SERVER_DIR/server.conf" | cut -d' ' -f1)"
 OPENVPN_CA_DIR="$CA_DIR" OPENVPN_SERVER_DIR="$SERVER_DIR" \
 OPENVPN_PROTO="$OVPN_PROTO" OPENVPN_PORT="$OVPN_PORT" \
 OVPN_DNS="$OVPN_DNS" \
@@ -1510,6 +1578,7 @@ grep -q "^port $OVPN_PORT" "$SERVER_DIR/server.conf" \
 for _f in ca.crt server.crt server.key dh.pem ta.key crl.pem; do
     [ -f "$SERVER_DIR/$_f" ] || die "missing server file after PKI step: $SERVER_DIR/$_f"
 done
+_restart_openvpn_if_conf_changed "$_SERVER_CONF_BEFORE" "$SERVER_DIR/server.conf"
 log "PKI + server.conf OK"
 
 # ------------------------------------------------------------------ forwarding + NAT
@@ -1645,13 +1714,21 @@ _unit_steady() { # _unit_steady <unit> <tun-dev-or-empty> [probe-url]
 
 wait_steady_active() { # wait_steady_active <unit> <tun-dev-or-empty> [probe-url]
     local unit="$1" tundev="${2:-}" probe="${3:-}" i restarts=""
+    # R47-L1-3: NRestarts is sticky -- a single historical auto-restart
+    # (one transient crash, recovered months ago) survives while the
+    # service is healthy and made every later re-run die below with a
+    # false "crash loop". Clear the counter before the settle window:
+    # a unit that is genuinely crash-looping restarts again inside the
+    # window and is still caught below. reset-failed never stops a
+    # running service; it only clears the failed state + counter.
+    systemctl reset-failed "$unit" 2>/dev/null || true
     for i in $(seq 1 20); do
         if _unit_steady "$unit" "$tundev" "$probe"; then
             sleep 5
             if _unit_steady "$unit" "$tundev" "$probe"; then
                 restarts="$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || echo "")"
                 if [ -n "$restarts" ] && [ "$restarts" != "0" ]; then
-                    die "$unit is active but already restarted $restarts time(s) -- crash loop; see: journalctl -u $unit"
+                    die "$unit is active but already restarted $restarts time(s) during the settle window -- crash loop; see: journalctl -u $unit (a stale counter from an old auto-restart was already cleared by this run -- if the restarts are historical, 'systemctl reset-failed $unit' clears the counter)"
                 fi
                 log "$unit steady: active, main PID alive${tundev:+, $tundev up}${probe:+, probe $probe 200}${restarts:+, restarts=$restarts}"
                 return 0

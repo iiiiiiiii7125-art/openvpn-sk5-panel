@@ -206,3 +206,30 @@ systemctl restart ovpn-agent
 `smokeuser`（沙箱无 openvpn/easy-rsa，应干净失败并上报
 `ok: false`），之后 poll 返回空。agent 用 `--once` 跑两次，
 验证 poll → 执行 → report 全链与成功/失败两条上报路径。
+
+## 卸载（R47-L5-4）
+
+只在面板上吊销节点是不够的：吊销只作废 token，agent 本身还在
+跑，每 5 秒 poll 一次、次次 401，直到手工删掉。卸载分两步，
+顺序不限：
+
+1. 本机上跑卸载脚本（随包在 `agent/uninstall-agent.sh`；已装
+   机的面板树里在 `/opt/openvpn-sk5-panel/agent/uninstall-agent.sh`）：
+
+```bash
+bash /opt/openvpn-sk5-panel/agent/uninstall-agent.sh
+# 非交互（脚本/自动化里用）：bash /opt/openvpn-sk5-panel/agent/uninstall-agent.sh --yes
+```
+
+脚本停掉并禁用 `ovpn-agent.service`，删 `/opt/ovpn-agent`、
+`/etc/ovpn-agent` 与 unit 文件，最后 `daemon-reload`。面板树
+已经删了、只有 agent 残留时，直接按脚本里的三行手工做也行：
+`systemctl disable --now ovpn-agent.service`、
+`rm -rf /opt/ovpn-agent /etc/ovpn-agent`、
+`rm -f /etc/systemd/system/ovpn-agent.service && systemctl daemon-reload`。
+
+2. 面板上吊销该节点（节点列表 → 吊销），旧 token 立即作废。
+
+只做第 1 步不做第 2 步：节点 token 仍有效，他人拿旧 token
+能重装 agent；只做第 2 步不做第 1 步：agent 继续空转 poll
+401。两步都做才算卸干净。

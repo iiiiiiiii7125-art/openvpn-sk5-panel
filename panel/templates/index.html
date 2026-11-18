@@ -990,7 +990,7 @@ async function loadNodes() {
       var delBtn = document.createElement("button");
       delBtn.type = "button"; delBtn.className = "btn danger small"; delBtn.textContent = "吊销";
       delBtn.onclick = async function () {
-        if (!confirm("确定吊销节点 " + n.name + " 吗？旧 token 立即作废，排队/已下发的命令一律标失败。")) return;
+        if (!confirm("确定吊销节点 " + n.name + " 吗？旧 token 立即作废，排队/已下发的命令一律标失败。注意：吊销只作废 token，不会停掉节点上的 agent——吊销后还须在节点上跑 uninstall-agent.sh（见 agent/README.md「卸载」），否则 agent 每 5 秒 poll 一次、次次 401。")) return;
         try {
           await api("/api/nodes/" + encodeURIComponent(n.name), "DELETE");
           if (currentNode === n.name) setCurrentNode("");
