@@ -312,7 +312,24 @@ def _post_json(
         with opener.open(req, timeout=POLL_TIMEOUT) as resp:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        raise RuntimeError("panel HTTP %s on %s" % (exc.code, url)) from exc
+        # R47-L5-2：面板的 401 分四种原因（"token 与节点名不匹配"
+        # 等），旧代码只剩 bare "panel HTTP 401"——最常见的装机
+        # 错（--node-name 写错）在 journalctl 里完全看不出原因。
+        # 把面板回的 error 原样带进异常消息；读不到/非 JSON 时
+        # 回落到只有状态码的旧文案（消息前缀 "panel HTTP <码>"
+        # 不变，旧的日志 grep 仍能命中）。
+        reason = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+            parsed = json.loads(body)
+            if isinstance(parsed, dict) and isinstance(
+                    parsed.get("error"), str):
+                reason = parsed["error"].strip()
+        except Exception:  # noqa: BLE001 -- body unreadable: bare code
+            reason = ""
+        detail = (": %s" % reason[:200]) if reason else ""
+        raise RuntimeError(
+            "panel HTTP %s on %s%s" % (exc.code, url, detail)) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise RuntimeError("cannot reach panel %s: %s" % (url, exc)) from exc
     try:
@@ -657,7 +674,16 @@ def action_init_pki(params: dict) -> dict:
             "init_pki force=true wipes the CA and invalidates every "
             "issued client certificate: resend with confirm=true to proceed"
         )
-    ca_dir = openvpn_manager.init_pki(force=force)
+    try:
+        ca_dir = openvpn_manager.init_pki(force=force)
+    except openvpn_manager.OpenVPNError as exc:
+        # R47-L5-1：重下发的 init_pki（CA 已存在）不是失败——期望的
+        # 终态（CA 在位）已经成立。服务端证书重建是幂等的（完整
+        # 集复用），建好后按成功回执。force=True 的显式清库路径
+        # 从不报 "already exists"，不受影响。
+        if "already exists" not in str(exc):
+            raise
+        ca_dir = openvpn_manager._resolve_ca_dir(None)
     installed = openvpn_manager.build_server_cert()
     return {"ca_dir": str(ca_dir), "server_files": installed}
 
@@ -731,12 +757,25 @@ def action_create_user(params: dict) -> dict:
     server_ip = params.get("server_ip") or None
     if server_ip is not None:
         openvpn_manager._validate_server_ip(server_ip)
-    ovpn = openvpn_manager.create_user(
-        name,
-        server_ip=server_ip,
-        proto=_as_proto(params["proto"]) if params.get("proto") else None,
-        port=_as_int(params["port"], "port") if params.get("port") else None,
-    )
+    try:
+        ovpn = openvpn_manager.create_user(
+            name,
+            server_ip=server_ip,
+            proto=_as_proto(params["proto"]) if params.get("proto") else None,
+            port=_as_int(params["port"], "port") if params.get("port") else None,
+        )
+    except openvpn_manager.UserAlreadyExistsError:
+        # R47-L5-1：重下发/重试建一个已存在的用户不是失败——首次
+        # 建用户已落地、回执丢了，名字再 409 就毒化了（.ovpn 永
+        # 远下不下来）。把已签发用户的 .ovpn 重建出来按成功回执，
+        # 面板照常存下回执。已吊销/已过期用户不在此列（那是
+        # create_user 的重签路径，照常走新建）。
+        ovpn = openvpn_manager.get_user_ovpn(
+            name,
+            server_ip=server_ip,
+            proto=_as_proto(params["proto"]) if params.get("proto") else None,
+            port=_as_int(params["port"], "port") if params.get("port") else None,
+        )
     # The .ovpn embeds the user's private key: it travels only over the
     # HTTPS report channel to the panel, which must deliver it to the
     # requesting admin -- never log it (see _redact / logging below).
@@ -751,7 +790,22 @@ def action_revoke_user(params: dict) -> dict:
         raise ValueError("invalid username: must be a string")
     if not _NAME_RE.match(name):
         raise ValueError("invalid username: must match [A-Za-z0-9_-]{1,32}")
-    revoked = openvpn_manager.revoke_user(name)
+    try:
+        revoked = openvpn_manager.revoke_user(name)
+    except openvpn_manager.UserAlreadyRevokedError:
+        # R47-L5-1：重下发的 revoke（已吊销）不是失败——吊销已
+        # 生效，再报失败是假阴性。CRL 已在位；守护进程只在运行
+        # 时才重启（与面板本机面的 was_running 守卫同款——停着的
+        # 服务下次启动时读 CRL，不为此把它拉起来）。
+        try:
+            running = bool(openvpn_manager.server_status().get("running"))
+        except Exception:  # noqa: BLE001 -- unknown state: no restart
+            running = False
+        status = (openvpn_manager.restart_server() if running
+                  else openvpn_manager.server_status())
+        return {"revoked": {"name": name, "status": "revoked",
+                            "already_revoked": True},
+                "server": status}
     # CRL is only read at daemon start -- restart so the revocation
     # takes effect for new connections immediately.
     status = openvpn_manager.restart_server()
@@ -920,6 +974,60 @@ ACTIONS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# executed-command journal (R47-L5-1: idempotent re-delivery)
+# ---------------------------------------------------------------------------
+# The panel re-delivers a command id when its report was lost (or the
+# sweep re-queued it): the same id arriving twice must never execute
+# twice. The journal records every finished execution (id -> outcome)
+# BEFORE its report is sent, so a re-delivery replays the stored
+# outcome instead of re-running. Same id = same execution, replay;
+# a new id = a new attempt, execute. The file holds .ovpn text
+# (private keys) next to the node token: 0600, same as the config.
+# Best-effort throughout: a journal failure must never break
+# execution or reporting (warn + continue).
+_JOURNAL_MAX_ENTRIES = 200
+
+
+def _journal_path(cfg: dict) -> Path:
+    return Path(cfg.get("config_path") or DEFAULT_CONFIG_PATH).parent / "executed.json"
+
+
+def _load_executed_journal(cfg: dict) -> dict:
+    try:
+        data = json.loads(_journal_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _lookup_executed(cfg: dict, cmd_id: str):
+    """Stored outcome for a previously executed command id, or None."""
+    rec = _load_executed_journal(cfg).get(cmd_id)
+    return rec if isinstance(rec, dict) else None
+
+
+def _record_executed(cfg: dict, cmd_id: str, ok: bool, result: Any,
+                     error: str | None) -> None:
+    try:
+        path = _journal_path(cfg)
+        journal = _load_executed_journal(cfg)
+        journal[cmd_id] = {"ok": bool(ok), "result": result,
+                           "error": error, "at": time.time()}
+        while len(journal) > _JOURNAL_MAX_ENTRIES:
+            oldest = min(journal, key=lambda k: journal[k].get("at", 0)
+                         if isinstance(journal[k], dict) else 0)
+            del journal[oldest]
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(journal, ensure_ascii=False),
+                       encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except Exception as exc:  # noqa: BLE001 -- journal is best-effort
+        log.warning("cannot record executed command %s: %s", cmd_id, exc)
+
+
 def execute_command(cmd: dict) -> tuple[bool, Any, str | None]:
     """Run one panel command. Returns (ok, result, error). Never raises."""
     cmd_id = str(cmd.get("id", ""))
@@ -1006,10 +1114,26 @@ class Agent:
             if not isinstance(cmd, dict) or "id" not in cmd:
                 log.warning("skipping malformed command: %s", _redact(cmd))
                 continue
+            cmd_id = str(cmd["id"])
+            prior = _lookup_executed(self.cfg, cmd_id)
+            if prior is not None:
+                # R47-L5-1：重下发的命令 id——回执丢了或扫描重投过——
+                # 直接重放已存结果，绝不重复执行（create_user 重跑
+                # 会 409 毒化用户名，install_prereqs 重跑会再装一遍）。
+                log.info("cmd %s already executed, replaying stored result",
+                         cmd_id)
+                try:
+                    self.report(cmd_id, bool(prior.get("ok")),
+                                prior.get("result"), prior.get("error"))
+                except Exception as exc:  # noqa: BLE001 -- report loss is logged
+                    log.warning("report for cmd %s failed: %s", cmd_id, exc)
+                continue
             ok, result, error = execute_command(cmd)
             log.info("cmd %s done ok=%s", cmd.get("id"), ok)
+            # 先落盘再上报：回执丢了也能靠日志重放，不重复执行。
+            _record_executed(self.cfg, cmd_id, ok, result, error)
             try:
-                self.report(str(cmd["id"]), ok, result, error)
+                self.report(cmd_id, ok, result, error)
             except Exception as exc:  # noqa: BLE001 -- report loss is logged
                 log.warning("report for cmd %s failed: %s", cmd.get("id"), exc)
         return len(commands)

@@ -667,8 +667,17 @@ def _enqueue_command(node_name, action, params):
 # （崩溃/离线/回执丢失），命令不再永久卡住：自动打回 queued
 # 重新下发，最多重投 3 次，超过即标 failed。
 # 与 Worker 侧约定一致：状态机 queued -> sent -> done/failed，
-# 超时重投时 retries +1；非幂等命令（create_user/init_pki）重投
-# 时 agent 侧可能重复执行，见 docs/security.md。
+# 超时重投时 retries +1。
+# R47-L5-1：重投扫描只许跑在 agent 上报时（agent_poll），绝不跑在
+# 状态读取（GET /api/cmd/<id>）上——UI 的 waitCmd 每 2 秒查一次
+# 结果，旧代码每次查询都扫一遍：一条合法的慢命令（install_prereqs
+# 的 apt 预算 300/900 秒）执行到 120 秒就被打回 queued，agent 的
+# 迟到回执再以 409 拒收，下次 poll 又原样重下发，等于执行两次；
+# 3 次之后面板还判“已重投 3 次，放弃”，而 agent 明明在执行。
+# 扫描放 poll 里才成立：agent 是同步执行、执行中不 poll，只有
+# 空闲（或重启后）的 agent 才会触发扫描——执行中的命令永远扫
+# 不到。重下发的幂等由 agent 侧兜底（已执行命令日志＋
+# create_user/revoke_user/init_pki 的重入恢复），见 agent/agent.py。
 SENT_TIMEOUT_SECONDS = 120
 SENT_MAX_RETRIES = 3
 
@@ -1327,11 +1336,23 @@ _OUTWARD_IP_LOCK = threading.Lock()
 _OUTWARD_IP_REFRESHING = {"busy": False}
 
 
+def _detect_public_ip():
+    """取 core 的公网探测函数——调用时才从模块上解析，不取导入时的
+    快照。面板的后台刷新与 core 的建用户路径必须观测到同一个探测
+    函数（R47-L2-2：建用户时 core 探到的公网 IP，下载重建时面板
+    必须能复用同一来源，而不是各拿一份可能不一致的快照）。
+    core 未落盘时回落到导入的引用（同样是 None）。"""
+    mod = sys.modules.get("openvpn_manager")
+    fn = getattr(mod, "detect_public_ip", None) if mod is not None else None
+    return fn if callable(fn) else detect_public_ip
+
+
 def _refresh_outward_ip():
-    if detect_public_ip is None:
+    fn = _detect_public_ip()
+    if fn is None:
         return
     try:
-        ip = detect_public_ip()
+        ip = fn()
     except Exception:  # noqa: BLE001 - background refresh never raises
         ip = None
     with _OUTWARD_IP_LOCK:
@@ -1379,6 +1400,32 @@ def _outward_ip():
     return _lan_address()
 
 
+def _outward_ip_wait(timeout=12.0):
+    """_outward_ip() 的下载专用变体：缓存冷时等后台探测落盘（有界），
+    而不是立刻发一个内网 remote 的 .ovpn（R47-L2-2）。下载是用户
+    主动点的动作：等几秒拿到公网 remote，远好过发一个站外连不上
+    的文件。显式设置/环境变量/已有缓存时与 _outward_ip() 一样
+    立即返回，不等。等满仍无结果时回落局域网地址——局域网内客户
+    端本来就用它，调用方须按 _remote_warning() 明示。"""
+    ip = _stored_server_ip() or os.environ.get("OPENVPN_SERVER_IP")
+    if ip:
+        return ip
+    with _OUTWARD_IP_LOCK:
+        cached = _OUTWARD_IP_CACHE["ip"]
+    if cached is not None:
+        return _outward_ip()
+    _refresh_in_background(_OUTWARD_IP_REFRESHING,
+                           _OUTWARD_IP_LOCK, _refresh_outward_ip)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with _OUTWARD_IP_LOCK:
+            cached = _OUTWARD_IP_CACHE["ip"]
+        if cached is not None:
+            return cached
+        time.sleep(0.05)
+    return _outward_ip()
+
+
 def _rebuild_user_ovpn(name):
     """core 没有 get_user_ovpn(),故用已签发证书/私钥重建 .ovpn.
 
@@ -1406,8 +1453,11 @@ def _rebuild_user_ovpn(name):
     if missing:
         raise FileNotFoundError("重建 .ovpn 缺少文件: %s" % ", ".join(missing))
     proto, port = _parse_server_conf()
+    # R47-L2-2：下载重建用等探测的变体——缓存冷时等公网探测落盘，
+    # 不把内网 remote 发给站外客户端（建用户路径只读缓存、不等，
+    # 见 ovpn_users_create）。
     return build_client_config(name, blobs["ca"], blobs["cert"], blobs["key"],
-                               blobs["ta_key"], _outward_ip(), proto, port)
+                               blobs["ta_key"], _outward_ip_wait(), proto, port)
 
 
 def _online_names():
@@ -1491,8 +1541,15 @@ def change_password():
     data, err = _json_body()
     if err:
         return jsonify({"ok": False, "error": err}), 400
-    old = str(data.get("old_password", ""))
-    new = str(data.get("new_password", ""))
+    # R47-L3-1：旧密码与新密码须为真字符串——str() 隐式转换曾把
+    # ["abcdefghij", 1] 存成它的 repr（强度校验看的是 repr），
+    # 改密 200 后用 repr 能登录。缺键沿旧缺省取 ""（随后 401/400）。
+    old, err = _strict_str(data, "old_password", "旧密码")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    new, err = _strict_str(data, "new_password", "新密码")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
     conn = _db()
     row = conn.execute("SELECT password_hash FROM admin WHERE id = 1").fetchone()
     if not row or not _check_password(old, row["password_hash"]):
@@ -1873,11 +1930,12 @@ def ovpn_public_ip():
                             "error": "节点尚未上报出口 IP：先让 agent "
                                      "上报一次 get_status"}), 502
         return jsonify({"ok": True, "ip": ip})
-    if detect_public_ip is None:
+    fn = _detect_public_ip()
+    if fn is None:
         return jsonify({"ok": False,
                         "error": "openvpn_manager 未落盘"}), 503
     try:
-        ip = detect_public_ip()
+        ip = fn()
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(exc)}), 500
     if not ip:
@@ -2060,7 +2118,12 @@ def ovpn_users_create():
     try:
         # 观察-1：建用户时把已保存的对外地址传给 core，否则新签发的
         # .ovpn 仍按旧逻辑解析 remote（内网地址）。
-        create_user(name, server_ip=_stored_server_ip())
+        # R47-L2-1：没存过对外地址时传面板的缓存值——_outward_ip()
+        # 是 stale-while-revalidate 缓存，请求路径上绝不现探
+        # （core 的 detect_public_ip() 在请求里要 2x5 秒，死 DNS
+        # 下建用户卡 10 秒）；缓存冷时取局域网地址，下载重建时再
+        # 等探测（见 _rebuild_user_ovpn）。
+        create_user(name, server_ip=_stored_server_ip() or _outward_ip())
         _audit("openvpn_user_create", result="ok", detail="name=%s" % name)
     except UserAlreadyExistsError as exc:
         # R5-P2-1: predictable client error, not a server failure --
@@ -2201,10 +2264,18 @@ def ovpn_users_download(name):
         return jsonify({"ok": False, "error": str(exc)}), 500
     if not content.strip():
         return jsonify({"ok": False, "error": "未取到该用户的 .ovpn 内容"}), 404
+    headers = {"Content-Disposition":
+               'attachment; filename="%s.ovpn"' % name}
+    # R47-L2-2：等满 12 秒仍无公网地址时，文件里的 remote 只能是
+    # 内网地址——与状态卡的 _remote_warning() 同款警告以 ASCII 头
+    # 标出（纯 href 下载前端读不到头，等探测才是真正的修法；头是
+    # 给将来走 fetch 的下载留的机器信号）。
+    _m = re.search(r"^remote (\S+) \d+$", content, re.M)
+    if _m is not None and _remote_warning(_m.group(1)) is not None:
+        headers["X-Ovpn-Remote-Private"] = _m.group(1)
     return app.response_class(
         content, mimetype="application/x-openvpn-profile",
-        headers={"Content-Disposition":
-                 'attachment; filename="%s.ovpn"' % name})
+        headers=headers)
 
 
 # ---------------- SK5 ----------------
@@ -2944,9 +3015,12 @@ def cmd_create():
 def cmd_get(cmd_id):
     with _QUEUE_LOCK:
         state = _load_queue()
-        # R12-P1-1/P2-7：先隔离坏条目（标 failed＋审计），再重投超时命令。
+        # R12-P1-1/P2-7：先隔离坏条目（标 failed＋审计）。注意：这里
+        # 绝不跑 _requeue_stale_sent——状态读取不许改写队列
+        # （R47-L5-1：UI 的 waitCmd 每 2 秒查一次，旧代码每次查询
+        # 都把执行中的慢命令打回 queued；重投扫描只跑在 agent_poll
+        # 里，agent 空闲上报时才触发）。
         _fail_malformed_cmds(state)
-        _requeue_stale_sent(state)
         _save_queue(state)
         cmd = state["cmds"].get(cmd_id)
     if not cmd:
@@ -2975,7 +3049,7 @@ def cmd_get(cmd_id):
             age = (datetime.now(timezone.utc) - sent).total_seconds()
             if age > SENT_TIMEOUT_SECONDS:
                 out["timeout_hint"] = ("已下发超过 %d 秒未回执：agent 可能已死"
-                                       "或离线，系统将自动重新下发"
+                                       "或离线，agent 下次上报时系统将自动重新下发"
                                        % SENT_TIMEOUT_SECONDS)
         except (ValueError, TypeError):
             # R12-P2-7：sent_at 数字等错型值只跳过提示，不 500。
