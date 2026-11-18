@@ -66,18 +66,18 @@ h = hashlib.sha256(tar_p.read_bytes()).hexdigest()
 cell("D02c tarball sidecar sha256 matches",
      h in sidecar, "sha256=%s..." % h[:12])
 
-# ---------- D03: DELIVERY §9 hashes == tag 6d3cae5 (gold standard) ----------
+# ---------- D03: DELIVERY §9 hashes == tag 1.0.4 (gold standard) ----------
 deliv = read("docs/DELIVERY.md")
 rows = re.findall(r"\|\s*([^\s|`]+)\s*\|\s*`([0-9a-f]{12})`\s*\|", deliv)
 checked, bad = [], []
 for path, short in rows:
-    blob = git_show("6d3cae5", path)
+    blob = git_show("1.0.4", path)
     if blob is None:
         bad.append((path, "missing at tag"))
         continue
     got = hashlib.sha256(blob.encode()).hexdigest()[:12]
     (checked if got == short else bad).append((path, short, got))
-cell("D03 DELIVERY §9 hashes match tag 6d3cae5", not bad and len(checked) == 9,
+cell("D03 DELIVERY §9 hashes match tag 1.0.4", not bad and len(checked) == 9,
      "checked=%d bad=%s" % (len(checked), bad))
 
 # ---------- D04: 15-action whitelist, 3-way equality ----------

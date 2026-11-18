@@ -1,8 +1,8 @@
-# OpenVPN + SK5 面板 · 交付说明（1.0.3）
+# OpenVPN + SK5 面板 · 交付说明（1.0.4）
 
-> 发布包：`releases/ovpn-release-1.0.3.tar.gz`（包内清单与校验值见 §9；包自身的 sha256 全值见同目录伴生文件 `ovpn-release-1.0.3.tar.gz.sha256`）。
-> 交付日期：2026-11-18。AUDIT-R46 已判**可交付（差集 ∅）**，R46 真机复验轮与全新安装测试**全部通过、零新 bug**（复验中新发现 LIVE-R46-1 已修，见 §10）。历史台账 304 条（284＋18＋2，见 §10）；未验 1（P0-1，Cloudflare 真实部署）、新 0、复发 0。
-> 以上是 1.0.3 发布时的快照（基线 tag 1.0.3）。1.0.2 之后跑了 AUDIT-R41（30 条：P0 1/P1 9/P2 20，Fix-A～G 全修）、AUDIT-R42（24 条＋1 瞬态残留：P1 3/P2 21，Fix-H～M＋Fix-N 全修）、AUDIT-R43（7 条，Fix-O～R 全修）、AUDIT-R44（14 条：P2 14，Fix-S～W 全修）、AUDIT-R45（22 条：P1 候选 1/P2 21，Fix-X～AB＋X2 全修）、AUDIT-R46（18 条：P1 候选 1/P2 17，Fix-AE～AJ 全修）与 R45 真机轮（2 条：LIVE-R45-1 P2、LIVE-R45-2 P1 候选，Fix-AC/AD 全修）、R46 真机复验轮（1 条：LIVE-R46-1 P2，Fix-AJ 全修）及全新安装测试（6/6 通过），索引见 `docs/audit/AUDIT-R41.md`、`docs/audit/AUDIT-R42.md`、`docs/audit/AUDIT-R43.md`、`docs/audit/AUDIT-R44.md`、`docs/audit/AUDIT-R45.md`、`docs/audit/AUDIT-R46.md`；历史台账现为 304 条（284＋18＋2），各轮差集均已清空。
+> 发布包：`releases/ovpn-release-1.0.4.tar.gz`（包内清单与校验值见 §9；包自身的 sha256 全值见同目录伴生文件 `ovpn-release-1.0.4.tar.gz.sha256`）。
+> 交付日期：2026-11-18。AUDIT-R47 已判**可交付（差集 ∅）**，R47 真机复验轮**全部通过、零新 bug**（复验中新发现 LIVE-R47-1 已修，见 §10）；全新安装测试发版前对本包复验（见 §10）。历史台账 336 条（304＋31＋1，见 §10）；未验 1（P0-1，Cloudflare 真实部署）、新 0、复发 0。
+> 以上是 1.0.4 发布时的快照（基线 tag 1.0.4）。1.0.2 之后跑了 AUDIT-R41（30 条：P0 1/P1 9/P2 20，Fix-A～G 全修）、AUDIT-R42（24 条＋1 瞬态残留：P1 3/P2 21，Fix-H～M＋Fix-N 全修）、AUDIT-R43（7 条，Fix-O～R 全修）、AUDIT-R44（14 条：P2 14，Fix-S～W 全修）、AUDIT-R45（22 条：P1 候选 1/P2 21，Fix-X～AB＋X2 全修）、AUDIT-R46（18 条：P1 候选 1/P2 17，Fix-AE～AJ 全修）、AUDIT-R47（31 条：P1 1/P2 30，Fix-BA～BE＋集成修补全修）与 R45 真机轮（2 条：LIVE-R45-1 P2、LIVE-R45-2 P1 候选，Fix-AC/AD 全修）、R46 真机复验轮（1 条：LIVE-R46-1 P2，Fix-AJ 全修）及全新安装测试（6/6 通过）、R47 真机复验轮（1 条：LIVE-R47-1 P2，面板＋Worker 两面修法全修），索引见 `docs/audit/AUDIT-R41.md`、`docs/audit/AUDIT-R42.md`、`docs/audit/AUDIT-R43.md`、`docs/audit/AUDIT-R44.md`、`docs/audit/AUDIT-R45.md`、`docs/audit/AUDIT-R46.md`、`docs/audit/AUDIT-R47.md`；历史台账现为 336 条（304＋31＋1），各轮差集均已清空。
 > **未验清单（交付后仍未验，不冒充）**：Cloudflare Worker 真实部署（P0-1，见 §2）；arm64 安装校验（本机 x86_64，无 arm64 机）；SK5 端口 1001 vs 9000 仍待确认（面板默认 1001，见 §5）。
 
 ## 0. 这是什么
@@ -32,11 +32,11 @@ cd /root/openvpn-sk5-panel && OVPN_PROTO=tcp OVPN_PORT=443 bash install.sh
 
 ```bash
 # 本机执行（传包）：
-scp releases/ovpn-release-1.0.3.tar.gz root@<目标机>:/root/
+scp releases/ovpn-release-1.0.4.tar.gz root@<目标机>:/root/
 # 然后在目标机上执行：
-cd /root && tar xzf ovpn-release-1.0.3.tar.gz && cd openvpn-sk5-panel && bash install.sh
+cd /root && tar xzf ovpn-release-1.0.4.tar.gz && cd openvpn-sk5-panel && bash install.sh
 # 或在目标机上直接下载发布包安装：
-cd /root && curl -L -o ovpn-release-1.0.3.tar.gz https://raw.githubusercontent.com/iiiiiiiii7125-art/openvpn-sk5-panel/1.0.3/releases/ovpn-release-1.0.3.tar.gz && tar xzf ovpn-release-1.0.3.tar.gz && cd openvpn-sk5-panel && bash install.sh
+cd /root && curl -L -o ovpn-release-1.0.4.tar.gz https://raw.githubusercontent.com/iiiiiiiii7125-art/openvpn-sk5-panel/1.0.4/releases/ovpn-release-1.0.4.tar.gz && tar xzf ovpn-release-1.0.4.tar.gz && cd openvpn-sk5-panel && bash install.sh
 ```
 
 #### 面板域名与反代（Caddy）
@@ -181,7 +181,7 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 
 ## 9. 发布包清单与校验
 
-发布包：`releases/ovpn-release-1.0.3.tar.gz`（顶层目录 `openvpn-sk5-panel/`）。包内清单（106 个文件；不含 `tests/`、`__pycache__`、`*.pyc`、`.gitignore`、`cloudflare/.wrangler`、`panel/data/` 内一切运行时文件）：
+发布包：`releases/ovpn-release-1.0.4.tar.gz`（顶层目录 `openvpn-sk5-panel/`）。包内清单（108 个文件；不含 `tests/`、`__pycache__`、`*.pyc`、`.gitignore`、`cloudflare/.wrangler`、`panel/data/` 内一切运行时文件）：
 
 - 顶层：`install.sh`、`verify.sh`、`verify-integration.sh`（30 格门禁，见下；R41 起新增 0 号凭据扫描格）、`README.md`
 - `scripts/`（1.0.3 起进包）：`check-no-secrets.sh`、`git-hooks/pre-push`（凭据扫描，见 §9 末）
@@ -191,30 +191,30 @@ agent 启动后每 5 秒 poll 拉命令；面板点「建服务、加用户、�
 - `egress/`：`sk5_manager.py`、`policy-routing.sh`、`sing-box.json.template`、`test-egress.sh`、`README.md`
 - `systemd/`：5 个单元（`openvpn-sk5-panel`、`openvpn-sk5-singbox`、`openvpn-sk5-policy`、`openvpn-sk5-healthcheck` 服务＋定时器）
 - `cloudflare/`：`src/index.js`、`wrangler.toml`、`README.md`、`server-mode.md`
-- `docs/`：本文件、`security.md`、`flmx-reference.md`、live-verify 报告 22 份（21 份编号报告＋`docs/live-verify.md`）、`audit/` 审计报告 45 份（AUDIT-R1–R39、R41–R46）＋ `l5-probes/` 探针 1 个
+- `docs/`：本文件、`security.md`、`flmx-reference.md`、live-verify 报告 22 份（21 份编号报告＋`docs/live-verify.md`）、`audit/` 审计报告 46 份（AUDIT-R1–R39、R41–R47）＋ `l5-probes/` 探针 1 个
 
-关键文件 sha256（前 12 位；与 1.0.3 发布树逐项一致）：
+关键文件 sha256（前 12 位；与 1.0.4 发布树逐项一致）：
 
 | 文件 | sha256（前 12 位） |
 |---|---|
-| install.sh | `00b5fc72bd12` |
-| egress/sk5_manager.py | `0e4c3b585f05` |
+| install.sh | `6f72a5a952c5` |
+| egress/sk5_manager.py | `2336c31d4f4b` |
 | egress/policy-routing.sh | `938b2b164090` |
-| panel/app.py | `bfd9a9009106` |
-| cloudflare/src/index.js | `2a7aa6b154f3` |
-| agent/agent.py | `6367d4b61ddd` |
-| core/openvpn_manager.py | `cd9ffa6bc9dc` |
-| verify-integration.sh | `2d83e1b334ea` |
-| verify.sh | `8aabf4d454d6` |
+| panel/app.py | `9731e1bbcb61` |
+| cloudflare/src/index.js | `0fe700962c84` |
+| agent/agent.py | `eb5e4e958408` |
+| core/openvpn_manager.py | `899984b39fb0` |
+| verify-integration.sh | `8ed689a18130` |
+| verify.sh | `256742e22775` |
 
-核对方法（本机）：`sha256sum -c releases/ovpn-release-1.0.3.tar.gz.sha256`；解包后 `tar tzf releases/ovpn-release-1.0.3.tar.gz | wc -l` 应为 106 个文件 + 目录条目。伴生校验文件须从仓库根目录生成（`sha256sum releases/ovpn-release-<版本>.tar.gz > releases/ovpn-release-<版本>.tar.gz.sha256`，不得先 `cd releases` 再生成，否则文件里只有裸文件名、根目录下核对失败——1.0.2 发布时即因此错过前缀，R45-L4-1；1.0.3 的伴生文件已带 `releases/` 前缀，根目录下核对通过；已发布的 1.0.2 tag 上的伴生文件仍为裸文件名，核对该 tag 的包时须进 `releases/` 再跑 `sha256sum -c`）。门禁：`bash verify-integration.sh` 应为 `PASS=30 FAIL=0 SKIP=0`（30 格，含 §7 哈希钉死两层；脚本用固定 `/tmp/ovpn-int-test`＋8443 端口，须串行跑）。§9 的关键文件哈希表是 1.0.3 发布快照（与本发布树一致），改动文件的哈希在打包时按 R34 §6 惯例刷新，不随每次修复提交改。
+核对方法（本机）：`sha256sum -c releases/ovpn-release-1.0.4.tar.gz.sha256`；解包后 `tar tzf releases/ovpn-release-1.0.4.tar.gz | wc -l` 应为 108 个文件 + 目录条目。伴生校验文件须从仓库根目录生成（`sha256sum releases/ovpn-release-<版本>.tar.gz > releases/ovpn-release-<版本>.tar.gz.sha256`，不得先 `cd releases` 再生成，否则文件里只有裸文件名、根目录下核对失败——1.0.2 发布时即因此错过前缀，R45-L4-1；1.0.3 的伴生文件已带 `releases/` 前缀，根目录下核对通过；已发布的 1.0.2 tag 上的伴生文件仍为裸文件名，核对该 tag 的包时须进 `releases/` 再跑 `sha256sum -c`）。门禁：`bash verify-integration.sh` 应为 `PASS=30 FAIL=0 SKIP=0`（30 格，含 §7 哈希钉死两层；脚本用固定 `/tmp/ovpn-int-test`＋8443 端口，须串行跑）。§9 的关键文件哈希表是 1.0.4 发布快照（与本发布树一致），改动文件的哈希在打包时按 R34 §6 惯例刷新，不随每次修复提交改。
 
 **凭据扫描（R41-L7-P2-3，强制门禁）**：`scripts/check-no-secrets.sh` 检查已追踪文件是否含凭据——敏感文件名（`secret.key` / `admin.pass` / `panel.db` / `sk5.json` / `agent_queue.json` / `ta.key`）、`panel/data/` 内文件、已发货密钥的 SHA-256（`panel/app.py` 的 tripwire 值，定义处除外）、私钥 PEM 块（含 `ENCRYPTED PRIVATE KEY` 块与 OpenVPN 静态密钥块；`tests/r17_core.py` 的 FAKE 夹具除外）、发布包内凭据条目；只报文件路径，不打印匹配内容。Git 模式只读索引（`git ls-files` / `git grep --cached`），未追踪文件对扫描不可见——门禁只在提交后才算数，跑门禁前先提交。两个执行点：① `verify-integration.sh` 的 0 号格（计入 30 格，跑在 venv 之前）；② pre-push hook（每 clone 装一次：`cp scripts/git-hooks/pre-push .git/hooks/pre-push`，或 `git config core.hooksPath scripts/git-hooks`）。
 
 ## 10. 审计与真机证据索引
 
 - 审计（1.0.2 发布时）：`docs/audit/AUDIT-R39.md`（114 行，可交付，差集 ∅）为该版本的终审；此前 R26–R38 各轮差集 0–3 条（R27 一 P1 其余全 P2；R36 与 R39 差集 ∅）均已修复闭合，历史 185 条全在 R39 §6 复扫（174 已修、2 部分按设计、1 未验 P0-1、0 复发）。
-- 审计（1.0.2 之后）：`docs/audit/AUDIT-R41.md`（30 条，P0 1/P1 9/P2 20，Fix-A～G 全修，差集 ∅）、`docs/audit/AUDIT-R42.md`（24 条＋1 瞬态，P1 3/P2 21，Fix-H～M＋Fix-N 全修，差集 ∅）、`docs/audit/AUDIT-R43.md`（7 条，Fix-O～R 全修，差集 ∅）、`docs/audit/AUDIT-R44.md`（14 条，P2 14，Fix-S～W 全修，差集 ∅）、`docs/audit/AUDIT-R45.md`（22 条，P1 候选 1/P2 21，Fix-X～AB＋X2 全修，差集 ∅）、`docs/audit/AUDIT-R46.md`（18 条，P1 候选 1/P2 17，Fix-AE～AJ 全修，差集 ∅）。
+- 审计（1.0.2 之后）：`docs/audit/AUDIT-R41.md`（30 条，P0 1/P1 9/P2 20，Fix-A～G 全修，差集 ∅）、`docs/audit/AUDIT-R42.md`（24 条＋1 瞬态，P1 3/P2 21，Fix-H～M＋Fix-N 全修，差集 ∅）、`docs/audit/AUDIT-R43.md`（7 条，Fix-O～R 全修，差集 ∅）、`docs/audit/AUDIT-R44.md`（14 条，P2 14，Fix-S～W 全修，差集 ∅）、`docs/audit/AUDIT-R45.md`（22 条，P1 候选 1/P2 21，Fix-X～AB＋X2 全修，差集 ∅）、`docs/audit/AUDIT-R46.md`（18 条，P1 候选 1/P2 17，Fix-AE～AJ 全修，差集 ∅）、`docs/audit/AUDIT-R47.md`（31 条，P1 1/P2 30，Fix-BA～BE＋集成修补全修，差集 ∅）。
 - 真机（1.0.2 发布时）：`docs/live-verify-R21.md`（207 行，全部通过、零新 bug）为该版本的终轮；R35–R39 修复格与域名反代成功路径全过（交互真装真实 LE 证书、换域＋安装器重启＋NRestarts=0、空重跑 Caddy 存活、TCP-443 守卫、R37-P2-1 守卫恢复、R38-P2-1 目录 0755 自愈），headline-9 毒树重跑硬门通过；S0–S4 与 headline 六项全过。1.0.2 之后又跑了 R41 真机轮（候选 c5bbd61，升级＋UDP 数据面通过；LIVE-R41-1 域名 502 已由 Fix-G 修）与 R42 真机轮（候选 9331daf，门禁 29/30、升级/新装/TCP 443/状态交叉全过；LIVE-R42-1 瞬态 502 已由 Fix-N 修，Fix-N 真机复验已过（R45 真机轮：域名轮询 150 次 200、0 个 502）。
-- 真机（1.0.2 之后）：R45 真机轮（候选 6eac5af）：Fix-N 真机复验通过（域名轮询 150 次 200、0 个 502）；升级带存量数据、新装、TCP 443、状态交叉、过期服务端证书续签、卸载全过；LIVE-R45-1（PID 父目录）与 LIVE-R45-2（agent 侧脚本未更新）由 Fix-AC/AD 修，复验轮（候选 e7f18ff）全过。复验轮又发现 LIVE-R45-3（P1 候选：面板证书轮换后 agent 的 TOFU pin 失效，静默断联约 10 小时）与 LIVE-R45-4（P2：纯代码升级不重启面板），由 R46 修法轮（Fix-AH/AE）修。R46 真机复验轮（候选 bf2eacd）：升级、LIVE-R45-4 双向、叶证书轮换、Fix-AC PID 父进程、UDP 数据面、探针全过 6/6；新发现 LIVE-R46-1（P2：探针盖真机密码文件）由 Fix-AJ 修，复验通过。R46 全新安装测试（候选 92c33d3）：卸载、新装、agent 从零、用户旅程、终态全过 6/6。
+- 真机（1.0.2 之后）：R45 真机轮（候选 6eac5af）：Fix-N 真机复验通过（域名轮询 150 次 200、0 个 502）；升级带存量数据、新装、TCP 443、状态交叉、过期服务端证书续签、卸载全过；LIVE-R45-1（PID 父目录）与 LIVE-R45-2（agent 侧脚本未更新）由 Fix-AC/AD 修，复验轮（候选 e7f18ff）全过。复验轮又发现 LIVE-R45-3（P1 候选：面板证书轮换后 agent 的 TOFU pin 失效，静默断联约 10 小时）与 LIVE-R45-4（P2：纯代码升级不重启面板），由 R46 修法轮（Fix-AH/AE）修。R46 真机复验轮（候选 bf2eacd）：升级、LIVE-R45-4 双向、叶证书轮换、Fix-AC PID 父进程、UDP 数据面、探针全过 6/6；新发现 LIVE-R46-1（P2：探针盖真机密码文件）由 Fix-AJ 修，复验通过。R46 全新安装测试（候选 92c33d3）：卸载、新装、agent 从零、用户旅程、终态全过 6/6。R47 真机复验轮（候选 6776b4a）：原地升级 1.0.3→6776b4a（登录/域名 200、密钥不变、agent 轮询、UDP 1194、真客户端连通）、L5-1 慢命令单次执行（8 秒墙钟、重试 0；>120 秒一跳真机逼不出，沙箱已验）、DNS 重启生效、陈旧 NRestarts 门、agent 卸载重装、直接启动守护进程停服、服务端证书续期、401 原因透传、冷缓存建用户/下载、杀开关/修复/开关风暴、CA 轮换→过期标记→强制重钉——8 节全过（L5-1 标 PARTIAL 诚实：真机条件逼不出 >120 秒）；新发现 LIVE-R47-1（P2：状态页 DNS 写死 1.1.1.1）由面板（0bf1109）与 Worker（9f1268b）两面修法修，探针＋门禁复验通过。R47 全新安装测试：发版硬门——tag 前必须对本发布包跑通（1.0.3 的 6/6 全新安装不继承为本版证据）。
 - 探针资产在包外：`tests/` 未进发布包（开发验证用，见树内 `tests/README.md`）。
