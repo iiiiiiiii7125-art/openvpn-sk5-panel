@@ -182,6 +182,10 @@ cell("D09 panel/README line citation points at the real note",
 # R47 integration (15-action whitelist, D04): r47_int_worker_renew_repair.mjs
 # joined (Worker ACTIONS + compat routes for renew/repair, 8 cells) —
 # the corpus is now 30 files, 441 cells.
+# R47 integration (Worker username validation, R47-L3-3):
+# r47_int_worker_username.mjs joined (compat create/revoke name pattern
+# + reserved names, Flask parity, 16 cells) — the corpus is now
+# 31 files, 457 cells.
 # The parser also handles the three output shapes in the corpus:
 # "TOTAL N cells", "N/N PASS", "checks=N failures=M", and "ALL PASS"
 # (count the ^PASS lines).)
@@ -205,6 +209,7 @@ worker_files = [
     "tests/r47_bd_worker_host.mjs",
     "tests/r47_int_worker_getcmd_sweep.mjs",
     "tests/r47_int_worker_renew_repair.mjs",
+    "tests/r47_int_worker_username.mjs",
 ]
 total, per = 0, {}
 for f in worker_files:

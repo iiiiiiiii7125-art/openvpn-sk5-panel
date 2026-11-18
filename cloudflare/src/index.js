@@ -1680,11 +1680,31 @@ function validateCreateServer(b) {
   return null;
 }
 
-function validateCreateUser(b) {
-  if (b.name !== undefined && b.name !== null && typeof b.name !== "string") {
-    return `用户名须为字符串，收到 ${pyTypeName(b.name)}`;
+// R47-L3-3: username validation on the Worker face, same rule as
+// Flask core validate_username ([A-Za-z0-9_-]{1,32}; reserved
+// server/openvpn-ca/ca, case-insensitive). The compat routes used to
+// 202 any string name (create) and any path name (revoke) and only
+// fail at the agent; Flask 400s both before enqueueing.
+const USERNAME_RE = /^[A-Za-z0-9_-]{1,32}$/;
+const RESERVED_USERNAMES = new Set(["server", "openvpn-ca", "ca"]);
+function validateUsername(name) {
+  if (typeof name !== "string") {
+    return `用户名须为字符串，收到 ${pyTypeName(name)}`;
+  }
+  if (!USERNAME_RE.test(name)) {
+    return "用户名无效：须为 1-32 位字母、数字、下划线或连字符";
+  }
+  if (RESERVED_USERNAMES.has(name.toLowerCase())) {
+    return `用户名无效：${name} 为保留名`;
   }
   return null;
+}
+
+function validateCreateUser(b) {
+  if (b.name === undefined || b.name === null) {
+    return "须指定用户名";
+  }
+  return validateUsername(b.name);
 }
 
 async function handleCompatInitPki(request, env) {
@@ -2157,9 +2177,10 @@ async function handleFetch(request, env, ctx) {
     }
     const revokeMatch = path.match(/^\/api\/openvpn\/users\/([^/]+)$/);
     if (method === "DELETE" && revokeMatch) {
+      const name = decodeURIComponent(revokeMatch[1]);
       return handleCompatEnqueue(request, env, "revoke_user", () => ({
-        name: decodeURIComponent(revokeMatch[1]),
-      }));
+        name,
+      }), false, () => validateUsername(name));
     }
     const ovpnMatch = path.match(/^\/api\/openvpn\/users\/([^/]+)\/ovpn$/);
     if (method === "GET" && ovpnMatch) {
