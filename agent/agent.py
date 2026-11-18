@@ -728,7 +728,16 @@ def action_create_server(params: dict) -> dict:
         allow_port_change=_as_bool(
             params.get("allow_port_change"), "allow_port_change", False),
     )
-    return {"proto": proto, "port": port, "conf": str(conf), "server_files": installed}
+    # R47 Worker-face LIVE-R47-1: the Worker stores the pushed DNS in
+    # servercfg at create_server completion (ground truth read back
+    # from the just-rendered conf, not the requested param -- a
+    # missing param means the $OVPN_DNS / 1.1.1.1 default). Old agents
+    # return no dns and the Worker keeps FIXED_DNS for them.
+    pushed_dns = openvpn_manager.server_dns()
+    if pushed_dns is None:
+        pushed_dns = dns if dns else openvpn_manager.DEFAULT_DNS
+    return {"proto": proto, "port": port, "conf": str(conf),
+            "server_files": installed, "dns": pushed_dns}
 
 
 def action_start_openvpn(_params: dict) -> dict:
@@ -966,6 +975,17 @@ def action_get_status(_params: dict) -> dict:
     # R47-L4-4: the panel's /api/status shows the server cert expiry
     # for remote nodes too (the snapshot carries this dict through).
     ovpn["server_cert"] = openvpn_manager.server_cert_info()
+    # R47 Worker-face LIVE-R47-1: the snapshot carries the pushed DNS
+    # so the Worker (and Flask remote) status reports the DNS the
+    # server actually pushes instead of the hardcoded 1.1.1.1. The
+    # Flask remote path already passes a snapshot dns through when
+    # present; the Worker prefers it over servercfg (see
+    # mergeServerCfg). Absent conf -> key absent -> downstream falls
+    # back to servercfg / FIXED_DNS; never fail a status call over
+    # this.
+    dns = openvpn_manager.server_dns()
+    if dns is not None:
+        ovpn["dns"] = dns
     return {
         "openvpn": ovpn,
         "users": openvpn_manager.list_users(),

@@ -186,6 +186,10 @@ cell("D09 panel/README line citation points at the real note",
 # r47_int_worker_username.mjs joined (compat create/revoke name pattern
 # + reserved names, Flask parity, 16 cells) — the corpus is now
 # 31 files, 457 cells.
+# R47 Worker-face LIVE-R47-1 (agent snapshot dns -> Worker servercfg):
+# r47_worker_dns.mjs joined (snapshot dns wins, servercfg fallback,
+# FIXED_DNS last; create_server stores result dns; /api/nodes face,
+# 9 cells) — the corpus is now 32 files, 466 cells.
 # The parser also handles the three output shapes in the corpus:
 # "TOTAL N cells", "N/N PASS", "checks=N failures=M", and "ALL PASS"
 # (count the ^PASS lines).)
@@ -210,6 +214,7 @@ worker_files = [
     "tests/r47_int_worker_getcmd_sweep.mjs",
     "tests/r47_int_worker_renew_repair.mjs",
     "tests/r47_int_worker_username.mjs",
+    "tests/r47_worker_dns.mjs",
 ]
 total, per = 0, {}
 for f in worker_files:
