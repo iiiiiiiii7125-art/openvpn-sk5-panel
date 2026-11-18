@@ -20,7 +20,7 @@ python3 app.py
 
 ## API 字段表
 
-管理接口 `/api/*`（除登录、`/api/me`）均需登录，未登录返回 `401 {"ok":false,"error":"unauthorized"}`。例外：`/api/agent/*` 走节点 token 鉴权（`_agent_auth`，未带／错 token 即 401）；`/api/agent/bundle`、`/api/agent/bundle.sha256` 与 `/install-agent.sh`、`/install-agent.sh.sha256` 公开（装机时无鉴权取脚本，设计如此）。
+管理接口 `/api/*`（除登录、`/api/me`）均需登录，未登录返回 `401 {"ok":false,"error":"unauthorized"}`。例外：`/api/agent/*` 走节点 token 鉴权（`_agent_auth`，未带／错 token 即 401）；`/api/agent/bundle`、`/api/agent/bundle.sha256`、`/api/agent/panel-ca` 与 `/install-agent.sh`、`/install-agent.sh.sha256` 公开（装机时无鉴权取脚本与面板 CA，设计如此）。
 成功一般返回 `{"ok":true, ...}`，失败返回 `{"ok":false,"error":"..."}`。
 对接模块未落盘时相关接口返回 `503 {"ok":false,"error":"module_missing","module":"..."}`。
 
@@ -31,6 +31,14 @@ python3 app.py
 | POST `/api/change-password` | `old_password: string, new_password: string`（新密码 ≥12 字符、含字母和数字、UTF-8 不超过 72 字节、与旧密码不同） | `ok, note`；成功后全部旧会话作废，须重新登录；仅服务器（Flask）模式，Cloudflare 模式回 501（R11-P2-1） |
 | POST `/api/logout` | — | `ok` |
 | GET `/api/me` | — | `ok, admin: bool` |
+| GET `/api/agent/panel-ca` | — | 面板 CA 证书 PEM（`application/x-pem-file`）；无 CA 文件时 404（旧版面板或用户自带证书） |
+| GET `/api/nodes` | — | `nodes: [{name, panel_url, created_at, last_seen, last_status, agent_bundle_sha256, agent_code_outdated, cert_pin_stale}]`（`cert_pin_stale`：CA 轮换后 last_seen 冻结即 True，无轮换记录即 null） |
+| POST `/api/nodes` | `name: string（字母/数字/_/-，1–32 字符）, panel_url?: string（http(s):// 开头，留空=面板自身地址）` | `node{name, panel_url, created_at}, token`（201；token 只返回一次） |
+| DELETE `/api/nodes/<name>` | — | `ok`（吊销节点 token，agent 此后 poll 恒 401；agent 本身须在节点机上另行移除） |
+| POST `/api/nodes/<name>/rotate` | — | `node, token`（轮换节点 token，旧 token 立即失效） |
+| POST `/api/cmd` | `node: string, action: string, params?: object` | `cmd_id, node, action`（命令入队，agent 下次 poll 拉取） |
+| GET `/api/cmd/<cmd_id>` | — | 命令记录 `{id, node, action, params, status, result?, ...}`（agent 上报后 status 变 done/failed） |
+| GET `/api/audit` | `limit?: int（默认 100）` | `audit: [{...}]`（操作审计行，最新在前） |
 | GET `/api/status` | — | `openvpn{running, online_users, port, proto, subnet: "10.8.0.0/24", dns: "1.1.1.1", unit_active, pid, error?, detail}, sk5{enabled, host, port, error?}, egress{ip, latency_ms, via_sk5, error?}, modules_missing[]` |
 | POST `/api/openvpn/server` | `port: int(1-65535)（可省，UDP 默认 1194 / TCP 默认 443）, proto: "udp"\|"tcp", server_ip?: string（.ovpn 的 remote，留空=自动探测公网 IP；填了须为 IP 或主机名，否则 400）` | `server{proto, port, conf_path, subnet, dns, server_ip, remote_warning, note}`；server_ip 为生效值（已存值或自动探测）；子网/DNS 由 core 固定，改配置后需重启服务生效 |
 | POST `/api/openvpn/start` | — | `result`（`server_status()` 返回值原样） |
@@ -97,7 +105,7 @@ SK5 启用时复用 `get_status()` 已探到的 `egress_ip`，直连探针与
 - 面板自身不直接操作 `tun`、不写 OpenVPN 配置、不做策略路由，
   全部业务逻辑在 `core/` 与 `egress/`，面板只做 HTTP 适配与鉴权，
   唯一的例外是 `.ovpn` 下载重建（见上节，纯属 core 缺口的适配）。
-- 生产部署建议在反代后加 HTTPS，面板本身只监听 8443 明文端口。
+- 生产部署的 8443 是 TLS（systemd 单元跑 `run-panel-tls.py`，以自签面板证书提供 `ssl_context`；浏览器会报不受信任证书警告，属预期，见 DELIVERY §1.3）；明文 HTTP 只用于本地开发启动。反代后加 HTTPS 的建议不变。
 - 改密入口：顶栏「修改密码」按钮（`POST /api/change-password`），
   前端先校验新密码强度（≥12 字符、含字母和数字、UTF-8 不超过 72 字节、与旧密码不同、
   两次输入一致），改后全部旧会话作废、页面回到登录页。（仅服务器 Flask 模式；Cloudflare 模式下该按钮调接口回 501 并明示线下改密方法，见 README:295。）

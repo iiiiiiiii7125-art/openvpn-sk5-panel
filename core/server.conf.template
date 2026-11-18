@@ -1,4 +1,4 @@
-# OpenVPN 2.6 server config -- rendered by core/openvpn_manager.py
+# OpenVPN 2.4+ server config -- rendered by core/openvpn_manager.py
 # render_server_conf(). Placeholders (string.Template): PROTO, PORT,
 # SERVER_DIR, DNS, DATA_CIPHERS. Defaults: proto udp / port 1194; TCP mode: proto tcp /
 # port 443; DNS from the OVPN_DNS env var (default 1.1.1.1).

@@ -793,6 +793,12 @@ async function handleListNodes(request, env) {
       agent_code_outdated: installedHash
         ? (currentHash ? installedHash !== currentHash : null)
         : null,
+      // R47-L7-2: Worker 没有面板 CA 轮换记录（轮换记在服务器模式
+      // panel-ca-rotations.log 里），也收不到 agent 的 pin 状态，
+      // 所以 pin 是否过期恒为未知（null，绝不谎报——与 Flask
+      // _cert_pin_stale 的 None 同款）。键必须在场：缺席时前端的
+      // “证书已轮换”徽章永远没机会亮。
+      cert_pin_stale: null,
       status_age_s:
         snap && snap.at ? Math.floor((nowMs() - snap.at) / 1000) : null,
     });
@@ -1508,6 +1514,10 @@ async function cachedStatus(env, nodeName) {
     age_s: ageS,
     agent_bundle_sha256: installedHash,
     agent_code_outdated: agentCodeOutdated,
+    // R47-L7-2: 同 handleListNodes —— Worker 无轮换记录，pin 过期
+    // 恒为未知（null，绝不谎报）；键必须在场（Flask /api/status
+    // panel/app.py:1001 同款）。
+    cert_pin_stale: null,
     note:
       ageS === null
         ? "节点尚未上报状态：agent 首次 poll 后执行一次 get_status 即可"
@@ -1989,6 +1999,18 @@ async function handleFetch(request, env, ctx) {
     // agent 安装包：无鉴权公开下发（包里只有代码），经源站代理 + sha256 验后才下发。
     if (path === "/api/agent/bundle" && method === "GET") return handleAgentBundle(request, env);
     if (path === "/api/agent/bundle.sha256" && method === "GET") return handleAgentBundleSha256(request, env);
+    // R47-L7-1: Worker 模式没有面板 CA —— agent 的 TLS 对端是
+    // Cloudflare 边缘证书，不是源站面板，源站的 CA 在这里没有任何
+    // 锚定作用。恒回 501 明示，绝不回 404：安装器把 404 当成“旧版
+    // 面板”并回退到钉叶证书，而边缘叶证书会轮换，钉它就是 LIVE-R45-3
+    // 的砖机机制（只是换成 Cloudflare 的轮换节奏）；501 让安装器直接
+    // 报错，要求更新本机 CA 证书库走系统信任。改密 501 同款做法。
+    if (path === "/api/agent/panel-ca" && method === "GET") {
+      return err(
+        "Cloudflare 模式没有面板 CA：agent 的 TLS 对端是 Cloudflare 边缘证书（会轮换，不能钉叶证书）；请更新本机 CA 证书库后重装（系统信任），或显式传 --ca-cert <签发 CA> / --insecure",
+        501,
+      );
+    }
     if (path.startsWith("/api/agent/")) return err("未知 agent 接口", 404);
 
     // 其余 /api/* 一律须管理员会话。

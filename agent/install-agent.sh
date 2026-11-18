@@ -140,8 +140,12 @@ fi
 # and the whole command chain is dead. Resolution, in order:
 #   --ca-cert PATH : that PEM is copied to $PANEL_CA_PEM and pinned.
 #                    Supply the panel CA certificate (panel-ca.crt) --
-#                    a leaf certificate also works, but only until the
-#                    panel rotates its leaf.
+#                    a self-signed leaf also works, but only until the
+#                    panel rotates its leaf. A user-supplied CA-issued
+#                    leaf does NOT work here (R47-L5-3): it has no
+#                    CA:TRUE and cannot anchor itself, so the
+#                    trial-verify below fails -- pass the ISSUING CA
+#                    certificate instead, it is the only path.
 #   --insecure     : config insecure=true (explicit opt-in ONLY -- the
 #                    node token and .ovpn contents can then be
 #                    intercepted; the installer prints a loud warning).
@@ -172,7 +176,7 @@ elif [ "$INSECURE" -eq 1 ]; then
     _TRUST_HINT="insecure"
 fi
 _TRUST_JSON="$(python3 - "$PANEL_URL" "$_TRUST_HINT" "$PANEL_CA_PEM" <<'PYEOF'
-import json, os, socket, ssl, sys, urllib.parse, urllib.request
+import json, os, socket, ssl, sys, urllib.error, urllib.parse, urllib.request
 panel_url, hint, out_pem = sys.argv[1:4]
 result = {"mode": "system", "ca_cert": None, "insecure": False, "pin": None}
 if hint == "insecure":
@@ -210,8 +214,16 @@ try:
     # unverified (TOFU) channel get_server_certificate uses below --
     # no weaker than today's leaf pin: the trial-verify after this
     # proves the candidate actually verifies the served leaf. A
-    # pre-fix panel has no such endpoint: fall back to pinning the
-    # presented leaf (old behavior).
+    # pre-fix panel has no such endpoint (404): fall back to pinning
+    # the presented leaf (old behavior) -- but ONLY a self-signed
+    # CA:TRUE leaf can anchor itself; a user-supplied CA-issued leaf
+    # (no CA:TRUE) fails the trial-verify below and the install dies
+    # naming --ca-cert (R47-L5-3: the issuing CA is the only path
+    # there). A 501 is NOT a pre-fix panel: it is the panel explicitly
+    # saying it has no panel CA (Cloudflare Worker mode -- the TLS
+    # peer is the rotating edge cert). Leaf-pinning that edge cert
+    # would brick the agent at the next rotation (LIVE-R45-3
+    # mechanism), so fail loud instead of falling back (R47-L7-1).
     try:
         ca_url = panel_url.rstrip("/") + "/api/agent/panel-ca"
         ca_req = urllib.request.Request(ca_url, method="GET")
@@ -223,6 +235,21 @@ try:
                 if "-----BEGIN CERTIFICATE-----" in ca_body:
                     pem = ca_body
                     pin_kind = "ca"
+    except urllib.error.HTTPError as exc:
+        if exc.code == 501:
+            print(json.dumps({"mode": "error", "ca_cert": None,
+                              "insecure": False,
+                              "error": "panel is in Cloudflare Worker mode "
+                                       "and serves no panel CA (the agent's "
+                                       "TLS peer is the Cloudflare edge "
+                                       "certificate, which rotates); a leaf "
+                                       "pin would break at the next rotation "
+                                       "-- update this host's CA certificates "
+                                       "so the system store trusts the panel, "
+                                       "or pass --ca-cert <issuing-CA.pem> / "
+                                       "--insecure"}))
+            sys.exit(0)
+        pem = None
     except Exception:
         pem = None
     if pem is None:

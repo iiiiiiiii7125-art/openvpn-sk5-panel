@@ -6,7 +6,7 @@ PKI operations and to ``systemctl openvpn-server@server`` (with a direct
 ``openvpn --config`` fallback) for the daemon.
 
 Only the standard library + ``subprocess`` is used. Target platform:
-Debian 12 / Ubuntu 22.04 / 24.04, OpenVPN 2.6, Python 3.10+.
+Debian 12 / Ubuntu 22.04 / 24.04, OpenVPN 2.4+, Python 3.10+.
 
 Layout (defaults, overridable with env vars)::
 

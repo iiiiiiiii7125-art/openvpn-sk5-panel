@@ -250,7 +250,11 @@ def _make_ssl_context(cfg: dict) -> ssl.SSLContext:
     used to verify against the system store only, so poll failed
     forever with CERTIFICATE_VERIFY_FAILED. Resolution order:
     insecure=True -> unverified context (explicit opt-in only, warns);
-    ca_cert set -> system store + that PEM as an extra trust anchor;
+    ca_cert set -> ONLY that PEM as the trust store (R47-L5-5:
+    create_default_context(cafile=...) REPLACES the system store, it
+    does not add an extra anchor -- the panel leaf must verify against
+    the pinned PEM alone, so pinning the panel CA while pointing
+    panel_url at a different front, e.g. the LE domain, fails);
     otherwise the default system store (public-CA panels, e.g. a
     Cloudflare front, need nothing extra).
     """
