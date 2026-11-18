@@ -45,8 +45,8 @@
 
 关键点：策略路由只按**源地址**匹配。sing-box 自己连 SK5 时源地址是本机 IP，不进 table 100，走主表直连商家 —— sing-box 的 SK5 连接永远不会被 loop 回 tun1。**DNS 查询（53 端口）默认走 direct、不经过 SK5**（sing-box 模板的既定设计，见观察-5）：VPN 用户的 DNS 出口是中转机直连 IP，只有 TCP/UDP 业务流量走 SK5；面板 SK5 卡片上已写明这一条。
 
-命令契约（面板 ↔ agent，13 个动作，两端白名单逐字一致）：
-`install_prereqs / init_pki / create_server / start_openvpn / stop_openvpn / restart_openvpn / create_user / revoke_user / set_sk5 / test_sk5 / enable_sk5 / disable_sk5 / get_status`。agent 发回执用 `id` 字段，面板侧 `id` 与 `cmd_id` 都接受（Cloudflare Worker 与 Flask 面板一致）。
+命令契约（面板 ↔ agent，15 个动作，两端白名单逐字一致）：
+`install_prereqs / init_pki / create_server / start_openvpn / stop_openvpn / restart_openvpn / create_user / revoke_user / set_sk5 / test_sk5 / enable_sk5 / disable_sk5 / get_status / renew_server_cert / repair_pki`。agent 发回执用 `id` 字段，面板侧 `id` 与 `cmd_id` 都接受（Cloudflare Worker 与 Flask 面板一致）。
 
 ## 一键安装
 
@@ -156,7 +156,7 @@ UI 与 agent 日志都会告警）。重装换 panel-url/token 后安装器会�
 重启。
 
 服务器部署模式（方式一）与 Cloudflare 模式用同一套前端与命令契约：
-同一 agent、同一 13 个动作，只是指向的面板地址不同（见
+同一 agent、同一 15 个动作，只是指向的面板地址不同（见
 `cloudflare/server-mode.md` 对照表）。
 
 > 对外地址（已修复，R45-L7-2）：Cloudflare 模式的 Worker 兼容层随建服务命令转发

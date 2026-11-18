@@ -262,6 +262,12 @@ AGENT_ACTIONS = frozenset({
     "start_openvpn", "stop_openvpn", "restart_openvpn",
     "create_user", "revoke_user", "set_sk5", "test_sk5",
     "enable_sk5", "disable_sk5", "get_status",
+    # R47-L4-3/L4-4 (Fix-BC): PKI repair + server-cert renewal are agent
+    # actions too (remote nodes run them via the command chain); the
+    # panel's own renew/repair endpoints enqueue them, so they must be
+    # in this whitelist or remote enqueue 400s. 15 total, 3-way equal
+    # with agent/agent.py ACTIONS and Worker ACTIONS (D04).
+    "renew_server_cert", "repair_pki",
 })
 _NODE_NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,32}\Z")
 _SECRET_KEYS = {"password", "node_token", "token"}

@@ -56,7 +56,9 @@
 // 队列写一致性（R18-P2-1／P2-2）：poll 的清空是条件式（只清本轮实际取走
 //   的 id，窗口内新入队的 id 保留）；poll／report／revoke／cmd_get 的读
 //   路径先跑 `_sweepWorkerCmds`——畸形记录标 failed＋隔离、孤儿 queued
-//   记录重新入队、孤儿 sent 记录按超时规则处理。enqueueCommand 本身仍是
+//   记录重新入队、孤儿 sent 记录恢复副本。超时裁决只在 poll（与 revoke
+//   前）做：cmd_get／report 前的 sweep 不裁决超时（R47-L5-1，见
+//   `_sweepWorkerCmds` 的 allowTimeout），读路径不许翻 sent 命令的状态。enqueueCommand 本身仍是
 //   读→push→写回：它与 poll 的清空写交错时最多让已取走的 id 在队列数组
 //   里短暂复活一轮（记录已是 sent／done／failed，下发守卫会跳过、下轮
 //   条件式清空会摘掉），不丢命令；丢命令的方向只在 poll 的清空写，已修。
@@ -75,6 +77,13 @@ const ACTIONS = new Set([
   "enable_sk5",
   "disable_sk5",
   "get_status",
+  // R47-L4-3/L4-4 (Fix-BC): PKI repair + server-cert renewal are agent
+  // actions too; 15 total, 3-way equal with Flask AGENT_ACTIONS and
+  // agent/agent.py ACTIONS (D04). Neither is SAFE_RETRY: renew mints
+  // a new cert every run, repair mutates PKI state -- a timeout marks
+  // them failed for manual re-issue, never auto re-queued.
+  "renew_server_cert",
+  "repair_pki",
 ]);
 
 const SESSION_TTL_S = 24 * 3600;
@@ -1040,14 +1049,20 @@ async function _handleSentTimeout(env, cmd, now, sentAtOverride) {
 //   - 非对象／缺 status／未知 status／缺 node 的记录 → 标 failed＋隔离；
 //   - queued 但队列数组不引用的孤儿记录 → 重新入队（R18-P2-1 的自愈层；
 //     即使队列写仍有残留竞态窗口，下一轮 poll 的 sweep 也会再捞回来）；
-//   - sent 但 sent 副本不引用的记录 → 按超时规则处理（未超时恢复副本，
-//     已超时走重投／标失败）；
+//   - sent 但 sent 副本不引用的记录 → 恢复副本（见下）；
 //   - 其余记录不动。返回 { queue, sent }（可能已补孤儿），调用方以返回值为准。
+// R47-L5-1（Worker 面）：超时裁决只属于 agent poll——poll 时 agent 活着、
+// 正在要活，超时的 sent 才算真的无人回执。状态读路径（cmd_get、report
+// 前的 sweep）绝不做超时裁决：allowTimeout=false 时，超时的 sent 孤儿
+// 只恢复 sent 副本（带原 sent_at），让下一轮 poll 的超时循环去裁决；
+// 未超时的孤儿同样恢复副本。读路径翻一条 sent 命令的状态，就是 Flask
+// 修前的 GET 重投缺陷（UI 每 2 秒轮询即触发）。revoke／poll 保持
+// allowTimeout=true（revoke 随后本来就要全标失败；poll 即裁决点）。
 // 队列写回用“重读＋并集”（不直接写回传入数组），避免 sweep 自己的写
 // 覆盖 poll 窗口内新入队的 id；无改动时不写回（不与并发写争用）。
 // list() 不可用时（如旧 harness 的 MockKV）静默退化为不扫——调用方
 // 行为与修复前一致，绝不因此 500。
-async function _sweepWorkerCmds(env, nodeName, queue, sent) {
+async function _sweepWorkerCmds(env, nodeName, queue, sent, allowTimeout = true) {
   // 未传数组时（如 report／revoke／cmd_get 路径）先读 KV——绝不能默认
   // 空数组：空数组会让 sweep 把全部记录都当成孤儿（已验证的实测教训：
   // cmd_get 的 sweep 曾因此把未超时的 sent 记录也走超时处理）。
@@ -1096,6 +1111,16 @@ async function _sweepWorkerCmds(env, nodeName, queue, sent) {
         queueIds.add(id);
         queueChanged = true;
       } else if (cmd.status === "sent" && !sentIds.has(id)) {
+        if (!allowTimeout) {
+          // R47-L5-1：读路径不裁决超时——只恢复 sent 副本（带原
+          // sent_at），下一轮 poll 的超时循环按该时间戳裁决。超时的
+          // 孤儿在此也不翻状态：执行中的命令丢了副本时，GET／report
+          // 前的 sweep 翻它就是一次假“放弃”裁决。
+          sentArr.push({ id: cmd.id, action: cmd.action, sent_at: toMs(cmd.sent_at) });
+          sentIds.add(cmd.id);
+          sentChanged = true;
+          continue;
+        }
         const outcome = await _handleSentTimeout(env, cmd, now);
         if (outcome === "requeued") {
           queueArr.push(cmd.id);
@@ -1317,7 +1342,10 @@ async function handleAgentReport(request, env) {
 
   // R18-P2-2：先 sweep——畸形记录先落 failed（随后按 failed 走 409，
   // 而不是以畸形原态回 409 后继续滞留）；孤儿 queued 记录重新入队。
-  await _sweepWorkerCmds(env, node.name, null, null);
+  // R47-L5-1：report 前的 sweep 不裁决超时（allowTimeout=false）——
+  // 超时的 sent 孤儿只恢复副本，迟到回执仍能落地（下面按 sent 态接受）；
+  // 在此翻它会先把记录标 failed／queued，再以 409 丢掉回执。
+  await _sweepWorkerCmds(env, node.name, null, null, false);
   const cmd = await kvGetJson(env, `cmd:${cmdId}`);
   if (!cmd) return err(`命令不存在：${cmdId}`, 404);
   if (typeof cmd !== "object" || Array.isArray(cmd)) {
@@ -1448,7 +1476,10 @@ async function handleGetCmd(request, env, id) {
     await _failMalformedCmd(env, id, null, "记录不是 JSON 对象");
     cmd = await kvGetJson(env, `cmd:${id}`);
   } else if (typeof cmd.node === "string" && cmd.node) {
-    await _sweepWorkerCmds(env, cmd.node, null, null);
+    // R47-L5-1：状态读路径不裁决超时（allowTimeout=false）——UI 每 2 秒
+    // 轮询 GET 时，sweep 只隔离畸形＋恢复孤儿副本，绝不把执行中的
+    // sent 命令重投／标失败；超时裁决只属于 agent poll。
+    await _sweepWorkerCmds(env, cmd.node, null, null, false);
     cmd = await kvGetJson(env, `cmd:${id}`);
     if (!cmd) return err(`命令不存在：${id}`, 404);
   }
@@ -2096,6 +2127,16 @@ async function handleFetch(request, env, ctx) {
     }
     if (method === "POST" && path === "/api/openvpn/restart") {
       return handleCompatEnqueue(request, env, "restart_openvpn", () => ({}));
+    }
+    // R47-L4-3/L4-4 (Fix-BC): PKI repair + server-cert renewal, same
+    // bare-action shape as start/stop/restart (no body params; the
+    // frontend calls both with POST {} and waits via apiWait). Without
+    // these routes Worker mode 404s the panel's renew/repair buttons.
+    if (method === "POST" && path === "/api/openvpn/renew-server-cert") {
+      return handleCompatEnqueue(request, env, "renew_server_cert", () => ({}));
+    }
+    if (method === "POST" && path === "/api/openvpn/pki/repair") {
+      return handleCompatEnqueue(request, env, "repair_pki", () => ({}));
     }
     if (method === "POST" && path === "/api/openvpn/init-pki") {
       return handleCompatInitPki(request, env);

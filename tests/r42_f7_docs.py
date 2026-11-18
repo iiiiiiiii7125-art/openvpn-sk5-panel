@@ -80,7 +80,10 @@ for path, short in rows:
 cell("D03 DELIVERY §9 hashes match tag 6d3cae5", not bad and len(checked) == 9,
      "checked=%d bad=%s" % (len(checked), bad))
 
-# ---------- D04: 13-action whitelist, 3-way equality ----------
+# ---------- D04: 15-action whitelist, 3-way equality ----------
+# (13 before R47; Fix-BC added renew_server_cert + repair_pki as agent
+# actions with panel renew/repair endpoints enqueueing them remotely --
+# the whitelist legitimately grew to 15 on all three faces.)
 flask = set(re.findall(r'"([a-z0-9_]+)"',
                        re.search(r"AGENT_ACTIONS = frozenset\(\{(.*?)\}\)",
                                  read("panel/app.py"), re.S).group(1)))
@@ -90,8 +93,8 @@ agent = set(re.findall(r'"([a-z0-9_]+)":',
 worker = set(re.findall(r'"([a-z0-9_]+)"',
                         re.search(r"const ACTIONS = new Set\(\[(.*?)\]\);",
                                   read("cloudflare/src/index.js"), re.S).group(1)))
-cell("D04 whitelist 13 each, identical on 3 faces",
-     len(flask) == 13 and flask == agent == worker,
+cell("D04 whitelist 15 each, identical on 3 faces",
+     len(flask) == 15 and flask == agent == worker,
      "flask=%d agent=%d worker=%d only-in-one-face=%s"
      % (len(flask), len(agent), len(worker),
         sorted((flask ^ agent) | (agent ^ worker) | (flask ^ worker))))
@@ -173,6 +176,12 @@ cell("D09 panel/README line citation points at the real note",
 # R47 Fix-BE + Fix-BD (merged): r47_l7_worker_capin.mjs (Worker panel-ca 501 +
 # cert_pin_stale key, 7 cells) and r47_bd_worker_host.mjs (SK5 host-shape
 # save-time validation, 8 cells) joined — the corpus is now 28 files, 421 cells.
+# R47 integration (Worker GET/report sweep, R47-L5-1 family):
+# r47_int_worker_getcmd_sweep.mjs joined (read paths must not judge a
+# sent timeout, 12 cells) — the corpus is now 29 files, 433 cells.
+# R47 integration (15-action whitelist, D04): r47_int_worker_renew_repair.mjs
+# joined (Worker ACTIONS + compat routes for renew/repair, 8 cells) —
+# the corpus is now 30 files, 441 cells.
 # The parser also handles the three output shapes in the corpus:
 # "TOTAL N cells", "N/N PASS", "checks=N failures=M", and "ALL PASS"
 # (count the ^PASS lines).)
@@ -194,6 +203,8 @@ worker_files = [
     "tests/r46_l7_contract.mjs",
     "tests/r47_l7_worker_capin.mjs",
     "tests/r47_bd_worker_host.mjs",
+    "tests/r47_int_worker_getcmd_sweep.mjs",
+    "tests/r47_int_worker_renew_repair.mjs",
 ]
 total, per = 0, {}
 for f in worker_files:
